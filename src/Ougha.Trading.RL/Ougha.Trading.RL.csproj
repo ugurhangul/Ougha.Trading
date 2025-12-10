@@ -1,0 +1,25 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.18.0" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.23.2" />
+    <PackageReference Include="RLMatrix" Version="0.5.2" />
+    <PackageReference Include="TorchSharp" Version="0.105.1" />
+    <PackageReference Include="TorchSharp-cuda-windows" Version="0.105.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Ougha.Trading.Core\Ougha.Trading.Core.csproj" />
+    <ProjectReference Include="..\Ougha.Trading.Features\Ougha.Trading.Features.csproj" />
+    <ProjectReference Include="..\Ougha.Trading.Risk\Ougha.Trading.Risk.csproj" />
+    <ProjectReference Include="..\Ougha.Trading.Backtesting\Ougha.Trading.Backtesting.csproj" />
+    <ProjectReference Include="..\Ougha.Trading.Data\Ougha.Trading.Data.csproj" />
+  </ItemGroup>
+
+</Project>
