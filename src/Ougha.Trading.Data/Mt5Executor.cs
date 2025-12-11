@@ -22,30 +22,27 @@ public class Mt5Config
 /// </summary>
 public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
 {
-    private readonly string _pythonDllPath;
-    private readonly IntPtr _threadState;
     private dynamic? _mt5;
-    private bool _initialized = false;
+    private bool _initialized;
 
     /// <summary>
     /// Create Mt5Executor from IConfiguration.
-    /// Reads credentials from "MT5" section in appsettings.
+    /// Reads credentials from the "MT5" section in appsettings.
     /// </summary>
     public Mt5Executor(IConfiguration configuration)
     {
         var mt5Config = new Mt5Config();
         configuration.GetSection("MT5").Bind(mt5Config);
         
-        _pythonDllPath = mt5Config.PythonDllPath;
+        var pythonDllPath = mt5Config.PythonDllPath;
 
         if (!PythonEngine.IsInitialized)
         {
-            Runtime.PythonDLL = _pythonDllPath;
+            Runtime.PythonDLL = pythonDllPath;
             PythonEngine.Initialize();
-            _threadState = PythonEngine.BeginAllowThreads();
+            PythonEngine.BeginAllowThreads();
         }
 
-        // Initialize with credentials from config
         var initTask = InitializeAsync(mt5Config.Login, mt5Config.Password, mt5Config.Server);
         initTask.Wait();
         
@@ -55,30 +52,7 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
         }
     }
 
-    /// <summary>
-    /// Create Mt5Executor with explicit config (for testing or manual setup).
-    /// </summary>
-    public Mt5Executor(Mt5Config config)
-    {
-        _pythonDllPath = config.PythonDllPath;
-
-        if (!PythonEngine.IsInitialized)
-        {
-            Runtime.PythonDLL = _pythonDllPath;
-            PythonEngine.Initialize();
-            _threadState = PythonEngine.BeginAllowThreads();
-        }
-
-        var initTask = InitializeAsync(config.Login, config.Password, config.Server);
-        initTask.Wait();
-        
-        if (!_initialized)
-        {
-            throw new Exception("MT5 Initialize failed. Check credentials.");
-        }
-    }
-
-    public async Task InitializeAsync(string login, string password, string server)
+    private async Task InitializeAsync(string login, string password, string server)
     {
         await Task.Run(() =>
         {
@@ -86,7 +60,6 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
             {
                 _mt5 = Py.Import("MetaTrader5");
 
-                // If credentials are empty, initialize without login
                 dynamic result;
                 if (string.IsNullOrEmpty(login))
                 {
@@ -103,7 +76,7 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
 
                 if (!(bool)result)
                 {
-                    dynamic err = _mt5.last_error();
+                    var err = _mt5.last_error();
                     throw new Exception($"MT5 Initialize failed: {err}");
                 }
 
@@ -112,20 +85,14 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
         });
     }
 
-    public bool IsInitialized => _initialized;
-
     public void Dispose()
     {
-        if (_initialized && _mt5 != null)
+        if (!_initialized || _mt5 == null) return;
+        using (Py.GIL())
         {
-            using (Py.GIL())
-            {
-                _mt5.shutdown();
-            }
+            _mt5?.shutdown();
         }
     }
-
-    // --- ISymbolInfoProvider Implementation ---
 
     public SymbolInfo GetSymbolInfo(string symbol)
     {
@@ -146,8 +113,6 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
         }
     }
 
-    // --- IOrderExecutor Implementation ---
-
     public async Task<OrderResult> ExecuteAsync(
         string symbol, TradeType type, double volume,
         double sl = 0, double tp = 0, string comment = "", RiskLevel riskLevel = RiskLevel.Conservative)
@@ -156,8 +121,8 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
         {
             using (Py.GIL())
             {
-                int orderType = type == TradeType.Buy ? 0 : 1;
-                double price = type == TradeType.Buy 
+                var orderType = type == TradeType.Buy ? 0 : 1;
+                var price = type == TradeType.Buy 
                     ? (double)_mt5!.symbol_info_tick(symbol).ask 
                     : (double)_mt5!.symbol_info_tick(symbol).bid;
 
@@ -170,7 +135,7 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
                 request["deviation"] = 10.ToPython();
                 request["magic"] = 123456.ToPython();
 
-                string metaComment = $"{comment}|{(int)riskLevel}|{sl}";
+                var metaComment = $"{comment}|{(int)riskLevel}|{sl}";
                 request["comment"] = metaComment.ToPython();
 
                 request["type_time"] = 0.ToPython();
@@ -179,15 +144,12 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
                 if (sl > 0) request["sl"] = sl.ToPython();
                 if (tp > 0) request["tp"] = tp.ToPython();
 
-                dynamic result = _mt5!.order_send(request);
+                var result = _mt5!.order_send(request);
 
                 if (result == null)
                     return new OrderResult(false, 0, 0, 0, "OrderSend returned null");
 
-                if ((int)result.retcode != 10009)
-                    return new OrderResult(false, 0, 0, 0, $"RetCode: {result.retcode}, Comment: {result.comment}");
-
-                return new OrderResult(true, (long)result.order, (double)result.price, (double)result.volume);
+                return (int)result.retcode != 10009 ? new OrderResult(false, 0, 0, 0, $"RetCode: {result.retcode}, Comment: {result.comment}") : new OrderResult(true, (long)result.order, (double)result.price, (double)result.volume);
             }
         });
     }
@@ -201,8 +163,8 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
         {
             using (Py.GIL())
             {
-                int type = pos.Type == TradeType.Buy ? 1 : 0;
-                double price = pos.Type == TradeType.Buy 
+                var type = pos.Type == TradeType.Buy ? 1 : 0;
+                var price = pos.Type == TradeType.Buy 
                     ? (double)_mt5!.symbol_info_tick(symbol).bid 
                     : (double)_mt5!.symbol_info_tick(symbol).ask;
 
@@ -216,12 +178,9 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
                 request["deviation"] = 10.ToPython();
                 request["magic"] = 123456.ToPython();
 
-                dynamic result = _mt5!.order_send(request);
+                var result = _mt5!.order_send(request);
 
-                if ((int)result.retcode != 10009)
-                    return new CloseResult(false, 0, 0, $"RetCode: {result.retcode}");
-
-                return new CloseResult(true, 0, (double)result.price);
+                return (int)result.retcode != 10009 ? new CloseResult(false, 0, 0, $"RetCode: {result.retcode}") : new CloseResult(true, 0, (double)result.price);
             }
         });
     }
@@ -243,7 +202,7 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
                 request["tp"] = tp.ToPython();
                 request["magic"] = 123456.ToPython();
 
-                dynamic result = _mt5!.order_send(request);
+                var result = _mt5!.order_send(request);
                 return (int)result.retcode == 10009;
             }
         });
@@ -265,7 +224,7 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
     {
         using (Py.GIL())
         {
-            dynamic positions = _mt5!.positions_get();
+            var positions = _mt5!.positions_get();
             if (positions == null) return Enumerable.Empty<Position>();
 
             var list = new List<Position>();
@@ -286,7 +245,7 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
 
                 try
                 {
-                    string comment = (string)p.comment;
+                    var comment = (string)p.comment;
                     if (!string.IsNullOrEmpty(comment))
                     {
                         var parts = comment.Split('|');
@@ -300,7 +259,10 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
                         }
                     }
                 }
-                catch { }
+                catch
+                {
+                    // ignored
+                }
 
                 list.Add(pos);
             }
@@ -346,7 +308,7 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
     {
         using (Py.GIL())
         {
-            dynamic info = _mt5!.symbol_info(symbol);
+            var info = _mt5!.symbol_info(symbol);
             if (info == null) return false;
             return (int)info.trade_mode == 4;
         }
@@ -358,21 +320,21 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
         {
             using (Py.GIL())
             {
-                dynamic rates = _mt5!.copy_rates_from_pos(symbol, timeframe, 0, count);
+                var rates = _mt5!.copy_rates_from_pos(symbol, timeframe, 0, count);
 
                 if (rates == null) return new List<Candle>();
 
                 var list = new List<Candle>();
                 foreach (dynamic r in rates)
                 {
-                    long timeSec = (long)r[0];
-                    DateTime time = DateTimeOffset.FromUnixTimeSeconds(timeSec).UtcDateTime;
+                    var timeSec = (long)r[0];
+                    var time = DateTimeOffset.FromUnixTimeSeconds(timeSec).UtcDateTime;
 
-                    double open = (double)r[1];
-                    double high = (double)r[2];
-                    double low = (double)r[3];
-                    double close = (double)r[4];
-                    long vol = (long)r[5];
+                    var open = (double)r[1];
+                    var high = (double)r[2];
+                    var low = (double)r[3];
+                    var close = (double)r[4];
+                    var vol = (long)r[5];
 
                     list.Add(new Candle(time, open, high, low, close, vol));
                 }

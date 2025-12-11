@@ -1,7 +1,4 @@
-using System;
-using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 
 namespace Ougha.Trading.App.Runners;
 
@@ -13,13 +10,11 @@ public class SymbolStats
     public int Episodes { get; set; }
     public double TotalReward { get; set; }
     public double BestReward { get; set; } = double.MinValue;
-    public double WorstReward { get; set; } = double.MaxValue;
     public double BestProfitFactor { get; set; }
     public double BestSharpe { get; set; }
     public double BestMaxDrawdown { get; set; }
     public double BestWinRate { get; set; }
     public int BestTrades { get; set; }
-    public int Wins { get; set; }
     public int NoImprovementCount { get; set; }
     public bool EarlyStopped { get; set; }
     
@@ -32,9 +27,8 @@ public class SymbolStats
 /// </summary>
 public class TrainingStats
 {
-    private readonly object _lock = new();
+    private readonly Lock _lock = new();
 
-    // Episode tracking
     private int _episode;
     public int Episode { get => _episode; set => _episode = value; }
     public int TotalEpisodes { get; set; }
@@ -51,12 +45,10 @@ public class TrainingStats
     public string CurrentSymbol { get; set; } = "";
     public string CurrentAction { get; set; } = "HOLD";
 
-    // Parallel episode tracking
     public int CompletedEpisodes => _completedEpisodes;
     private int _completedEpisodes;
     public int ActiveEpisodes { get; set; }
 
-    // Timing
     public DateTime StartTime { get; set; } = DateTime.Now;
     public TimeSpan Elapsed => DateTime.Now - StartTime;
 
@@ -64,7 +56,7 @@ public class TrainingStats
     {
         get
         {
-            int completed = _completedEpisodes;
+            var completed = _completedEpisodes;
             if (completed <= 0) return TimeSpan.Zero;
             var episodesRemaining = TotalEpisodes - completed;
             var secondsPerEpisode = Elapsed.TotalSeconds / completed;
@@ -72,17 +64,16 @@ public class TrainingStats
         }
     }
 
-    // Rewards
     public double EpisodeReward { get; set; }
     public double EpisodeLoss { get; set; }
     private double _bestReward = double.MinValue;
     public double BestReward { get => _bestReward; set => _bestReward = value; }
     public float Epsilon { get; set; } = 1.0f;
-    public float Entropy { get; set; } = 0.05f; // PPO entropy coefficient for exploration
-    public bool IsPpoAgent { get; set; } = false; // Flag to show Entropy vs Epsilon
+    public float Entropy { get; set; } = 0.05f;
+    public bool IsPpoAgent { get; set; }
 
     private readonly Queue<double> _recentRewards = new();
-    public int RewardHistorySize { get; set; } = 100;
+    private int RewardHistorySize { get; set; } = 100;
 
     public void AddReward(double reward)
     {
@@ -114,7 +105,6 @@ public class TrainingStats
         }
     }
 
-    // Portfolio/Environment state
     public int Positions { get; set; }
     public double Equity { get; set; } = 10000;
     public double InitialBalance { get; set; } = 10000;
@@ -124,7 +114,6 @@ public class TrainingStats
         ? (Equity - InitialBalance) / InitialBalance * 100
         : 0;
 
-    // Performance metrics
     private readonly Stopwatch _stepTimer = new();
     private int _stepCount;
     private double _totalStepTime;
@@ -153,17 +142,16 @@ public class TrainingStats
         }
     }
 
-    // Action distribution
     private readonly Dictionary<int, int> _actionCounts = new()
     {
-        { 0, 0 }, // HOLD
-        { 1, 0 }, // BUY (Conservative)
-        { 2, 0 }, // BUY (Moderate)
-        { 3, 0 }, // BUY (Aggressive)
-        { 4, 0 }, // SELL (Conservative)
-        { 5, 0 }, // SELL (Moderate)
-        { 6, 0 }, // SELL (Aggressive)
-        { 7, 0 }  // CLOSE
+        { 0, 0 },
+        { 1, 0 },
+        { 2, 0 },
+        { 3, 0 },
+        { 4, 0 },
+        { 5, 0 },
+        { 6, 0 },
+        { 7, 0 }
     };
 
     public Dictionary<int, int> ActionCounts
@@ -209,7 +197,6 @@ public class TrainingStats
         }
     }
 
-    // Trade stats (use Interlocked for thread-safety)
     private int _tradesOpened;
     private int _tradesClosed;
     private int _wins;
@@ -251,10 +238,9 @@ public class TrainingStats
         {
             current = _bestReward;
             if (reward <= current) return;
-        } while (Interlocked.CompareExchange(ref _bestReward, reward, current) != current);
+        } while (Math.Abs(Interlocked.CompareExchange(ref _bestReward, reward, current) - current) > 0.1);
     }
 
-    // Per-symbol stats
     private readonly Dictionary<string, SymbolStats> _symbolPerformance = new();
 
     public Dictionary<string, SymbolStats> SymbolPerformance
@@ -278,13 +264,7 @@ public class TrainingStats
             return stats;
         }
     }
-
-    // Feature flags (for display)
     public bool GpuAvailable { get; set; }
-    public bool NumbaActive { get; set; }
-    public bool PrecomputedActive { get; set; }
-
-    // Early stopping
     public int EarlyStopPatience { get; set; } = 300;
     public int EarlyStopMinEpisodes { get; set; } = 500;
 }

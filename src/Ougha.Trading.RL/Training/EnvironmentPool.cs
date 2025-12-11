@@ -2,7 +2,6 @@
 using Ougha.Trading.Backtesting;
 using Ougha.Trading.Core.Models;
 using Ougha.Trading.Features;
-using Ougha.Trading.Features.Indicators;
 using Ougha.Trading.Risk;
 
 namespace Ougha.Trading.RL.Training;
@@ -19,8 +18,7 @@ public record PreparedEnvironment(
 );
 
 public record EnvironmentPoolConfig(
-    int PoolSize = 3,
-    int EpisodeDays = 5
+    int PoolSize = 3
 );
 
 public class EnvironmentPool : IDisposable
@@ -28,7 +26,6 @@ public class EnvironmentPool : IDisposable
     private readonly ChunkBasedDataProvider _chunkProvider;
     private readonly Dictionary<string, SymbolInfo> _symbolInfo;
     private readonly PortfolioEnvironmentConfig _envConfig;
-    private readonly EnvironmentPoolConfig _poolConfig;
     private readonly string[] _symbols;
     private readonly int _episodesPerChunk;
 
@@ -36,11 +33,9 @@ public class EnvironmentPool : IDisposable
     private readonly CancellationTokenSource _cts;
     private Task? _producerTask;
 
-    private PreparedEnvironment? _currentEnv;
-    private readonly object _lock = new();
+    private readonly Lock _lock = new();
 
     public int TotalChunks => _chunkProvider.TotalChunks;
-    public int CurrentChunkIndex { get; private set; }
 
     public EnvironmentPool(
         ChunkBasedDataProvider chunkProvider,
@@ -52,12 +47,12 @@ public class EnvironmentPool : IDisposable
         _chunkProvider = chunkProvider;
         _symbolInfo = symbolInfo;
         _envConfig = envConfig;
-        _poolConfig = poolConfig ?? new EnvironmentPoolConfig();
+        var poolConfig1 = poolConfig ?? new EnvironmentPoolConfig();
         _symbols = envConfig.Symbols;
         _episodesPerChunk = Math.Max(1, totalEpisodes / Math.Max(1, _chunkProvider.TotalChunks));
 
         _envChannel = Channel.CreateBounded<PreparedEnvironment>(
-            new BoundedChannelOptions(_poolConfig.PoolSize)
+            new BoundedChannelOptions(poolConfig1.PoolSize)
             {
                 FullMode = BoundedChannelFullMode.Wait,
                 SingleReader = true,
@@ -82,8 +77,6 @@ public class EnvironmentPool : IDisposable
                 {
                     lock (_lock)
                     {
-                        _currentEnv = preparedEnv;
-                        CurrentChunkIndex = preparedEnv.ChunkIndex;
                     }
                     return preparedEnv;
                 }
@@ -93,28 +86,17 @@ public class EnvironmentPool : IDisposable
         return null;
     }
 
-    public PreparedEnvironment? GetCurrentEnvironment()
-    {
-        lock (_lock)
-        {
-            return _currentEnv;
-        }
-    }
-
     private async Task ProduceEnvironmentsAsync(CancellationToken ct)
     {
-        int producedInChunk = 0;
-        int chunkIndex = 0;
-        DateTime chunkStart = DateTime.MinValue;
-        DateTime chunkEnd = DateTime.MinValue;
+        var producedInChunk = 0;
 
         try
         {
             var chunk = await _chunkProvider.GetNextChunkAsync();
             if (chunk == null) return;
-            chunkIndex = _chunkProvider.CurrentChunkIndex;
-            chunkStart = chunk.StartDate;
-            chunkEnd = chunk.EndDate;
+            var chunkIndex = _chunkProvider.CurrentChunkIndex;
+            var chunkStart = chunk.StartDate;
+            var chunkEnd = chunk.EndDate;
 
             while (!ct.IsCancellationRequested)
             {
@@ -168,7 +150,6 @@ public class EnvironmentPool : IDisposable
         var env = new PortfolioTradingEnvironment(
             episodeExecutor,
             new FeatureBuilder(),
-            new PortfolioManager(),
             new RewardCalculator(),
             _envConfig
         );

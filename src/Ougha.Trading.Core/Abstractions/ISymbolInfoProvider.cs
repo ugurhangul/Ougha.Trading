@@ -10,7 +10,7 @@ public interface ISymbolInfoProvider
 {
     /// <summary>
     /// Get symbol info from the broker/connector.
-    /// Returns null if symbol not found.
+    /// Returns null if the symbol is not found.
     /// </summary>
     SymbolInfo GetSymbolInfo(string symbol);
 }

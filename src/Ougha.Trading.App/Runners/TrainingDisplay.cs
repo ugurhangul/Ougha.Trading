@@ -1,6 +1,3 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using Spectre.Console;
 using Spectre.Console.Rendering;
 using Ougha.Trading.RL.Training;
@@ -14,7 +11,7 @@ namespace Ougha.Trading.App.Runners;
 public static class TrainingDisplay
 {
     /// <summary>
-    /// Build complete training display with all panels.
+    /// Build a complete training display with all panels.
     /// </summary>
     public static IRenderable BuildDisplay(TrainingStats stats, TrainingBudget budget)
     {
@@ -33,9 +30,9 @@ public static class TrainingDisplay
     }
 
     /// <summary>
-    /// Build header panel with episode progress, chunk info, and date ranges.
+    /// Build the header panel with episode progress, chunk info, and date ranges.
     /// </summary>
-    public static Panel BuildHeaderPanel(TrainingStats stats)
+    private static Panel BuildHeaderPanel(TrainingStats stats)
     {
         var elapsed = stats.Elapsed;
         var eta = stats.EstimatedTimeRemaining;
@@ -45,15 +42,13 @@ public static class TrainingDisplay
         
         var table = new Table().Border(TableBorder.None).HideHeaders();
         table.AddColumn("L1").AddColumn("V1").AddColumn("L2").AddColumn("V2").AddColumn("L3").AddColumn("V3");
-        
-        // Row 1: Episode and time info
+
         table.AddRow(
             "[bold]Episode:[/]", $"[bold yellow]{stats.Episode}/{stats.TotalEpisodes}[/] ({progress:F1}%)",
-            "[bold]Elapsed:[/]", $"[cyan]{elapsed:hh\\:mm\\:ss}[/]",
-            "[bold]ETA:[/]", $"[yellow]{eta:hh\\:mm\\:ss}[/]"
+            "[bold]Elapsed:[/]", $@"[cyan]{elapsed:hh\:mm\:ss}[/]",
+            "[bold]ETA:[/]", $@"[yellow]{eta:hh\:mm\:ss}[/]"
         );
-        
-        // Row 2: Chunk info
+
         var chunkDateRange = stats.ChunkStartDate != DateTime.MinValue 
             ? $"{stats.ChunkStartDate:MM/dd} - {stats.ChunkEndDate:MM/dd}"
             : "-";
@@ -62,8 +57,7 @@ public static class TrainingDisplay
             "[bold]Chunk Dates:[/]", $"[dim]{chunkDateRange}[/]",
             "[bold]Eps/Chunk:[/]", $"[dim]{stats.EpisodeInChunk}/{stats.EpisodesPerChunk}[/]"
         );
-        
-        // Row 3: Current episode date range
+
         var episodeDateRange = stats.EpisodeStartDate != DateTime.MinValue 
             ? $"{stats.EpisodeStartDate:yyyy-MM-dd HH:mm} → {stats.EpisodeEndDate:yyyy-MM-dd HH:mm}"
             : "-";
@@ -79,16 +73,15 @@ public static class TrainingDisplay
     }
 
     /// <summary>
-    /// Build current status panel with live training metrics.
+    /// Build the current status panel with live training metrics.
     /// </summary>
-    public static Panel BuildStatusPanel(TrainingStats stats)
+    private static Panel BuildStatusPanel(TrainingStats stats)
     {
         var pnlStyle = stats.PnLPercent >= 0 ? "green" : "red";
         var pnlSign = stats.PnLPercent >= 0 ? "+" : "";
-        
-        // Escape user-provided strings to prevent markup parsing issues
-        var safeSymbol = Markup.Escape(stats.CurrentSymbol ?? "-");
-        var safeAction = Markup.Escape(stats.CurrentAction ?? "HOLD");
+
+        var safeSymbol = Markup.Escape(stats.CurrentSymbol);
+        var safeAction = Markup.Escape(stats.CurrentAction);
         
         var table = new Table().Border(TableBorder.None).HideHeaders();
         table.AddColumn("L1").AddColumn("V1").AddColumn("L2").AddColumn("V2").AddColumn("L3").AddColumn("V3");
@@ -98,8 +91,7 @@ public static class TrainingDisplay
             "[bold]Step:[/]", $"[yellow]{stats.CurrentStep}[/]/[dim]{stats.MaxSteps}[/]",
             "[bold]Positions:[/]", $"[blue]{stats.Positions}[/]"
         );
-        
-        // Show Entropy for PPO, Epsilon for DQN
+
         var explorationLabel = stats.IsPpoAgent ? "Entropy:" : "Epsilon:";
         var explorationValue = stats.IsPpoAgent ? stats.Entropy : stats.Epsilon;
         
@@ -128,13 +120,12 @@ public static class TrainingDisplay
     }
 
     /// <summary>
-    /// Build performance metrics panel with timing breakdowns.
+    /// Build a performance metrics panel with timing breakdowns.
     /// </summary>
-    public static Panel BuildPerformancePanel(TrainingStats stats)
+    private static Panel BuildPerformancePanel(TrainingStats stats)
     {
         var totalTime = stats.ActionTimeMs + stats.EnvStepTimeMs + stats.TrainTimeMs + stats.BufferAddTimeMs;
-        
-        // Pre-compute percentages and styles
+
         var actionPct = totalTime > 0 ? stats.ActionTimeMs / totalTime * 100 : 0;
         var envPct = totalTime > 0 ? stats.EnvStepTimeMs / totalTime * 100 : 0;
         var trainPct = totalTime > 0 ? stats.TrainTimeMs / totalTime * 100 : 0;
@@ -171,12 +162,11 @@ public static class TrainingDisplay
     /// <summary>
     /// Build training budget panel showing configuration.
     /// </summary>
-    public static Panel BuildBudgetPanel(TrainingBudget budget)
+    private static Panel BuildBudgetPanel(TrainingBudget budget)
     {
         var table = new Table().Border(TableBorder.None).HideHeaders();
         table.AddColumn("L1").AddColumn("V1").AddColumn("L2").AddColumn("V2").AddColumn("L3").AddColumn("V3").AddColumn("L4").AddColumn("V4");
-        
-        // Escape GPU name for markup safety
+
         var safeGpuName = budget.Hardware.GpuName != null ? Markup.Escape(budget.Hardware.GpuName) : "Unknown";
         
         table.AddRow(
@@ -200,13 +190,12 @@ public static class TrainingDisplay
     }
 
     /// <summary>
-    /// Build global training stats panel with action distribution and trade counts.
+    /// Build a global training stats panel with action distribution and trade counts.
     /// </summary>
-    public static Panel BuildGlobalStatsPanel(TrainingStats stats)
+    private static Panel BuildGlobalStatsPanel(TrainingStats stats)
     {
         var totalActions = stats.TotalActions > 0 ? stats.TotalActions : 1;
-        
-        // Correct 3-action system: 0=HOLD, 1=BUY, 2=SELL
+
         var holdCount = stats.ActionCounts.GetValueOrDefault(0, 0);
         var buyCount = stats.ActionCounts.GetValueOrDefault(1, 0);
         var sellCount = stats.ActionCounts.GetValueOrDefault(2, 0);
@@ -247,9 +236,9 @@ public static class TrainingDisplay
     }
 
     /// <summary>
-    /// Build symbol performance table with per-symbol metrics.
+    /// Build a symbol performance table with per-symbol metrics.
     /// </summary>
-    public static Table BuildSymbolPerformanceTable(TrainingStats stats)
+    private static Table BuildSymbolPerformanceTable(TrainingStats stats)
     {
         var table = new Table()
             .Title("[bold magenta]Symbol Performance (Best Episode Stats)[/]")
@@ -274,7 +263,7 @@ public static class TrainingDisplay
         
         foreach (var (symbol, s) in sortedSymbols)
         {
-            var safeSymbol = Markup.Escape(symbol ?? "-");
+            var safeSymbol = Markup.Escape(symbol);
             var avgStyle = s.AverageReward > 0 ? "green" : s.AverageReward < 0 ? "red" : "dim";
             var bestStr = s.BestReward > double.MinValue ? $"[green]{s.BestReward:F2}[/]" : "-";
             var pfStyle = s.BestProfitFactor > 1.5 ? "green" : s.BestProfitFactor > 1 ? "yellow" : "red";
@@ -315,8 +304,7 @@ public static class TrainingDisplay
                 statusStr
             );
         }
-        
-        // Add empty row if no symbols yet
+
         if (sortedSymbols.Count == 0)
         {
             table.AddRow("-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "[dim]Waiting...[/]");
@@ -326,18 +314,17 @@ public static class TrainingDisplay
     }
 
     /// <summary>
-    /// Build progress bar component.
+    /// Build a progress bar component.
     /// </summary>
-    public static IRenderable BuildProgressBar(TrainingStats stats)
+    private static IRenderable BuildProgressBar(TrainingStats stats)
     {
         var progress = stats.TotalEpisodes > 0 
             ? (double)stats.Episode / stats.TotalEpisodes * 100 
             : 0;
-        
-        // Simple text-based progress indicator (ProgressBar is internal in Spectre.Console)
-        int barWidth = 40;
-        int filled = (int)(progress / 100.0 * barWidth);
-        string bar = new string('█', filled) + new string('░', barWidth - filled);
+
+        var barWidth = 40;
+        var filled = (int)(progress / 100.0 * barWidth);
+        var bar = new string('█', filled) + new string('░', barWidth - filled);
         
         return new Panel(
             new Markup($"[bold blue]Training Progress:[/] [{(progress > 50 ? "green" : "yellow")}]{bar}[/] {progress:F1}%")
@@ -345,7 +332,7 @@ public static class TrainingDisplay
     }
 
     /// <summary>
-    /// Generate final training result report.
+    /// Generate a final training result report.
     /// </summary>
     public static string GenerateResultReport(TrainingStats stats, TrainingBudget budget, string modelDir)
     {
@@ -353,30 +340,30 @@ public static class TrainingDisplay
         var lines = new List<string>
         {
             "",
-            new string('=', 80),
+            new('=', 80),
             "                    RL TRAINING RESULT REPORT",
-            new string('=', 80),
+            new('=', 80),
             "",
             "📊 TRAINING SUMMARY",
-            new string('-', 40),
+            new('-', 40),
             $"  Total Episodes:        {stats.Episode:N0}",
-            $"  Training Duration:     {elapsed:hh\\:mm\\:ss}",
+            $@"  Training Duration:     {elapsed:hh\:mm\:ss}",
             $"  Model Directory:       {modelDir}",
             "",
             "📈 REWARD STATISTICS",
-            new string('-', 40),
+            new('-', 40),
             $"  Best Episode Reward:   {stats.BestReward:F2}",
             $"  Final Avg (last 100):  {stats.AverageReward100:F2}",
             "",
             "🎯 TRADE STATISTICS",
-            new string('-', 40),
+            new('-', 40),
             $"  Trades Opened:         {stats.TradesOpened:N0}",
             $"  Trades Closed:         {stats.TradesClosed:N0}",
             $"  Win Rate:              {stats.WinRate:F1}%",
             $"  Profit Factor:         {stats.ProfitFactor:F2}",
             "",
             "📊 SYMBOL PERFORMANCE",
-            new string('-', 40)
+            new('-', 40)
         };
         
         foreach (var (symbol, s) in stats.SymbolPerformance.OrderByDescending(x => x.Value.BestReward))

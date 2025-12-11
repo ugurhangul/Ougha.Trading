@@ -1,52 +1,42 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using TorchSharp;
 using TorchSharp.Modules;
 using static TorchSharp.torch;
-using static TorchSharp.torch.nn;
-using static TorchSharp.torch.optim;
 using Ougha.Trading.RL.Models;
 using Ougha.Trading.RL.Training;
 
 namespace Ougha.Trading.RL.Agents;
 
-public class PpoAgent : IAgent, IDisposable
+public class PpoAgent : IAgent
 {
-    private readonly ActorCriticModel _model; // Training network
-    private readonly ActorCriticModel _inferenceNet; // Inference network
+    private readonly ActorCriticModel _model;
+    private readonly ActorCriticModel _inferenceNet;
     private readonly Adam _optimizer;
     private readonly Device _device;
-    
-    // PPO Hyperparameters
+
     private readonly float _gamma;
     private readonly float _gaeLambda;
     private readonly float _clipEpsilon;
     private readonly float _valueCoef;
     private float _entropyCoef;
-    private readonly float _initialEntropyCoef;
     private readonly float _minEntropyCoef;
     private readonly int _updateEpochs;
     private readonly int _batchSize;
     
-    private List<Experience> _rolloutBuffer = new();
-    private readonly object _bufferLock = new();
+    private List<Experience> _rolloutBuffer = [];
+    private readonly Lock _bufferLock = new();
     private readonly int _rolloutHorizon;
     
     private float _lastLogProb;
-    
-    // Pre-allocated buffers for 3-tensor packing (performance optimization)
-    private const int MAX_INFERENCE_BATCH = 64; // Max batch size for inference (increased for GPU efficiency)
+
+    private const int MAX_INFERENCE_BATCH = 64;
     private const int WINDOW_SIZE = 20;
     private const int NUM_FEATURES = 45;
     private readonly long[] _symbolBuffer = new long[MAX_INFERENCE_BATCH];
+
+    private readonly float[]? _packedTfBuffer;
+    private readonly float[]? _packedFeatBuffer;
     
-    // Packed buffers for efficient GPU transfer
-    private float[]? _packedTfBuffer;
-    private float[]? _packedFeatBuffer;
-    
-    public PpoAgent(
-        int batchSize = 64,
+    public PpoAgent(int batchSize = 64,
         int rolloutHorizon = 2048,
         float gamma = 0.99f,
         float gaeLambda = 0.95f,
@@ -61,14 +51,12 @@ public class PpoAgent : IAgent, IDisposable
         _gaeLambda = gaeLambda;
         _clipEpsilon = clipEpsilon;
         _valueCoef = 0.5f;
-        _entropyCoef = 0.1f;           // Doubled for more exploration
-        _initialEntropyCoef = 0.1f;
-        _minEntropyCoef = 0.01f;       // Higher floor for continued exploration
+        _entropyCoef = 0.1f;
+        _minEntropyCoef = 0.01f;
         _updateEpochs = updateEpochs;
-        
-        // CUDA setup with logging
-        bool cudaAvailable = torch.cuda.is_available();
-        _device = useCuda && cudaAvailable ? torch.CUDA : torch.CPU;
+
+        var cudaAvailable = cuda.is_available();
+        _device = useCuda && cudaAvailable ? CUDA : CPU;
         Console.WriteLine($"[PpoAgent] Device: {(useCuda && cudaAvailable ? "CUDA" : "CPU")} (useCuda={useCuda}, cudaAvailable={cudaAvailable})");
         
         _model = new ActorCriticModel("ppo_net_train");
@@ -78,16 +66,15 @@ public class PpoAgent : IAgent, IDisposable
         _inferenceNet.to(_device);
         SyncInferenceNetwork();
         
-        _optimizer = torch.optim.Adam(_model.parameters(), lr: learningRate);
-        
-        // Initialize packed buffers for 3-tensor transfer
+        _optimizer = optim.Adam(_model.parameters(), lr: learningRate);
+
         _packedTfBuffer = new float[MAX_INFERENCE_BATCH * 5 * WINDOW_SIZE * NUM_FEATURES];
-        _packedFeatBuffer = new float[MAX_INFERENCE_BATCH * 77]; // All features concatenated
+        _packedFeatBuffer = new float[MAX_INFERENCE_BATCH * 77];
     }
 
     public void SyncInferenceNetwork()
     {
-        using (torch.no_grad())
+        using (no_grad())
         {
              var stateDict = _model.state_dict();
              _inferenceNet.load_state_dict(stateDict);
@@ -97,13 +84,13 @@ public class PpoAgent : IAgent, IDisposable
     public int Act(AgentInput input, bool training = true)
     {
         _inferenceNet.eval();
-        using (torch.no_grad())
+        using (no_grad())
         {
-            var tensors = PrepareInputTensors(new[] { input });
+            var tensors = PrepareInputTensors([input]);
             var (logits, _, _) = _inferenceNet.forward(tensors);
             
-            var probs = torch.nn.functional.softmax(logits, dim: 1);
-            var dist = torch.distributions.Categorical(probs);
+            var probs = nn.functional.softmax(logits, dim: 1);
+            var dist = distributions.Categorical(probs);
             var action = dist.sample();
             
             _lastLogProb = dist.log_prob(action).item<float>();
@@ -121,36 +108,32 @@ public class PpoAgent : IAgent, IDisposable
     public (int[] Actions, float[,] TpSlMultipliers, float[] LogProbs) ActBatchWithTpSlAndLogProbs(AgentInput[] inputs, bool training = true)
     {
         _inferenceNet.eval();
-        using (torch.no_grad())
+        using (no_grad())
         {
             var tensors = PrepareInputTensors(inputs);
             var (logits, _, tpSl) = _inferenceNet.forward(tensors);
-            
-            // Replace NaN with 0 unconditionally (avoid GPU sync from .item<bool>())
-            logits = torch.nan_to_num(logits, 0.0f);
 
-            var probs = torch.nn.functional.softmax(logits, dim: 1);
-            
-            // Clamp probabilities to avoid NaN/negative without GPU sync
-            probs = torch.clamp(probs, 1e-8f, 1.0f);
+            logits = nan_to_num(logits);
+
+            var probs = nn.functional.softmax(logits, dim: 1);
+
+            probs = clamp(probs, 1e-8f, 1.0f);
             probs = probs / probs.sum(1, keepdim: true);
 
-            var dist = torch.distributions.Categorical(probs);
+            var dist = distributions.Categorical(probs);
             var actionsTensor = dist.sample();
             var logProbsTensor = dist.log_prob(actionsTensor);
-            
-            // Batch all data extractions together
+
             var actionsData = actionsTensor.data<long>().ToArray();
             var logProbs = logProbsTensor.data<float>().ToArray();
             var tpSlData = tpSl.data<float>().ToArray();
-            
-            // Convert actions to int array
+
             var actions = new int[inputs.Length];
-            for (int i = 0; i < inputs.Length; i++)
+            for (var i = 0; i < inputs.Length; i++)
                 actions[i] = (int)actionsData[i];
             
             var tpSlMults = new float[inputs.Length, 2];
-            for (int i = 0; i < inputs.Length; i++)
+            for (var i = 0; i < inputs.Length; i++)
             {
                 tpSlMults[i, 0] = tpSlData[i * 2];
                 tpSlMults[i, 1] = tpSlData[i * 2 + 1];
@@ -182,7 +165,7 @@ public class PpoAgent : IAgent, IDisposable
                 Reward = reward,
                 NextState = nextState,
                 Done = done,
-                Priority = logProb // Store log prob in Priority field
+                Priority = logProb
             });
         }
     }
@@ -207,7 +190,7 @@ public class PpoAgent : IAgent, IDisposable
     {
         lock (_bufferLock)
         {
-            for (int i = 0; i < states.Length; i++)
+            for (var i = 0; i < states.Length; i++)
             {
                 _rolloutBuffer.Add(new Experience
                 {
@@ -225,118 +208,102 @@ public class PpoAgent : IAgent, IDisposable
     public float Train()
     {
         List<Experience> bufferToTrain;
-        
-        // Check buffer size and SWAP if ready
+
         lock(_bufferLock)
         {
             if (_rolloutBuffer.Count < _rolloutHorizon)
                 return 0f;
                 
             bufferToTrain = _rolloutBuffer;
-            _rolloutBuffer = new List<Experience>(); // New empty buffer for Collector
+            _rolloutBuffer = new List<Experience>();
         }
             
-        return UpdatePPO(bufferToTrain);
+        return UpdatePpo(bufferToTrain);
     }
     
-    public float TrainStep() => Train(); // Interface compat
-    public float TrainMultipleBatches(int batches) => Train(); // Interface compat
+    public float TrainStep() => Train();
+    public float TrainMultipleBatches(int batches) => Train();
 
-    private float UpdatePPO(List<Experience> rollouts)
+    private float UpdatePpo(List<Experience> rollouts)
     {
-        // 1. Compute GAE
         var states = rollouts.Select(e => e.State).ToArray();
-        
-        // Compute Values, Advantages and Returns
-        var (advantages, returns) = ComputeGAE(rollouts, states);
-        
-        // Prepare training data
+
+        var (advantages, returns) = ComputeGae(rollouts, states);
+
         var dataset = new PpoDataset(rollouts, advantages, returns);
         var loader = new DataLoader(dataset, _batchSize, shuffle: true);
         
         _model.train();
         float totalLoss = 0;
-        int steps = 0;
-        
-        // 2. Multi-epoch update
-        for (int epoch = 0; epoch < _updateEpochs; epoch++)
+        var steps = 0;
+
+        for (var epoch = 0; epoch < _updateEpochs; epoch++)
         {
             foreach (var batch in loader)
             {
                 var stateTensors = PrepareInputTensors(batch.States);
-                var actions = torch.tensor(batch.Actions, dtype: ScalarType.Int64, device: _device);
-                var oldLogProbs = torch.tensor(batch.LogProbs, dtype: ScalarType.Float32, device: _device);
-                var returnsTensor = torch.tensor(batch.Returns, dtype: ScalarType.Float32, device: _device);
-                var advs = torch.tensor(batch.Advantages, dtype: ScalarType.Float32, device: _device);
-                
-                // Normalize advantages
+                var actions = tensor(batch.Actions, dtype: ScalarType.Int64, device: _device);
+                var oldLogProbs = tensor(batch.LogProbs, dtype: ScalarType.Float32, device: _device);
+                var returnsTensor = tensor(batch.Returns, dtype: ScalarType.Float32, device: _device);
+                var advs = tensor(batch.Advantages, dtype: ScalarType.Float32, device: _device);
+
                 advs = (advs - advs.mean()) / (advs.std() + 1e-8f);
                 
                 var (logits, values, _) = _model.forward(stateTensors);
-                
-                // 3. Loss Calculation
-                // Policy Loss
-                var probs = torch.nn.functional.softmax(logits, dim: 1);
-                var dist = torch.distributions.Categorical(probs);
+
+                var probs = nn.functional.softmax(logits, dim: 1);
+                var dist = distributions.Categorical(probs);
                 var newLogProbs = dist.log_prob(actions);
                 var entropy = dist.entropy().mean();
                 
                 var ratio = (newLogProbs - oldLogProbs).exp();
                 var surr1 = ratio * advs;
-                var surr2 = torch.clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * advs;
-                var actorLoss = -torch.min(surr1, surr2).mean();
-                
-                // Value Loss
-                var valueLoss = torch.nn.functional.mse_loss(values.squeeze(), returnsTensor);
+                var surr2 = clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * advs;
+                var actorLoss = -min(surr1, surr2).mean();
+
+                var valueLoss = nn.functional.mse_loss(values.squeeze(), returnsTensor);
                 
                 var loss = actorLoss + _valueCoef * valueLoss - _entropyCoef * entropy;
                 
                 _optimizer.zero_grad();
                 loss.backward();
-                torch.nn.utils.clip_grad_norm_(_model.parameters(), 0.5f);
+                nn.utils.clip_grad_norm_(_model.parameters(), 0.5f);
                 _optimizer.step();
                 
                 totalLoss += loss.item<float>();
                 steps++;
             }
         }
-        
-        // _rolloutBuffer.Clear(); // Already swapped
-        SyncInferenceNetwork(); // Sync weights to inference net
+
+        SyncInferenceNetwork();
         return steps > 0 ? totalLoss / steps : 0;
     }
-    
-    // Pass rollouts specifically to avoid using _rolloutBuffer field
-    private (float[] Advantages, float[] Returns) ComputeGAE(List<Experience> rollouts, AgentInput[] states)
+
+    private (float[] Advantages, float[] Returns) ComputeGae(List<Experience> rollouts, AgentInput[] states)
     {
-        int T = rollouts.Count;
+        var T = rollouts.Count;
         var advantages = new float[T];
         var returns = new float[T];
-        
-        // Get Values for all states + last next state
-        // Batching in chunks to avoid OOM
+
         var values = new float[T + 1];
-        int chunkSize = 256;
+        var chunkSize = 256;
         
-        using (torch.no_grad())
+        using (no_grad())
         {
             _model.eval();
-            // Get value for every step
-            for (int i = 0; i < T; i += chunkSize)
+            for (var i = 0; i < T; i += chunkSize)
             {
-                int len = Math.Min(chunkSize, T - i);
+                var len = Math.Min(chunkSize, T - i);
                 var chunk = states.Skip(i).Take(len).ToArray();
                 var tensors = PrepareInputTensors(chunk);
-                // ...
                 var (_, v, _) = _model.forward(tensors);
                 var vData = v.cpu().data<float>().ToArray();
                 Array.Copy(vData, 0, values, i, len);
             }
-            
-            // Last value (bootstrapping if episode not done)
+
             if (!rollouts[T - 1].Done && rollouts[T - 1].NextState != null)
             {
-                var tensors = PrepareInputTensors(new[] { rollouts[T - 1].NextState! });
+                var tensors = PrepareInputTensors([rollouts[T - 1].NextState!]);
                 var (_, v, _) = _model.forward(tensors);
                 values[T] = v.item<float>();
             }
@@ -347,15 +314,13 @@ public class PpoAgent : IAgent, IDisposable
         }
         
         float gae = 0;
-        for (int t = T - 1; t >= 0; t--)
+        for (var t = T - 1; t >= 0; t--)
         {
             var exp = rollouts[t];
-            // Delta = r + gamma * V(s') * (1-d) - V(s)
-            float delta = exp.Reward + _gamma * values[t + 1] * (exp.Done ? 0 : 1) - values[t];
+            var delta = exp.Reward + _gamma * values[t + 1] * (exp.Done ? 0 : 1) - values[t];
             gae = delta + _gamma * _gaeLambda * (exp.Done ? 0 : 1) * gae;
             advantages[t] = gae;
-            
-            // Return = Advantage + Value (Target for Value Head)
+
             returns[t] = advantages[t] + values[t];
         }
         
@@ -364,146 +329,110 @@ public class PpoAgent : IAgent, IDisposable
 
     public void Save(string path) => _model.save(path);
     public void Load(string path) => _model.load(path);
-    public void ResetOnlineLearning() { _rolloutBuffer.Clear(); }
-    public void DecayEpsilon()
+    public void ResetOnlineLearning()
     {
-        // PPO uses adaptive entropy decay instead of epsilon
-        if (_entropyCoef > _minEntropyCoef)
+        lock (_bufferLock)
         {
-            _entropyCoef *= 0.999f; // Slower decay for longer exploration
-            _entropyCoef = Math.Max(_entropyCoef, _minEntropyCoef);
+            _rolloutBuffer.Clear();
         }
     }
-    public int BufferCount => _rolloutBuffer.Count;
+    public void DecayEpsilon()
+    {
+        if (!(_entropyCoef > _minEntropyCoef)) return;
+        _entropyCoef *= 0.999f;
+        _entropyCoef = Math.Max(_entropyCoef, _minEntropyCoef);
+    }
     public float GetEntropyCoef() => _entropyCoef;
-    
-    // OPTIMIZED: Pack into 3 tensors instead of 13 for faster GPU transfer
-    // Returns: [PackedTimeframes, SymbolId, PackedFeatures]
-    // PackedTimeframes: [batch, 5, 20, 45] - all 5 timeframes stacked
-    // SymbolId: [batch, 1] - int64
-    // PackedFeatures: [batch, 77] - all 7 feature arrays concatenated
+
     private Tensor[] PrepareInputTensors(AgentInput[] inputs)
     {
-        int batchSize = inputs.Length;
-        bool usePreallocated = batchSize <= MAX_INFERENCE_BATCH;
+        var batchSize = inputs.Length;
+        var usePreallocated = batchSize <= MAX_INFERENCE_BATCH;
         
-        var tensors = new Tensor[3]; // Only 3 tensors now!
-        string[] tfNames = { "M1", "M5", "M15", "H1", "H4" };
-        
-        // 1. Pack all 5 timeframes into one 4D tensor [batch, 5, 20, 45]
-        int tfTotalLen = batchSize * 5 * WINDOW_SIZE * NUM_FEATURES;
-        float[] tfPackedBuffer = usePreallocated && _packedTfBuffer != null 
+        var tensors = new Tensor[3];
+        string[] tfNames = ["M1", "M5", "M15", "H1", "H4"];
+
+        var tfTotalLen = batchSize * 5 * WINDOW_SIZE * NUM_FEATURES;
+        var tfPackedBuffer = usePreallocated && _packedTfBuffer != null 
             ? _packedTfBuffer 
             : new float[tfTotalLen];
         
-        for (int tfIdx = 0; tfIdx < 5; tfIdx++)
+        for (var tfIdx = 0; tfIdx < 5; tfIdx++)
         {
-            string tf = tfNames[tfIdx];
-            int tfOffset = tfIdx * WINDOW_SIZE * NUM_FEATURES; // Offset within each batch item
-            
-            for (int b = 0; b < batchSize; b++)
+            var tf = tfNames[tfIdx];
+            var tfOffset = tfIdx * WINDOW_SIZE * NUM_FEATURES;
+
+            for (var b = 0; b < batchSize; b++)
             {
-                int batchOffset = b * 5 * WINDOW_SIZE * NUM_FEATURES + tfOffset;
+                var batchOffset = b * 5 * WINDOW_SIZE * NUM_FEATURES + tfOffset;
                 
                 if (!inputs[b].TimeframeFeatures.TryGetValue(tf, out var tfData))
                 {
-                    // Zero-fill for missing timeframe
-                    for (int i = 0; i < WINDOW_SIZE * NUM_FEATURES; i++)
+                    for (var i = 0; i < WINDOW_SIZE * NUM_FEATURES; i++)
                         tfPackedBuffer[batchOffset + i] = 0f;
                     continue;
                 }
                 
-                for (int row = 0; row < WINDOW_SIZE; row++)
+                for (var row = 0; row < WINDOW_SIZE; row++)
                 {
-                    int rowOffset = batchOffset + row * NUM_FEATURES;
-                    for (int col = 0; col < NUM_FEATURES; col++)
+                    var rowOffset = batchOffset + row * NUM_FEATURES;
+                    for (var col = 0; col < NUM_FEATURES; col++)
                     {
-                        float val = tfData[row, col];
+                        var val = tfData[row, col];
                         tfPackedBuffer[rowOffset + col] = float.IsFinite(val) ? val : 0f;
                     }
                 }
             }
         }
         
-        tensors[0] = torch.tensor(tfPackedBuffer, new long[] { batchSize, 5, WINDOW_SIZE, NUM_FEATURES }, 
+        tensors[0] = tensor(tfPackedBuffer, new long[] { batchSize, 5, WINDOW_SIZE, NUM_FEATURES }, 
             dtype: ScalarType.Float32, device: _device);
 
-        // 2. Symbol ID tensor (unchanged, it's tiny)
-        long[] symBuffer = usePreallocated ? _symbolBuffer : new long[batchSize];
-        for (int i = 0; i < batchSize; i++) 
+        var symBuffer = usePreallocated ? _symbolBuffer : new long[batchSize];
+        for (var i = 0; i < batchSize; i++) 
             symBuffer[i] = inputs[i].SymbolId;
-        tensors[1] = torch.tensor(symBuffer, new long[] { batchSize, 1 }, 
+        tensors[1] = tensor(symBuffer, new long[] { batchSize, 1 }, 
             dtype: ScalarType.Int64, device: _device);
-        
-        // 3. Pack all 7 feature arrays into one [batch, 77] tensor
-        // Layout: Trigger(5) + Confluence(10) + Portfolio(5) + Risk(9) + News(16) + Correlation(20) + Exposure(12) = 77
-        const int TOTAL_FEATURES = 5 + 10 + 5 + 9 + 16 + 20 + 12; // 77
-        int featTotalLen = batchSize * TOTAL_FEATURES;
-        float[] featPackedBuffer = usePreallocated && _packedFeatBuffer != null 
+
+        const int totalFeatures = 5 + 10 + 5 + 9 + 16 + 20 + 12;
+        var featTotalLen = batchSize * totalFeatures;
+        var featPackedBuffer = usePreallocated && _packedFeatBuffer != null 
             ? _packedFeatBuffer 
             : new float[featTotalLen];
         
-        for (int b = 0; b < batchSize; b++)
+        for (var b = 0; b < batchSize; b++)
         {
-            int offset = b * TOTAL_FEATURES;
+            var offset = b * totalFeatures;
             var inp = inputs[b];
-            
-            // Copy each feature array in order
+
             CopyFeatures(featPackedBuffer, offset, inp.TriggerContext, 5); offset += 5;
             CopyFeatures(featPackedBuffer, offset, inp.ConfluenceFeatures, 10); offset += 10;
             CopyFeatures(featPackedBuffer, offset, inp.PortfolioFeatures, 5); offset += 5;
             CopyFeatures(featPackedBuffer, offset, inp.RiskState, 9); offset += 9;
-            CopyFeatures(featPackedBuffer, offset, inp.NewsFeatures ?? _zeroNews, 16); offset += 16;
-            CopyFeatures(featPackedBuffer, offset, inp.CorrelationFeatures ?? _zeroCorrelation, 20); offset += 20;
-            CopyFeatures(featPackedBuffer, offset, inp.PortfolioExposure ?? _zeroExposure, 12);
+            CopyFeatures(featPackedBuffer, offset, inp.NewsFeatures ?? ZeroNews, 16); offset += 16;
+            CopyFeatures(featPackedBuffer, offset, inp.CorrelationFeatures ?? ZeroCorrelation, 20); offset += 20;
+            CopyFeatures(featPackedBuffer, offset, inp.PortfolioExposure ?? ZeroExposure, 12);
         }
         
-        tensors[2] = torch.tensor(featPackedBuffer, new long[] { batchSize, TOTAL_FEATURES }, 
+        tensors[2] = tensor(featPackedBuffer, new long[] { batchSize, totalFeatures }, 
             dtype: ScalarType.Float32, device: _device);
              
         return tensors;
     }
-    
-    // Fast copy helper with NaN check
+
     private static void CopyFeatures(float[] dest, int destOffset, float[] source, int len)
     {
-        for (int i = 0; i < len; i++)
+        for (var i = 0; i < len; i++)
         {
-            float val = source[i];
+            var val = source[i];
             dest[destOffset + i] = float.IsFinite(val) ? val : 0f;
         }
     }
-    
-    // Zero arrays for optional features
-    private static readonly float[] _zeroNews = new float[16];
-    private static readonly float[] _zeroCorrelation = new float[20];
-    private static readonly float[] _zeroExposure = new float[12];
 
-    
-    private Tensor BatchFloatArrayOptimized(AgentInput[] inputs, int batchSize, float[]? prealloc, 
-        Func<AgentInput, float[]> selector, int dim)
-    {
-        int len = batchSize * dim;
-        float[] flat = prealloc ?? new float[len];
-        
-        for (int i = 0; i < batchSize; i++)
-        {
-            var source = selector(inputs[i]);
-            int offset = i * dim;
-            
-            // Use Buffer.BlockCopy for source arrays (4 bytes per float)
-            Buffer.BlockCopy(source, 0, flat, offset * sizeof(float), dim * sizeof(float));
-        }
-        
-        // NaN check pass (vectorizable by JIT)
-        for (int i = 0; i < len; i++)
-        {
-            if (!float.IsFinite(flat[i]))
-                flat[i] = 0f;
-        }
-        
-        return torch.tensor(flat, new long[] { batchSize, dim }, dtype: ScalarType.Float32, device: _device);
-    }
+    private static readonly float[] ZeroNews = new float[16];
+    private static readonly float[] ZeroCorrelation = new float[20];
+    private static readonly float[] ZeroExposure = new float[12];
+
 
     public void Dispose()
     {
@@ -513,65 +442,57 @@ public class PpoAgent : IAgent, IDisposable
     }
 }
 
-// Simple Dataset/Loader helpers
-class PpoDataset
+internal class PpoDataset
 {
-    public AgentInput[] States;
-    public int[] Actions;
-    public float[] LogProbs;
-    public float[] Advantages;
-    public float[] Returns;
+    public readonly AgentInput[] States;
+    public readonly int[] Actions;
+    public readonly float[] LogProbs;
+    public readonly float[] Advantages;
+    public readonly float[] Returns;
     
     public PpoDataset(List<Experience> rollouts, float[] advantages, float[] returns)
     {
-        int n = rollouts.Count;
+        var n = rollouts.Count;
         States = new AgentInput[n];
         Actions = new int[n];
         LogProbs = new float[n];
         Advantages = advantages;
         Returns = returns;
         
-        for(int i=0; i<n; i++)
+        for(var i=0; i<n; i++)
         {
             States[i] = rollouts[i].State;
             Actions[i] = rollouts[i].Action;
-            LogProbs[i] = rollouts[i].Priority; // Hijacked field
+            LogProbs[i] = rollouts[i].Priority;
         }
     }
 }
 
-class DataLoader 
+internal class DataLoader(PpoDataset ds, int batch, bool shuffle)
 {
-    private PpoDataset _ds;
-    private int _batch;
-    private bool _shuffle;
-    private Random _rng = new Random();
-    
-    public DataLoader(PpoDataset ds, int batch, bool shuffle) { _ds = ds; _batch = batch; _shuffle = shuffle; }
-    
+    private readonly Random _rng = new();
+
     public IEnumerator<PpoBatch> GetEnumerator()
     {
-        int n = _ds.States.Length;
+        var n = ds.States.Length;
         var indices = Enumerable.Range(0, n).ToArray();
         
-        if (_shuffle)
+        if (shuffle)
         {
-            // Fisher-Yates shuffle
-            for (int i = n - 1; i > 0; i--)
+            for (var i = n - 1; i > 0; i--)
             {
-                int k = _rng.Next(i + 1);
+                var k = _rng.Next(i + 1);
                 (indices[i], indices[k]) = (indices[k], indices[i]);
             }
         }
         
-        for(int i=0; i<n; i+=_batch)
+        for(var i=0; i<n; i+=batch)
         {
-             int len = Math.Min(_batch, n-i);
+             var len = Math.Min(batch, n-i);
              var batchIndices = new int[len];
              Array.Copy(indices, i, batchIndices, 0, len);
-             
-             // Construct batch
-             var batch = new PpoBatch
+
+             var batch1 = new PpoBatch
              {
                  States = new AgentInput[len],
                  Actions = new int[len],
@@ -580,22 +501,22 @@ class DataLoader
                  Returns = new float[len]
              };
              
-             for(int j=0; j<len; j++)
+             for(var j=0; j<len; j++)
              {
-                 int idx = batchIndices[j];
-                 batch.States[j] = _ds.States[idx];
-                 batch.Actions[j] = _ds.Actions[idx];
-                 batch.LogProbs[j] = _ds.LogProbs[idx];
-                 batch.Advantages[j] = _ds.Advantages[idx];
-                 batch.Returns[j] = _ds.Returns[idx];
+                 var idx = batchIndices[j];
+                 batch1.States[j] = ds.States[idx];
+                 batch1.Actions[j] = ds.Actions[idx];
+                 batch1.LogProbs[j] = ds.LogProbs[idx];
+                 batch1.Advantages[j] = ds.Advantages[idx];
+                 batch1.Returns[j] = ds.Returns[idx];
              }
              
-             yield return batch;
+             yield return batch1;
         }
     }
 }
 
-struct PpoBatch {
+internal struct PpoBatch {
     public AgentInput[] States;
     public int[] Actions;
     public float[] LogProbs;

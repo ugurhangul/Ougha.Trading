@@ -1,13 +1,10 @@
-using System;
-using System.Collections.Generic;
-using TorchSharp;
 using static TorchSharp.torch;
 using static TorchSharp.torch.nn;
 using TorchSharp.Modules;
 
 namespace Ougha.Trading.RL.Models;
 
-public class DqnModel : Module<Tensor[], (Tensor QValues, Tensor TpSlMultipliers)>
+public sealed class DqnModel : Module<Tensor[], (Tensor QValues, Tensor TpSlMultipliers)>
 {
     private readonly ModuleList<LSTM> _lstmEncoders;
     private readonly ModuleList<LayerNorm> _inputNorms;
@@ -25,16 +22,10 @@ public class DqnModel : Module<Tensor[], (Tensor QValues, Tensor TpSlMultipliers
     private readonly Linear _actionHead;
     private readonly Linear _tpSlHead;
 
-    private readonly int _windowSize;
-    private readonly int _nFeatures;
-    private readonly int _lstmUnits;
-    private readonly int _embedDim;
-
     private const int N_TIMEFRAMES = 5;
 
     public DqnModel(
         string name,
-        int windowSize = 20,
         int nFeatures = 45,
         int actionSpace = 3,
         int numSymbols = SymbolIdMapper.MaxSymbols,
@@ -45,35 +36,21 @@ public class DqnModel : Module<Tensor[], (Tensor QValues, Tensor TpSlMultipliers
         bool includeNews = true,
         bool includeCrossSymbol = true) : base(name)
     {
-        _windowSize = windowSize;
-        _nFeatures = nFeatures;
-        _lstmUnits = lstmUnits;
-        _embedDim = symbolEmbedDim;
-        
-        hiddenSizes ??= new[] { 256, 128 };
-        
-        // 1. LSTM Encoders (one per timeframe) with input normalization
+        hiddenSizes ??= [256, 128];
+
         _lstmEncoders = new ModuleList<LSTM>();
         _inputNorms = new ModuleList<LayerNorm>();
-        for (int i = 0; i < N_TIMEFRAMES; i++)
+        for (var i = 0; i < N_TIMEFRAMES; i++)
         {
-            // Input normalization for each timeframe features
-            _inputNorms.Add(LayerNorm(new long[] { nFeatures }));
-            // batch_first=true is important
+            _inputNorms.Add(LayerNorm([nFeatures]));
             _lstmEncoders.Add(LSTM(nFeatures, lstmUnits, batchFirst: true));
         }
-        
-        // 2. Attention
-        int keyDim = Math.Max(8, lstmUnits / attentionHeads);
+
         _attention = MultiheadAttention(lstmUnits, attentionHeads, dropout: 0.0, bias: true, add_bias_kv: false, add_zero_attn: false, kdim: null, vdim: null);
-        _attnNorm = LayerNorm(new long[] { lstmUnits });
-        
-        // 3. Symbol Embedding
+        _attnNorm = LayerNorm([lstmUnits]);
+
         _symbolEmbedding = Embedding(numSymbols, symbolEmbedDim);
-        
-        // 4. Input Dimensions Calculation
-        // Fused (lstmUnits) + Symbol (embedDim) + Trigger (5) + Confluence (10) + Portfolio (5) + Risk (9)
-        // Portfolio now includes balance (5 instead of 4)
+
         long totalInputDim = lstmUnits + symbolEmbedDim + 5 + 10 + 5 + 9;
 
         if (includeNews)
@@ -91,11 +68,10 @@ public class DqnModel : Module<Tensor[], (Tensor QValues, Tensor TpSlMultipliers
             totalInputDim += 16;
         }
 
-        // 5. Hidden Layers
         _hiddenLayers = new ModuleList<Linear>();
         _dropouts = new ModuleList<Dropout>();
 
-        long inputDim = totalInputDim;
+        var inputDim = totalInputDim;
         foreach (var size in hiddenSizes)
         {
             _hiddenLayers.Add(Linear(inputDim, size));
@@ -103,10 +79,7 @@ public class DqnModel : Module<Tensor[], (Tensor QValues, Tensor TpSlMultipliers
             inputDim = size;
         }
 
-        // 6. Output Heads
-        // Action head: 3 discrete actions (Hold, Buy, Sell)
         _actionHead = Linear(inputDim, actionSpace);
-        // TP/SL head: 2 continuous values (TP multiplier, SL multiplier)
         _tpSlHead = Linear(inputDim, 2);
 
         RegisterComponents();
@@ -129,35 +102,35 @@ public class DqnModel : Module<Tensor[], (Tensor QValues, Tensor TpSlMultipliers
     public override (Tensor QValues, Tensor TpSlMultipliers) forward(Tensor[] inputs)
     {
         var encodedTfs = new List<Tensor>();
-        for (int i = 0; i < N_TIMEFRAMES; i++)
+        for (var i = 0; i < N_TIMEFRAMES; i++)
         {
             var normalized = _inputNorms[i].forward(inputs[i]);
-            var (output, hn, cn) = _lstmEncoders[i].forward(normalized);
+            var (_, hn, _) = _lstmEncoders[i].forward(normalized);
             encodedTfs.Add(hn.squeeze(0));
         }
 
-        var stacked = torch.stack(encodedTfs, dim: 1);
+        var stacked = stack(encodedTfs, dim: 1);
 
         var stackedPermuted = stacked.permute(1, 0, 2);
         var (attnOutput, _) = _attention.forward(stackedPermuted, stackedPermuted, stackedPermuted, key_padding_mask: null, need_weights: false, attn_mask: null);
         attnOutput = attnOutput.permute(1, 0, 2);
 
         attnOutput = _attnNorm.forward(attnOutput + stacked);
-        var fused = attnOutput.mean(new long[] { 1 });
+        var fused = attnOutput.mean([1]);
 
-        var symEmbed = _symbolEmbedding.forward(inputs[5].to(torch.int64)).flatten(1);
+        var symEmbed = _symbolEmbedding.forward(inputs[5].to(int64)).flatten(1);
 
         var toConcat = new List<Tensor>
         {
             fused,
             symEmbed,
-            inputs[6], // Trigger
-            inputs[7], // Confluence
-            inputs[8], // Portfolio (now 5D with balance)
-            inputs[9]  // Risk
+            inputs[6],
+            inputs[7],
+            inputs[8],
+            inputs[9]
         };
 
-        int processedIdx = 10;
+        var processedIdx = 10;
 
         if (_newsEncoder != null && inputs.Length > processedIdx)
         {
@@ -173,26 +146,21 @@ public class DqnModel : Module<Tensor[], (Tensor QValues, Tensor TpSlMultipliers
 
         if (_exposureEncoder != null && inputs.Length > processedIdx)
         {
-            var expo = functional.relu(_exposureEncoder.forward(inputs[processedIdx++]));
+            var expo = functional.relu(_exposureEncoder.forward(inputs[processedIdx]));
             toConcat.Add(expo);
         }
 
-        var combined = torch.cat(toConcat, dim: 1);
+        var combined = cat(toConcat, dim: 1);
 
         var x = combined;
-        for (int i = 0; i < _hiddenLayers.Count; i++)
+        for (var i = 0; i < _hiddenLayers.Count; i++)
         {
             x = functional.relu(_hiddenLayers[i].forward(x));
             x = _dropouts[i].forward(x);
         }
 
-        // Action Q-values (3 actions: Hold, Buy, Sell)
         var qValues = _actionHead.forward(x);
 
-        // TP/SL multipliers with sigmoid to bound output [0, 1]
-        // These will be scaled to actual ATR multipliers in the environment
-        // tpSlRaw[0] = TP multiplier (will be scaled to 1.0-5.0 ATR range)
-        // tpSlRaw[1] = SL multiplier (will be scaled to 0.5-3.0 ATR range)
         var tpSlRaw = functional.sigmoid(_tpSlHead.forward(x));
 
         return (qValues, tpSlRaw);

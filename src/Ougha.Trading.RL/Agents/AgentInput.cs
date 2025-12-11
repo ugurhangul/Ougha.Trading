@@ -28,20 +28,4 @@ public record AgentInput
 
     public float[]? PortfolioExposure { get; init; }
 
-    public static AgentInput Empty(int windowSize, int nFeatures) => new()
-    {
-        TimeframeFeatures = new Dictionary<string, float[,]>
-        {
-            ["M1"] = new float[windowSize, nFeatures],
-            ["M5"] = new float[windowSize, nFeatures],
-            ["M15"] = new float[windowSize, nFeatures],
-            ["H1"] = new float[windowSize, nFeatures],
-            ["H4"] = new float[windowSize, nFeatures]
-        },
-        SymbolId = 0,
-        TriggerContext = new float[5],
-        ConfluenceFeatures = new float[10],
-        PortfolioFeatures = new float[5],
-        RiskState = new float[9]
-    };
 }

@@ -1,5 +1,4 @@
 using Ougha.Trading.Core.Models;
-using Ougha.Trading.Risk;
 
 namespace Ougha.Trading.RL;
 
@@ -9,9 +8,9 @@ public static class ActionDecoder
 
     public static TradeType? Decode(int action) => action switch
     {
-        0 => null,           // HOLD
-        1 => TradeType.Buy,  // BUY
-        2 => TradeType.Sell, // SELL
+        0 => null,
+        1 => TradeType.Buy,
+        2 => TradeType.Sell,
         _ => null
     };
 

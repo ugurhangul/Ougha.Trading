@@ -8,5 +8,5 @@ public record Candle(
     double Close,
     long Volume)
 {
-    public Candle() : this(default, default, default, default, default, default) { }
+    public Candle() : this(default, 0, 0, 0, 0, 0) { }
 }

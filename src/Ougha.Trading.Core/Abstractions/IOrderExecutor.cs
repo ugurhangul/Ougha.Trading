@@ -31,7 +31,6 @@ public interface IOrderExecutor
     /// </summary>
     Task<bool> ModifyPositionAsync(string symbol, double sl, double tp);
 
-    // Data Access
     /// <summary>
     /// Get all open positions.
     /// </summary>

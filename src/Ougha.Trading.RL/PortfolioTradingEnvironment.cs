@@ -1,7 +1,6 @@
 using Ougha.Trading.Backtesting;
 using Ougha.Trading.Core.Abstractions;
 using Ougha.Trading.Core.Models;
-using Ougha.Trading.Risk;
 using Ougha.Trading.Features.Indicators;
 using Ougha.Trading.RL.Agents;
 
@@ -17,29 +16,22 @@ public class PortfolioTradingEnvironment
     private readonly PortfolioStateBuilder _stateBuilder;
     private readonly RewardCalculator _rewardCalculator;
     private readonly PortfolioEnvironmentConfig _config;
-    private readonly PortfolioManager _portfolioManager;
-    private readonly IFeatureBuilder _featureBuilder;
 
-    // Per-symbol state tracking - now uses MTF aggregator for all timeframes
     private readonly Dictionary<string, MultiTimeframeCandleAggregator> _mtfAggregators;
     private readonly Dictionary<string, MultiTimeframeStateBuilder> _mtfBuilders;
     private readonly Dictionary<string, int> _positionOpenTicks;
     private readonly Dictionary<string, double> _peakUnrealizedPnls;
     private readonly Dictionary<string, List<string>> _lastClosedTimeframes;
-    
-    // Action memory tracking (matches Python's action_memory_window)
+
     private readonly Dictionary<string, int> _lastExecutedAction;
     private readonly Dictionary<string, int> _lastExecutedTick;
-    private readonly int _actionMemoryWindow; // Configurable, default 1050
-    private const int MIN_HOLDING_TICKS = 50; // Minimum ticks before closing
+    private readonly int _actionMemoryWindow;
+    private const int MIN_HOLDING_TICKS = 50;
 
-    // Per-symbol action tracking for online learning (tracks every action, not just executed)
     private readonly Dictionary<string, int> _lastActionBySymbol;
 
-    // Per-symbol TP/SL multipliers from model output
     private readonly Dictionary<string, (float TpMult, float SlMult)> _lastTpSlMultipliers;
 
-    // Global state
     private int _currentTick;
     private double _peakEquity;
     private double _initialBalance;
@@ -47,13 +39,6 @@ public class PortfolioTradingEnvironment
     private int _lastM1Minute = -1;
 
     public int StateSize => _stateBuilder.GetStateSize(_config.Symbols.Length);
-    public int ActionSize => ActionDecoder.NumActions; // 3 actions: HOLD, BUY, SELL
-    public string[] Symbols => _config.Symbols;
-    
-    /// <summary>
-    /// Expose RewardCalculator for episode metric resets.
-    /// </summary>
-    public RewardCalculator RewardCalculator => _rewardCalculator;
     
     /// <summary>
     /// Expose executor for stats access (positions, balance, results).
@@ -68,20 +53,16 @@ public class PortfolioTradingEnvironment
     public PortfolioTradingEnvironment(
         BacktestExecutor executor,
         IFeatureBuilder featureBuilder,
-        PortfolioManager portfolioManager,
         RewardCalculator rewardCalculator,
         PortfolioEnvironmentConfig config)
     {
         _executor = executor;
-        _featureBuilder = featureBuilder;
-        _portfolioManager = portfolioManager;
         _rewardCalculator = rewardCalculator;
         _config = config;
         _stateBuilder = new PortfolioStateBuilder(featureBuilder, config.WindowSize);
         _initialBalance = executor.GetBalance();
         _peakEquity = _initialBalance;
 
-        // Initialize per-symbol state with MTF aggregators
         _mtfAggregators = new Dictionary<string, MultiTimeframeCandleAggregator>();
         _mtfBuilders = new Dictionary<string, MultiTimeframeStateBuilder>();
         _positionOpenTicks = new Dictionary<string, int>();
@@ -102,7 +83,7 @@ public class PortfolioTradingEnvironment
             _peakUnrealizedPnls[symbol] = 0;
             _lastClosedTimeframes[symbol] = new List<string>();
             _lastActionBySymbol[symbol] = 0;
-            _lastTpSlMultipliers[symbol] = (0.5f, 0.5f); // Default middle values
+            _lastTpSlMultipliers[symbol] = (0.5f, 0.5f);
         }
 
         _reusableRewards = new float[config.Symbols.Length];
@@ -117,9 +98,7 @@ public class PortfolioTradingEnvironment
     public async Task<(AgentInput[] NextStates, float[] Rewards, bool[] Dones)> StepTrainingAsync(int[] actions)
     {
         var (rewards, dones, m1CandleClosed) = await StepFastAsync(actions);
-        
-        // OPTIMIZATION: Only rebuild features when M1 candle closes or cache is empty
-        // This avoids expensive feature computation on every tick
+
         AgentInput[] nextStates;
         if (_isDone)
         {
@@ -140,8 +119,8 @@ public class PortfolioTradingEnvironment
 
 
     private AgentInput[]? _cachedAgentInputs;
-    private static readonly float[] _emptyRewards = new float[8];
-    private static readonly bool[] _doneFlagsTrue = Enumerable.Repeat(true, 8).ToArray();
+    private static readonly float[] EmptyRewards = new float[8];
+    private static readonly bool[] DoneFlagsTrue = Enumerable.Repeat(true, 8).ToArray();
     private readonly float[] _reusableRewards;
     private readonly bool[] _reusableDones;
 
@@ -151,39 +130,37 @@ public class PortfolioTradingEnvironment
     /// </summary>
     public async Task<(float[] Rewards, bool[] Dones, bool M1CandleClosed)> StepFastAsync(int[] actions)
     {
-        int symbolCount = _config.Symbols.Length;
+        var symbolCount = _config.Symbols.Length;
 
         if (_isDone)
         {
-            var emptyRewards = symbolCount <= 8 ? _emptyRewards : new float[symbolCount];
-            var trueDones = symbolCount <= 8 ? _doneFlagsTrue : Enumerable.Repeat(true, symbolCount).ToArray();
+            var emptyRewards = symbolCount <= 8 ? EmptyRewards : new float[symbolCount];
+            var trueDones = symbolCount <= 8 ? DoneFlagsTrue : Enumerable.Repeat(true, symbolCount).ToArray();
             return (emptyRewards, trueDones, false);
         }
 
         Array.Clear(_reusableRewards, 0, symbolCount);
         Array.Clear(_reusableDones, 0, symbolCount);
 
-        for (int i = 0; i < symbolCount; i++)
+        for (var i = 0; i < symbolCount; i++)
         {
             _lastActionBySymbol[_config.Symbols[i]] = actions[i];
         }
 
-        bool moreData = await _executor.AdvanceAsync();
+        var moreData = await _executor.AdvanceAsync();
         _currentTick++;
 
-        // Process automatic TP/SL closes that happened during AdvanceAsync
-        // CRITICAL: This gives the agent reward signals for profitable closes!
         var pendingCloses = _executor.GetAndClearPendingCloses();
         foreach (var closeInfo in pendingCloses)
         {
-            int symbolIndex = Array.IndexOf(_config.Symbols, closeInfo.Symbol);
+            var symbolIndex = Array.IndexOf(_config.Symbols, closeInfo.Symbol);
             if (symbolIndex >= 0)
             {
                 double maxDrawdownPct = 0;
                 if (_peakEquity > 0)
                     maxDrawdownPct = (_peakEquity - _executor.GetEquity()) / _peakEquity;
 
-                float closeReward = _rewardCalculator.Calculate(
+                var closeReward = _rewardCalculator.Calculate(
                     tradeClosed: true,
                     tradeProfit: closeInfo.Profit,
                     holdingTicks: closeInfo.HoldingTicks,
@@ -199,12 +176,12 @@ public class PortfolioTradingEnvironment
             }
         }
 
-        string? tickedSymbol = _executor.LastTickedSymbol;
-        bool m1CandleClosed = false;
+        var tickedSymbol = _executor.LastTickedSymbol;
+        var m1CandleClosed = false;
 
         if (tickedSymbol != null)
         {
-            int symbolIndex = Array.IndexOf(_config.Symbols, tickedSymbol);
+            var symbolIndex = Array.IndexOf(_config.Symbols, tickedSymbol);
             if (symbolIndex >= 0)
             {
                 var action = actions[symbolIndex];
@@ -222,7 +199,6 @@ public class PortfolioTradingEnvironment
             }
         }
 
-        // Use time-based M1 detection for determinism (independent of tick order)
         var currentTime = _executor.CurrentTime;
         if (_lastM1Minute != currentTime.Minute)
         {
@@ -230,10 +206,10 @@ public class PortfolioTradingEnvironment
             m1CandleClosed = true;
         }
 
-        double currentEquity = _executor.GetEquity();
+        var currentEquity = _executor.GetEquity();
         if (currentEquity > _peakEquity) _peakEquity = currentEquity;
 
-        bool globalDone = !moreData;
+        var globalDone = !moreData;
         if (currentEquity < _initialBalance * (1 - _config.MaxLossPercent / 100.0))
             globalDone = true;
 
@@ -249,23 +225,22 @@ public class PortfolioTradingEnvironment
 
         var entryType = ActionDecoder.Decode(action);
 
-        bool tradeClosed = false;
+        var tradeClosed = false;
         double tradeProfit = 0;
-        int holdingTicks = 0;
+        var holdingTicks = 0;
 
         var pos = _executor.GetPosition(symbol);
-        bool hasPosition = pos != null;
+        var hasPosition = pos != null;
 
-        int lastAction = _lastExecutedAction.GetValueOrDefault(symbol, -1);
-        int lastTick = _lastExecutedTick.GetValueOrDefault(symbol, -_actionMemoryWindow);
-        int ticksSinceLastAction = _currentTick - lastTick;
+        var lastAction = _lastExecutedAction.GetValueOrDefault(symbol, -1);
+        var lastTick = _lastExecutedTick.GetValueOrDefault(symbol, -_actionMemoryWindow);
+        var ticksSinceLastAction = _currentTick - lastTick;
 
         if (lastAction == action && ticksSinceLastAction < _actionMemoryWindow)
             return (0, false);
 
-        int currentHoldingTicks = hasPosition ? _currentTick - _positionOpenTicks.GetValueOrDefault(symbol) : 0;
+        var currentHoldingTicks = hasPosition ? _currentTick - _positionOpenTicks.GetValueOrDefault(symbol) : 0;
 
-        // If we have a position and action is opposite direction, close first
         if (hasPosition && entryType.HasValue && pos!.Type != entryType.Value)
         {
             if (currentHoldingTicks >= MIN_HOLDING_TICKS)
@@ -286,49 +261,41 @@ public class PortfolioTradingEnvironment
             }
         }
 
-        // Open new position if no position
         if (entryType.HasValue && !hasPosition)
         {
             var candle = _executor.GetLastKnownCandle(symbol);
             if (candle != null)
             {
-                double atr = CalculateAtr(symbol);
+                var atr = CalculateAtr(symbol);
                 if (atr <= 0 || double.IsNaN(atr))
                     atr = candle.Close * 0.001;
 
                 var symInfo = _executor.GetSymbolInfo(symbol)
                     ?? new SymbolInfo(symbol, 0.00001, 100000, 1, 0.00001, "USD", "USD", 5);
 
-                // Get TP/SL multipliers from model output
                 var (tpMult, slMult) = _lastTpSlMultipliers.GetValueOrDefault(symbol, (0.5f, 0.5f));
 
-                // Scale multipliers to ATR ranges:
-                // TP: 1.0 - 5.0 ATR (tpMult is 0-1 from sigmoid)
-                // SL: 0.5 - 3.0 ATR (slMult is 0-1 from sigmoid)
-                double tpAtrMult = 1.0 + tpMult * 4.0;  // 1.0 to 5.0
-                double slAtrMult = 0.5 + slMult * 2.5;  // 0.5 to 3.0
+                var tpAtrMult = 1.0 + tpMult * 4.0;
+                var slAtrMult = 0.5 + slMult * 2.5;
 
-                double slDistance = atr * slAtrMult;
-                double tpDistance = atr * tpAtrMult;
-                
-                // Use Bid/Ask from executor (which uses Close +/- spread now)
-                double bid = _executor.GetBid(symbol);
-                double ask = _executor.GetAsk(symbol);
+                var slDistance = atr * slAtrMult;
+                var tpDistance = atr * tpAtrMult;
 
-                double sl = entryType.Value == TradeType.Buy
+                var bid = _executor.GetBid(symbol);
+                var ask = _executor.GetAsk(symbol);
+
+                var sl = entryType.Value == TradeType.Buy
                     ? bid - slDistance
                     : ask + slDistance;
 
-                double tp = entryType.Value == TradeType.Buy
+                var tp = entryType.Value == TradeType.Buy
                     ? bid + tpDistance
                     : ask - tpDistance;
 
-                // Calculate position size based on risk
-                double riskAmount = _executor.GetEquity() * 0.01; // 1% risk per trade
-                double slPoints = slDistance / symInfo.Point;
-                double tickValue = symInfo.TickValue;
-                // Avoid DBZ
-                double volume = tickValue > 0 && slPoints > 0
+                var riskAmount = _executor.GetEquity() * 0.01;
+                var slPoints = slDistance / symInfo.Point;
+                var tickValue = symInfo.TickValue;
+                var volume = tickValue > 0 && slPoints > 0
                     ? riskAmount / (tickValue * slPoints)
                     : 0.01;
                 volume = Math.Max(0.01, Math.Min(volume, 100.0));
@@ -348,7 +315,7 @@ public class PortfolioTradingEnvironment
         }
 
         pos = _executor.GetPosition(symbol);
-        double unrealized = pos?.UnrealizedPnlPercent / 100.0 ?? 0;
+        var unrealized = pos?.UnrealizedPnlPercent / 100.0 ?? 0;
 
         if (unrealized > _peakUnrealizedPnls.GetValueOrDefault(symbol))
             _peakUnrealizedPnls[symbol] = unrealized;
@@ -357,7 +324,7 @@ public class PortfolioTradingEnvironment
         if (_peakEquity > 0)
             maxDrawdownPct = (_peakEquity - _executor.GetEquity()) / _peakEquity;
 
-        float reward = _rewardCalculator.Calculate(
+        var reward = _rewardCalculator.Calculate(
             tradeClosed, tradeProfit, holdingTicks,
             pos != null, unrealized, _peakUnrealizedPnls.GetValueOrDefault(symbol),
             _initialBalance, maxDrawdownPct);
@@ -372,7 +339,7 @@ public class PortfolioTradingEnvironment
 
     public void SetTpSlMultipliersBatch(float[,] tpSlMultipliers)
     {
-        for (int i = 0; i < _config.Symbols.Length && i < tpSlMultipliers.GetLength(0); i++)
+        for (var i = 0; i < _config.Symbols.Length && i < tpSlMultipliers.GetLength(0); i++)
         {
             _lastTpSlMultipliers[_config.Symbols[i]] = (tpSlMultipliers[i, 0], tpSlMultipliers[i, 1]);
         }
@@ -384,58 +351,23 @@ public class PortfolioTradingEnvironment
         if (history.Count < 15)
             return 0;
 
-        double[] h = history.Select(c => c.High).ToArray();
-        double[] l = history.Select(c => c.Low).ToArray();
-        double[] c = history.Select(c => c.Close).ToArray();
+        var h = history.Select(c => c.High).ToArray();
+        var l = history.Select(c => c.Low).ToArray();
+        var c = history.Select(c => c.Close).ToArray();
 
         var atrSeries = Technicals.Atr(h, l, c, 14);
         return atrSeries[^1];
     }
 
-    private float[] BuildCurrentState()
-    {
-        var symbolCandles = new Dictionary<string, IReadOnlyList<Candle>>();
-        var portfolioStates = new Dictionary<string, SymbolPortfolioState>();
-
-        foreach (var symbol in _config.Symbols)
-        {
-            symbolCandles[symbol] = _mtfAggregators[symbol].GetCandles("M1", _config.WindowSize);
-
-            var pos = _executor.GetPosition(symbol);
-            if (pos != null)
-            {
-                double unrealized = pos.UnrealizedPnlPercent / 100.0;
-                double peakPnl = _peakUnrealizedPnls.GetValueOrDefault(symbol);
-                double drawdown = Math.Max(0, peakPnl - unrealized);
-                
-                int heldTicks = _currentTick - _positionOpenTicks.GetValueOrDefault(symbol);
-                double holdingTimeNorm = Math.Min(1.0, heldTicks / (double)_config.MaxHoldingSteps);
-
-                portfolioStates[symbol] = new SymbolPortfolioState(
-                    HasPosition: true,
-                    PositionType: pos.Type,
-                    UnrealizedPnlPct: unrealized,
-                    HoldingTimeNorm: holdingTimeNorm,
-                    DrawdownPct: drawdown);
-            }
-            else
-            {
-                portfolioStates[symbol] = SymbolPortfolioState.Flat;
-            }
-        }
-
-        return _stateBuilder.BuildPortfolioState(symbolCandles, portfolioStates, _config.Symbols);
-    }
-
     /// <summary>
     /// Build structured AgentInput for each symbol.
-    /// This is the recommended method for new ONNX agent interface.
+    /// This is the recommended method for the new ONNX agent interface.
     /// </summary>
     public AgentInput[] BuildAgentInputs()
     {
         var inputs = new AgentInput[_config.Symbols.Length];
 
-        for (int i = 0; i < _config.Symbols.Length; i++)
+        for (var i = 0; i < _config.Symbols.Length; i++)
         {
             var symbol = _config.Symbols[i];
             inputs[i] = BuildAgentInputForSymbol(symbol);
@@ -451,8 +383,7 @@ public class PortfolioTradingEnvironment
     {
         var mtfBuilder = _mtfBuilders[symbol];
         var mtfAggregator = _mtfAggregators[symbol];
-        
-        // Update MTF builder with all timeframe candles from aggregator
+
         var allTimeframeCandles = mtfAggregator.GetAllTimeframeCandles(_config.WindowSize + 50);
         foreach (var (timeframe, candles) in allTimeframeCandles)
         {
@@ -461,39 +392,31 @@ public class PortfolioTradingEnvironment
                 mtfBuilder.UpdateCandles(timeframe, candles, symbol);
             }
         }
-        
-        // Fallback: copy M1 to missing timeframes if not enough data yet
+
         mtfBuilder.CopyM1ToMissingTimeframes();
 
         var pos = _executor.GetPosition(symbol);
-        bool hasPosition = pos != null;
+        var hasPosition = pos != null;
 
-        // Build portfolio features [5D] - includes balance
-        // [0] = position_type (1.0 for BUY, -1.0 for SELL, 0.0 for no position)
-        // [1] = unrealized_pnl * 100 (percent)
-        // [2] = min(1.0, holding_ticks / max_holding_ticks) (normalized)
-        // [3] = drawdown * 100 (percent)
-        // [4] = normalized balance (current_balance / initial_balance - 1.0)
         var portfolioFeatures = new float[5];
 
-        // Normalized balance: (current / initial) - 1.0, so 0 = break-even, positive = profit, negative = loss
-        double currentBalance = _executor.GetBalance();
+        var currentBalance = _executor.GetBalance();
         portfolioFeatures[4] = (float)((currentBalance / _initialBalance) - 1.0);
 
         if (hasPosition)
         {
             portfolioFeatures[0] = pos!.Type == TradeType.Buy ? 1.0f : -1.0f;
 
-            double unrealizedPnl = (pos.CurrentPrice - pos.OpenPrice) / pos.OpenPrice;
+            var unrealizedPnl = (pos.CurrentPrice - pos.OpenPrice) / pos.OpenPrice;
             if (pos.Type == TradeType.Sell) unrealizedPnl *= -1;
             portfolioFeatures[1] = (float)(unrealizedPnl * 100.0);
 
-            int heldTicks = _currentTick - _positionOpenTicks.GetValueOrDefault(symbol);
+            var heldTicks = _currentTick - _positionOpenTicks.GetValueOrDefault(symbol);
             portfolioFeatures[2] = (float)Math.Min(1.0, heldTicks / (double)_config.MaxHoldingSteps);
 
             if (unrealizedPnl > _peakUnrealizedPnls.GetValueOrDefault(symbol))
                 _peakUnrealizedPnls[symbol] = unrealizedPnl;
-            double drawdown = Math.Max(0.0, _peakUnrealizedPnls.GetValueOrDefault(symbol) - unrealizedPnl);
+            var drawdown = Math.Max(0.0, _peakUnrealizedPnls.GetValueOrDefault(symbol) - unrealizedPnl);
             portfolioFeatures[3] = (float)(drawdown * 100.0);
         }
 
@@ -521,13 +444,10 @@ public class PortfolioTradingEnvironment
 
     public Task<float[]> ResetAsync()
     {
-        // Reset executor to enable fresh episode data
         _executor.Reset();
-        
-        // Reset reward calculator episode metrics for proper PF/Sharpe tracking
+
         _rewardCalculator.ResetEpisode();
-        
-        // No warmup skip needed - candles are preloaded from QuestDB materialized views
+
         _currentTick = 0;
         _isDone = false;
         _initialBalance = _executor.GetBalance();
@@ -563,9 +483,8 @@ public class PortfolioTradingEnvironment
         DateTime episodeStartTime,
         int? candleCount = null)
     {
-        int count = candleCount ?? _config.WindowSize + 50;
-        
-        // Map internal timeframe keys to QuestDB materialized view names
+        var count = candleCount ?? _config.WindowSize + 50;
+
         var timeframeMap = new Dictionary<string, string>
         {
             ["M1"] = "m1",
@@ -590,8 +509,7 @@ public class PortfolioTradingEnvironment
                 }
             }
         }
-        
-        // Reset tick counter since we have pre-built candle history
+
         _currentTick = 0;
     }
 

@@ -27,7 +27,7 @@ public interface IFeatureBuilder
     float[,] BuildFeatures(IReadOnlyList<Candle> candles, string symbol);
 
     /// <summary>
-    /// Build flattened feature vector for model input.
+    /// Build a flattened feature vector for model input.
     /// </summary>
     /// <param name="candles">Historical candles</param>
     /// <param name="symbol">Symbol name</param>

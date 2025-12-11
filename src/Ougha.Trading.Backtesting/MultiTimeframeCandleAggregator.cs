@@ -19,13 +19,11 @@ public class MultiTimeframeCandleAggregator
 
     private readonly int _maxCandlesPerTimeframe;
 
-    // Completed candles per timeframe
     private readonly Dictionary<string, List<Candle>> _completedCandles = new();
 
-    // Current building candle per timeframe
     private readonly Dictionary<string, Candle?> _currentCandles = new();
 
-    public static readonly string[] Timeframes = { "M1", "M5", "M15", "H1", "H4" };
+    public static readonly string[] Timeframes = ["M1", "M5", "M15", "H1", "H4"];
 
     public MultiTimeframeCandleAggregator(int maxCandlesPerTimeframe = 100)
     {
@@ -33,7 +31,7 @@ public class MultiTimeframeCandleAggregator
 
         foreach (var tf in Timeframes)
         {
-            _completedCandles[tf] = new List<Candle>();
+            _completedCandles[tf] = [];
             _currentCandles[tf] = null;
         }
     }
@@ -53,16 +51,13 @@ public class MultiTimeframeCandleAggregator
 
             if (_currentCandles[tf] == null)
             {
-                // Start first candle
                 _currentCandles[tf] = CreateCandle(candleTime, tick);
             }
             else if (_currentCandles[tf]!.Time != candleTime)
             {
-                // Close current candle and start new one
                 _completedCandles[tf].Add(_currentCandles[tf]!);
                 closedTimeframes.Add(tf);
 
-                // Trim to max size
                 if (_completedCandles[tf].Count > _maxCandlesPerTimeframe)
                 {
                     _completedCandles[tf].RemoveAt(0);
@@ -72,7 +67,6 @@ public class MultiTimeframeCandleAggregator
             }
             else
             {
-                // Update current candle
                 _currentCandles[tf] = UpdateCandle(_currentCandles[tf]!, tick);
             }
         }
@@ -96,7 +90,6 @@ public class MultiTimeframeCandleAggregator
 
             if (_currentCandles[tf] == null)
             {
-                // Start first candle
                 _currentCandles[tf] = new Candle(
                     candleTime,
                     inputCandle.Open,
@@ -107,11 +100,9 @@ public class MultiTimeframeCandleAggregator
             }
             else if (_currentCandles[tf]!.Time != candleTime)
             {
-                // Close current candle and start new one
                 _completedCandles[tf].Add(_currentCandles[tf]!);
                 closedTimeframes.Add(tf);
 
-                // Trim to max size
                 if (_completedCandles[tf].Count > _maxCandlesPerTimeframe)
                 {
                     _completedCandles[tf].RemoveAt(0);
@@ -127,15 +118,10 @@ public class MultiTimeframeCandleAggregator
             }
             else
             {
-                // Merge input candle into current higher-timeframe candle
                 var current = _currentCandles[tf]!;
                 _currentCandles[tf] = new Candle(
                     current.Time,
-                    current.Open,                                       // Keep original open
-                    Math.Max(current.High, inputCandle.High),           // Highest high
-                    Math.Min(current.Low, inputCandle.Low),             // Lowest low
-                    inputCandle.Close,                                  // Latest close
-                    current.Volume + inputCandle.Volume);               // Sum volume
+                    current.Open, Math.Max(current.High, inputCandle.High), Math.Min(current.Low, inputCandle.Low), inputCandle.Close, current.Volume + inputCandle.Volume);
             }
         }
 
@@ -148,12 +134,6 @@ public class MultiTimeframeCandleAggregator
     /// <returns>List of timeframes that just closed a candle</returns>
     public List<string> AddM1Candle(Candle m1Candle)
     {
-        // Re-use generic AddCandle logic, or keep separate if M1 handling needs specific optimization? 
-        // For now, identical logic to generic AddCandle but specifically M1 is often base.
-        // Actually, AddM1Candle iterates ALL timeframes, including M1? 
-        // If input IS M1, then M1 logic in loop (period=1m) will just always be "Start new" or "Update"?
-        // If input is M1 aligned, it will simply replace/update. 
-        // Logic in AddCandle handles it correctly.
         return AddCandle(m1Candle);
     }
 
@@ -163,18 +143,17 @@ public class MultiTimeframeCandleAggregator
     public List<Candle> GetCandles(string timeframe, int count)
     {
         if (!_completedCandles.ContainsKey(timeframe))
-            return new List<Candle>();
+            return [];
 
         var completed = _completedCandles[timeframe];
         var current = _currentCandles[timeframe];
 
         var result = new List<Candle>();
-        int start = Math.Max(0, completed.Count - count);
+        var start = Math.Max(0, completed.Count - count);
 
-        for (int i = start; i < completed.Count; i++)
+        for (var i = start; i < completed.Count; i++)
             result.Add(completed[i]);
 
-        // Add current candle snapshot if exists
         if (current != null && result.Count < count)
             result.Add(current);
 
@@ -231,21 +210,17 @@ public class MultiTimeframeCandleAggregator
             return;
 
         _completedCandles[timeframe].Clear();
-        
-        // Add all candles except the last one (which might still be forming)
-        int count = candles.Count;
+
+        var count = candles.Count;
         if (count == 0) return;
-        
-        // Add completed candles
-        for (int i = 0; i < count - 1; i++)
+
+        for (var i = 0; i < count - 1; i++)
         {
             _completedCandles[timeframe].Add(candles[i]);
         }
-        
-        // Keep latest as "current" (potentially still forming)
+
         _currentCandles[timeframe] = candles[count - 1];
-        
-        // Trim to max size
+
         while (_completedCandles[timeframe].Count > _maxCandlesPerTimeframe)
         {
             _completedCandles[timeframe].RemoveAt(0);

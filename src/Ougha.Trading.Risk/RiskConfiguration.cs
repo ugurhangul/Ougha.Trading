@@ -7,5 +7,4 @@ public record RiskConfiguration(
     double MaxLotSize = 100.0,
     double MinLotSize = 0.01,
     bool UseTrailingStop = true,
-    double TrailingStopDistance = 50.0 // Points? Or R?
-);
+    double TrailingStopDistance = 50.0);

@@ -28,35 +28,24 @@ public record DataDensityInfo(
 /// Mirrors Python's TrainingBudget dataclass.
 /// </summary>
 public record TrainingBudget(
-    // Episode parameters
-    int Episodes,
+  int Episodes,
     int MaxSteps,
     int TickSkipMin,
     int TickSkipMax,
-
-    // Parallelism
     int EnvsPerSymbol,
     int Workers,
-
-    // Training loop
     int BatchSize,
     int TrainBatches,
     int TrainFreq,
     int MemorySize,
     int SaveFrequency,
-
-    // Model architecture
     int LstmUnits,
     int AttentionHeads,
     int[] HiddenLayers,
     double LearningRate,
-
-    // Schedule
     double EpsilonDecay,
     int EarlyStopPatience,
     int EarlyStopMinEpisodes,
-
-    // Metrics
     int NumSymbols,
     long TotalSamples,
     long SamplesPerSymbol,
@@ -64,8 +53,6 @@ public record TrainingBudget(
     double DaysPerEpisode,
     double EstimatedTrainingHours,
     HardwareInfo Hardware,
-
-    // Chunk-based training configuration
     int ChunkDays = 7,
     int ChunkPrefetchCount = 2,
     int ChunkHistoryBufferDays = 1,

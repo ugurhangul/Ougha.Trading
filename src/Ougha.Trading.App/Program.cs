@@ -4,9 +4,9 @@ using Ougha.Trading.App.Runners;
 
 namespace Ougha.Trading.App;
 
-class Program
+abstract class Program
 {
-    static async Task<int> Main(string[] args)
+    private static async Task<int> Main(string[] args)
     {
         var configBuilder = new ConfigurationBuilder()
             .SetBasePath(AppContext.BaseDirectory)
@@ -21,7 +21,6 @@ class Program
             description: "Execution mode: backtest, train, live",
             getDefaultValue: () => "backtest");
 
-        // Optional: Default null so we can check if passed
         var symbolOption = new Option<string?>(
             name: "--symbol",
             description: "Symbol to trade/test (overrides appsettings.json)",
@@ -43,10 +42,8 @@ class Program
 
         rootCommand.SetHandler(async (mode, symbolArg, episodes, train) =>
         {
-            // Inject train flag into config
             configuration["Backtest:Train"] = train.ToString();
 
-            // Determine Symbols
             string targetSymbols;
             if (!string.IsNullOrEmpty(symbolArg))
             {
@@ -54,7 +51,6 @@ class Program
             }
             else
             {
-                // Fallback to Config
                 var configSymbols = configuration.GetSection("Trading:Symbols").Get<string[]>();
 
                 if (configSymbols != null) targetSymbols = string.Join(",", configSymbols);

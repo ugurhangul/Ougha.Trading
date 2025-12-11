@@ -1,5 +1,3 @@
-using System;
-
 namespace Ougha.Trading.RL.Agents;
 
 /// <summary>
@@ -17,11 +15,6 @@ public interface IAgent : IDisposable
     int Act(AgentInput state, bool training = false);
 
     /// <summary>
-    /// Select actions for a batch of states, including TP/SL multipliers.
-    /// </summary>
-    (int[] Actions, float[,] TpSlMultipliers) ActBatchWithTpSl(AgentInput[] inputs, bool training = true);
-
-    /// <summary>
     /// Select actions for a batch of states, including TP/SL multipliers and log probabilities.
     /// Used by PPO for on-policy training where log probs must be stored with experiences.
     /// </summary>
@@ -31,16 +24,6 @@ public interface IAgent : IDisposable
     /// Add an experience tuple to the replay buffer.
     /// </summary>
     void AddExperience(AgentInput state, int action, float reward, AgentInput? nextState, bool done);
-
-    /// <summary>
-    /// Add a batch of experiences efficiently (vectorized add).
-    /// </summary>
-    void AddExperienceBatch(
-        AgentInput[] states,
-        int[] actions,
-        float[] rewards,
-        AgentInput?[] nextStates,
-        bool[] dones);
 
     /// <summary>
     /// Add a batch of experiences with log probabilities for PPO training.
@@ -76,13 +59,8 @@ public interface IAgent : IDisposable
     void Load(string path);
 
     /// <summary>
-    /// Reset online learning state for a new backtest run.
+    /// Reset the online learning state for a new backtest run.
     /// Clears replay buffer, resets epsilon, and step count.
     /// </summary>
     void ResetOnlineLearning();
-
-    /// <summary>
-    /// Get the current number of experiences in the replay buffer.
-    /// </summary>
-    int BufferCount { get; }
 }

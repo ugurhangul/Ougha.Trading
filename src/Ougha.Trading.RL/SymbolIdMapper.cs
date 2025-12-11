@@ -20,12 +20,12 @@ public static class SymbolIdMapper
 
     private static uint[] GenerateCrc32Table()
     {
-        const uint polynomial = 0xEDB88320; // IEEE 802.3 polynomial (reversed)
+        const uint polynomial = 0xEDB88320;
         var table = new uint[256];
         for (uint i = 0; i < 256; i++)
         {
-            uint crc = i;
-            for (int j = 0; j < 8; j++)
+            var crc = i;
+            for (var j = 0; j < 8; j++)
             {
                 if ((crc & 1) == 1)
                     crc = (crc >> 1) ^ polynomial;
@@ -42,8 +42,8 @@ public static class SymbolIdMapper
     /// </summary>
     private static uint ComputeCrc32(byte[] data)
     {
-        uint crc = 0xFFFFFFFF;
-        foreach (byte b in data)
+        var crc = 0xFFFFFFFF;
+        foreach (var b in data)
         {
             crc = Crc32Table[(crc ^ b) & 0xFF] ^ (crc >> 8);
         }
@@ -61,8 +61,8 @@ public static class SymbolIdMapper
         if (string.IsNullOrEmpty(symbol))
             return 0;
 
-        byte[] bytes = Encoding.UTF8.GetBytes(symbol);
-        uint crc = ComputeCrc32(bytes);
+        var bytes = Encoding.UTF8.GetBytes(symbol);
+        var crc = ComputeCrc32(bytes);
         return (int)(crc % MaxSymbols);
     }
 }

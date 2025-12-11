@@ -13,7 +13,7 @@ public class MultiTimeframeStateBuilder
     /// <summary>
     /// Supported timeframes in order (matching Python's SUPPORTED_TIMEFRAMES).
     /// </summary>
-    public static readonly string[] Timeframes = { "M1", "M5", "M15", "H1", "H4" };
+    public static readonly string[] Timeframes = ["M1", "M5", "M15", "H1", "H4"];
 
     private static readonly Dictionary<string, int> TimeframeIndex = Timeframes
         .Select((tf, i) => (tf, i))
@@ -23,11 +23,9 @@ public class MultiTimeframeStateBuilder
     private readonly int _nFeatures;
     private readonly IFeatureBuilder _featureBuilder;
 
-    // Feature buffers per timeframe [windowSize, nFeatures]
     private readonly Dictionary<string, float[,]> _featureBuffers = new();
     private readonly Dictionary<string, DateTime> _lastCandleTimes = new();
 
-    // Confluence cache
     private float[] _cachedConfluence = new float[10];
     private bool _confluenceDirty = true;
 
@@ -40,7 +38,6 @@ public class MultiTimeframeStateBuilder
         _windowSize = windowSize;
         _nFeatures = featureBuilder.FeatureCount;
 
-        // Initialize empty buffers
         foreach (var tf in Timeframes)
         {
             _featureBuffers[tf] = new float[windowSize, _nFeatures];
@@ -55,7 +52,7 @@ public class MultiTimeframeStateBuilder
     /// <param name="candles">Candle data (needs at least windowSize candles)</param>
     /// <param name="symbol">Symbol name for feature engineering</param>
     /// <returns>True if buffer was updated with new data</returns>
-    public bool UpdateCandles(string timeframe, IReadOnlyList<Candle> candles, string symbol)
+    public bool UpdateCandles(string timeframe, IReadOnlyList<Candle>? candles, string symbol)
     {
         if (!TimeframeIndex.ContainsKey(timeframe))
             return false;
@@ -67,17 +64,15 @@ public class MultiTimeframeStateBuilder
         if (lastCandleTime <= _lastCandleTimes[timeframe])
             return false;
 
-        // Build features for all candles
         var features = _featureBuilder.BuildFeatures(candles, symbol);
 
-        // Extract last windowSize rows
-        int startRow = Math.Max(0, features.GetLength(0) - _windowSize);
-        int rows = Math.Min(_windowSize, features.GetLength(0));
+        var startRow = Math.Max(0, features.GetLength(0) - _windowSize);
+        var rows = Math.Min(_windowSize, features.GetLength(0));
 
         var buffer = _featureBuffers[timeframe];
-        for (int i = 0; i < rows; i++)
+        for (var i = 0; i < rows; i++)
         {
-            for (int j = 0; j < _nFeatures; j++)
+            for (var j = 0; j < _nFeatures; j++)
             {
                 buffer[i, j] = features[startRow + i, j];
             }
@@ -95,16 +90,15 @@ public class MultiTimeframeStateBuilder
     public void CopyM1ToMissingTimeframes()
     {
         if (_lastCandleTimes["M1"] == DateTime.MinValue)
-            return; // No M1 data to copy
+            return;
 
         var m1Buffer = _featureBuffers["M1"];
         var m1Time = _lastCandleTimes["M1"];
 
-        foreach (var tf in Timeframes.Skip(1)) // Skip M1
+        foreach (var tf in Timeframes.Skip(1))
         {
             if (_lastCandleTimes[tf] == DateTime.MinValue)
             {
-                // Copy M1 buffer to this timeframe
                 var buffer = _featureBuffers[tf];
                 Array.Copy(m1Buffer, buffer, m1Buffer.Length);
                 _lastCandleTimes[tf] = m1Time;
@@ -125,7 +119,7 @@ public class MultiTimeframeStateBuilder
     /// <param name="minTimeframes">Minimum number of timeframes with data (default 3)</param>
     public bool HasSufficientData(int minTimeframes = 3)
     {
-        int count = _lastCandleTimes.Count(x => x.Value > DateTime.MinValue);
+        var count = _lastCandleTimes.Count(x => x.Value > DateTime.MinValue);
         return count >= minTimeframes;
     }
 
@@ -159,7 +153,6 @@ public class MultiTimeframeStateBuilder
 
         var confluence = new float[10];
 
-        // Get available timeframes with data
         var availableTfs = Timeframes
             .Where(tf => _lastCandleTimes[tf] > DateTime.MinValue)
             .ToList();
@@ -171,12 +164,11 @@ public class MultiTimeframeStateBuilder
             return confluence;
         }
 
-        // Feature indices (matching Python)
-        int sma7Idx = 4;  // sma_7_pct
-        int sma21Idx = 6; // sma_21_pct
-        int rsi14Idx = 29; // rsi_14
-        int macdHistIdx = 33; // macd_hist_pct
-        int volRegimeIdx = 39; // volatility_regime
+        var sma7Idx = 4;
+        var sma21Idx = 6;
+        var rsi14Idx = 29;
+        var macdHistIdx = 33;
+        var volRegimeIdx = 39;
 
         var trends = new List<int>();
         var volRegimes = new List<float>();
@@ -186,13 +178,12 @@ public class MultiTimeframeStateBuilder
         foreach (var tf in availableTfs)
         {
             var buffer = _featureBuffers[tf];
-            int lastRow = _windowSize - 1;
+            var lastRow = _windowSize - 1;
 
-            // Get feature values from last row
             if (lastRow >= 0 && lastRow < buffer.GetLength(0))
             {
-                float sma7 = buffer[lastRow, Math.Min(sma7Idx, _nFeatures - 1)];
-                float sma21 = buffer[lastRow, Math.Min(sma21Idx, _nFeatures - 1)];
+                var sma7 = buffer[lastRow, Math.Min(sma7Idx, _nFeatures - 1)];
+                var sma21 = buffer[lastRow, Math.Min(sma21Idx, _nFeatures - 1)];
                 trends.Add(sma7 > sma21 ? 1 : (sma7 < sma21 ? -1 : 0));
 
                 if (volRegimeIdx < _nFeatures)
@@ -206,42 +197,32 @@ public class MultiTimeframeStateBuilder
             }
         }
 
-        // 0: Trend alignment (-1 to 1)
         if (trends.Count > 0)
             confluence[0] = trends.Sum() / (float)trends.Count;
 
-        // 1: Trend agreement (0 or 1)
         if (trends.Count > 1)
             confluence[1] = trends.All(t => t > 0) || trends.All(t => t < 0) ? 1f : 0f;
 
-        // 2: Volatility regime average
         if (volRegimes.Count > 0)
             confluence[2] = volRegimes.Average();
 
-        // 3: Volatility agreement
         if (volRegimes.Count > 1)
             confluence[3] = volRegimes.All(v => v > 0.5f) || volRegimes.All(v => v <= 0.5f) ? 1f : 0f;
 
-        // 4: Average RSI (normalized to 0-1)
         if (rsis.Count > 0)
             confluence[4] = rsis.Average() / 100f;
 
-        // 5: RSI spread
         if (rsis.Count > 1)
             confluence[5] = (rsis.Max() - rsis.Min()) / 100f;
 
-        // 6: Average MACD histogram
         if (macdHists.Count > 0)
             confluence[6] = macdHists.Average();
 
-        // 7: MACD agreement
         if (macdHists.Count > 1)
             confluence[7] = macdHists.All(m => m > 0) || macdHists.All(m => m < 0) ? 1f : 0f;
 
-        // 8: Data coverage (0-1)
         confluence[8] = availableTfs.Count / (float)Timeframes.Length;
 
-        // 9: Bullish timeframe ratio
         if (trends.Count > 0)
             confluence[9] = trends.Count(t => t > 0) / (float)trends.Count;
 

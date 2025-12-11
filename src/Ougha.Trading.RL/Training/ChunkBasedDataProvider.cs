@@ -1,9 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Channels;
-using System.Threading.Tasks;
+﻿using System.Threading.Channels;
 using Ougha.Trading.Core.Models;
 using Ougha.Trading.Data;
 
@@ -20,8 +15,7 @@ public record DataChunk(
     DateTime StartDate,
     DateTime EndDate,
     List<(DateTime Time, string Symbol, Candle Candle)> Candles,
-    Dictionary<string, List<Candle>> HistoryBySymbol,
-    Dictionary<string, Dictionary<string, List<Candle>>>? MultiTimeframeCandles = null
+    Dictionary<string, List<Candle>> HistoryBySymbol
 );
 
 public class ChunkBasedDataProvider : IDisposable
@@ -33,19 +27,18 @@ public class ChunkBasedDataProvider : IDisposable
     private readonly ChunkConfig _config;
     private readonly string _timeframe;
     
-    private Channel<DataChunk> _chunkChannel;
-    private CancellationTokenSource _cts;
+    private readonly Channel<DataChunk> _chunkChannel;
+    private readonly CancellationTokenSource _cts;
     private Task? _producerTask;
     
     private readonly List<(DateTime Start, DateTime End)> _chunkBoundaries;
     private int _currentChunkIndex;
     private DataChunk? _currentChunk;
     private readonly Random _random;
-    private readonly object _lock = new();
+    private readonly Lock _lock = new();
 
     public int TotalChunks => _chunkBoundaries.Count;
     public int CurrentChunkIndex => _currentChunkIndex;
-    public bool IsExhausted => _currentChunkIndex >= _chunkBoundaries.Count && _currentChunk == null;
 
     public ChunkBasedDataProvider(
         QuestDbDataLoader dataLoader,
@@ -80,7 +73,7 @@ public class ChunkBasedDataProvider : IDisposable
     {
         var channel = _chunkChannel;
         var token = _cts.Token;
-        _producerTask = Task.Run(() => ProduceChunksAsync(channel, token));
+        _producerTask = Task.Run(() => ProduceChunksAsync(channel, token), token);
     }
 
     public async Task<DataChunk?> GetNextChunkAsync()
@@ -177,7 +170,7 @@ public class ChunkBasedDataProvider : IDisposable
         }
     }
 
-    private static readonly string[] MultiTimeframes = { "m1", "m5", "m15", "h1", "h4" };
+    private static readonly string[] MultiTimeframes = ["m1", "m5", "m15", "h1", "h4"];
 
     private async Task<DataChunk> LoadChunkAsync(DateTime historyStart, DateTime chunkStart, DateTime chunkEnd)
     {
@@ -187,7 +180,7 @@ public class ChunkBasedDataProvider : IDisposable
 
         foreach (var symbol in _symbols)
         {
-            historyBySymbol[symbol] = new List<Candle>();
+            historyBySymbol[symbol] = [];
             mtfCandles[symbol] = new Dictionary<string, List<Candle>>();
         }
 
@@ -205,24 +198,19 @@ public class ChunkBasedDataProvider : IDisposable
             }
         }
 
-        var mtfTasks = new List<Task>();
-        foreach (var symbol in _symbols)
-        {
-            foreach (var tf in MultiTimeframes)
+        var mtfTasks = (from symbol in _symbols
+            from tf in MultiTimeframes
+            let s = symbol
+            let t = tf
+            select Task.Run(async () =>
             {
-                var s = symbol;
-                var t = tf;
-                mtfTasks.Add(Task.Run(async () =>
+                var candles = await _dataLoader.LoadCandlesAsync(s, t, historyStart, chunkEnd);
+                var list = candles.OrderBy(c => c.Time).ToList();
+                lock (mtfCandles)
                 {
-                    var candles = await _dataLoader.LoadCandlesAsync(s, t, historyStart, chunkEnd);
-                    var list = candles.OrderBy(c => c.Time).ToList();
-                    lock (mtfCandles)
-                    {
-                        mtfCandles[s][t.ToUpper()] = list;
-                    }
-                }));
-            }
-        }
+                    mtfCandles[s][t.ToUpper()] = list;
+                }
+            })).ToList();
         await Task.WhenAll(mtfTasks);
 
         allCandles = allCandles.OrderBy(c => c.Time).ToList();
@@ -230,52 +218,18 @@ public class ChunkBasedDataProvider : IDisposable
         foreach (var symbol in _symbols)
             historyBySymbol[symbol] = historyBySymbol[symbol].OrderBy(c => c.Time).ToList();
 
-        return new DataChunk(chunkStart, chunkEnd, allCandles, historyBySymbol, mtfCandles);
-    }
-
-    public void Reset()
-    {
-        lock (_lock)
-        {
-            _currentChunkIndex = 0;
-            _currentChunk = null;
-        }
-
-        _cts.Cancel();
-        try
-        {
-            _producerTask?.Wait(TimeSpan.FromSeconds(2));
-        }
-        catch (AggregateException ex) when (ex.InnerExceptions.All(e => e is TaskCanceledException or OperationCanceledException))
-        {
-        }
-
-        _chunkChannel = Channel.CreateBounded<DataChunk>(new BoundedChannelOptions(_config.PrefetchChunks)
-        {
-            FullMode = BoundedChannelFullMode.Wait,
-            SingleReader = true,
-            SingleWriter = true
-        });
-
-        _cts = new CancellationTokenSource();
-        StartPrefetching();
-    }
-
-    public async Task<bool> HasMoreChunksAsync()
-    {
-        return await _chunkChannel.Reader.WaitToReadAsync() || _currentChunkIndex < _chunkBoundaries.Count;
+        return new DataChunk(chunkStart, chunkEnd, allCandles, historyBySymbol);
     }
 
     private static int BinarySearchTime(
         List<(DateTime Time, string Symbol, Candle Candle)> list, 
         DateTime target)
     {
-        // Binary search implementation
         int lo = 0, hi = list.Count - 1;
         while (lo <= hi)
         {
-            int mid = lo + (hi - lo) / 2;
-            int cmp = list[mid].Time.CompareTo(target);
+            var mid = lo + (hi - lo) / 2;
+            var cmp = list[mid].Time.CompareTo(target);
             if (cmp == 0) return mid;
             if (cmp < 0) lo = mid + 1;
             else hi = mid - 1;

@@ -1,25 +1,21 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using TorchSharp;
 using TorchSharp.Modules;
 using static TorchSharp.torch;
 using static TorchSharp.torch.nn;
-using static TorchSharp.torch.optim;
 using Ougha.Trading.RL.Models;
 using Ougha.Trading.RL.Training;
 
 namespace Ougha.Trading.RL.Agents;
 
-public class TorchAgent : IAgent, IDisposable
+public class TorchAgent : IAgent
 {
     private readonly DqnModel _policyNet;
     private readonly DqnModel _targetNet;
-    private readonly DqnModel _inferenceNet; // Dedicated network for inference (Actor)
+    private readonly DqnModel _inferenceNet;
     private readonly Adam _optimizer;
     private readonly PrioritizedReplayBuffer _buffer;
-    private readonly object _bufferLock = new(); // Lock for thread-safe buffer access
-    
+    private readonly Lock _bufferLock = new();
+
     private readonly int _batchSize;
     private readonly float _gamma;
     private float _epsilon;
@@ -28,29 +24,22 @@ public class TorchAgent : IAgent, IDisposable
     private readonly float _epsilonDecay;
     private readonly int _targetUpdateFreq;
     private int _stepCount;
-    
-    // Soft update parameter (Polyak averaging)
+
     private const float TAU = 0.005f;
     
     private readonly Device _device;
-    
-    // TRAINING Buffers (Learner)
+
     private readonly long[] _trainActionBuffer;
     private readonly float[] _trainRewardBuffer;
     private readonly float[] _trainDoneBuffer;
     private readonly AgentInput[] _trainStateBuffer;
     private readonly AgentInput[] _trainNextStateBuffer;
-    private int[]? _priorityIndices;
-    
-    // Constant for buffer sizing
+
     private const int TF_BUFFER_SIZE = 64 * 20 * 45;
 
-    // Separate pre-allocated buffers for Training and Inference to avoid race conditions
     private readonly Dictionary<string, float[]> _trainTfBatchBuffers;
     private readonly Dictionary<string, float[]> _inferenceTfBatchBuffers;
 
-    // Reusable buffers for small feature arrays - Separate sets
-    // Training set
     private readonly long[] _trainSymbolIdBuffer = new long[64];
     private readonly float[] _trainTriggerBuffer = new float[64 * 5];
     private readonly float[] _trainConfluenceBuffer = new float[64 * 10];
@@ -60,7 +49,6 @@ public class TorchAgent : IAgent, IDisposable
     private readonly float[] _trainCorrelationBuffer = new float[64 * 20];
     private readonly float[] _trainExposureBuffer = new float[64 * 12];
 
-    // Inference set (assuming max batch 64 for inference too, though usually smaller)
     private readonly long[] _inferenceSymbolIdBuffer = new long[64];
     private readonly float[] _inferenceTriggerBuffer = new float[64 * 5];
     private readonly float[] _inferenceConfluenceBuffer = new float[64 * 10];
@@ -88,42 +76,32 @@ public class TorchAgent : IAgent, IDisposable
         _epsilonDecay = epsilonDecay;
         _targetUpdateFreq = targetUpdateFreq;
         
-        _device = useCuda && torch.cuda.is_available() ? torch.CUDA : torch.CPU;
-        
-        // Initialize Models
-        // Initialize Models
+        _device = useCuda && cuda.is_available() ? CUDA : CPU;
+
         _policyNet = new DqnModel("policy_net");
         _targetNet = new DqnModel("target_net");
-        _inferenceNet = new DqnModel("inference_net"); // Create inference network
-        
+        _inferenceNet = new DqnModel("inference_net");
+
         _policyNet.to(_device);
         _targetNet.to(_device);
         _inferenceNet.to(_device);
-        
-        // Hard copy weights for initial sync
+
         UpdateTargetNetwork(hard: true);
-        SyncInferenceNetwork(); // Initial sync for inference net
-        
-        _optimizer = torch.optim.Adam(_policyNet.parameters(), lr: 0.0005);
-        
-        // Use PrioritizedReplayBuffer with N-step returns
+        SyncInferenceNetwork();
+
+        _optimizer = optim.Adam(_policyNet.parameters(), lr: 0.0005);
+
         _buffer = new PrioritizedReplayBuffer(
             capacity: bufferSize,
-            alpha: 0.6f,        // Priority exponent
-            betaStart: 0.4f,    // Initial importance sampling
-            betaEnd: 1.0f,      // Final importance sampling  
-            nSteps: 3,          // N-step returns
-            gamma: gamma
+            alpha: 0.6f, betaStart: 0.4f, betaEnd: 1.0f, nSteps: 3, gamma: gamma
         );
-        
-        // Pre-allocate TRAINING buffers
+
         _trainActionBuffer = new long[batchSize];
         _trainRewardBuffer = new float[batchSize];
         _trainDoneBuffer = new float[batchSize];
         _trainStateBuffer = new AgentInput[batchSize];
         _trainNextStateBuffer = new AgentInput[batchSize];
 
-        // Initialize dictionary buffers
         _trainTfBatchBuffers = CreateTfBuffers();
         _inferenceTfBatchBuffers = CreateTfBuffers();
     }
@@ -141,21 +119,19 @@ public class TorchAgent : IAgent, IDisposable
     }
     
     /// <summary>
-    /// Soft update of target network using Polyak averaging.
-    /// target = τ * policy + (1 - τ) * target
+    /// Soft update of the target network using Polyak averaging.
+    /// Target = τ * policy + (1 - τ) * target
     /// </summary>
-    public void UpdateTargetNetwork(bool hard = false)
+    private void UpdateTargetNetwork(bool hard = false)
     {
         if (hard)
         {
-            // Hard copy for initial sync
             var stateDict = _policyNet.state_dict();
             _targetNet.load_state_dict(stateDict);
             return;
         }
-        
-        // Soft update (Polyak averaging)
-        using (torch.no_grad())
+
+        using (no_grad())
         {
             var targetParams = _targetNet.named_parameters().ToList();
             var policyParams = _policyNet.named_parameters().ToDictionary(p => p.name, p => p.parameter);
@@ -176,34 +152,31 @@ public class TorchAgent : IAgent, IDisposable
     /// </summary>
     public void SyncInferenceNetwork()
     {
-        using (torch.no_grad())
+        using (no_grad())
         {
              var stateDict = _policyNet.state_dict();
              _inferenceNet.load_state_dict(stateDict);
         }
     }
     
-    private static readonly Random _random = new();
-    private const int NUM_ACTIONS = ActionDecoder.NumActions; // 3 actions: Hold, Buy, Sell
+    private static readonly Random Random = new();
+    private const int NUM_ACTIONS = ActionDecoder.NumActions;
 
-    // Last TP/SL multipliers from model output (for environment to use)
     private float[,]? _lastTpSlMultipliers;
     public float[,]? LastTpSlMultipliers => _lastTpSlMultipliers;
 
     public int Act(AgentInput input, bool training = true)
     {
-        if (training && _random.NextDouble() < _epsilon)
+        if (training && Random.NextDouble() < _epsilon)
         {
-            _lastTpSlMultipliers = new float[1, 2] { { (float)_random.NextDouble(), (float)_random.NextDouble() } };
-            return _random.Next(NUM_ACTIONS);
+            _lastTpSlMultipliers = new[,] { { (float)Random.NextDouble(), (float)Random.NextDouble() } };
+            return Random.Next(NUM_ACTIONS);
         }
 
-        // Use Inference Network for Acting
-        _inferenceNet.eval(); // Ensure eval mode
-        using (torch.no_grad())
+        _inferenceNet.eval();
+        using (no_grad())
         {
-            // Use INFERENCE buffers
-            var tensors = PrepareInputTensors(new[] { input }, useTrainingBuffers: false);
+            var tensors = PrepareInputTensors([input], useTrainingBuffers: false);
             var (qValues, tpSl) = _inferenceNet.forward(tensors);
             _lastTpSlMultipliers = new float[1, 2];
             var tpSlData = tpSl.data<float>().ToArray();
@@ -215,19 +188,19 @@ public class TorchAgent : IAgent, IDisposable
 
     public (int[] Actions, float[,] TpSlMultipliers) ActBatchWithTpSl(AgentInput[] inputs, bool training = true)
     {
-        int count = inputs.Length;
+        var count = inputs.Length;
         var actions = new int[count];
         var tpSlMults = new float[count, 2];
 
         if (training)
         {
-            for (int i = 0; i < count; i++)
+            for (var i = 0; i < count; i++)
             {
-                if (_random.NextDouble() < _epsilon)
+                if (Random.NextDouble() < _epsilon)
                 {
-                    actions[i] = _random.Next(NUM_ACTIONS);
-                    tpSlMults[i, 0] = (float)_random.NextDouble();
-                    tpSlMults[i, 1] = (float)_random.NextDouble();
+                    actions[i] = Random.Next(NUM_ACTIONS);
+                    tpSlMults[i, 0] = (float)Random.NextDouble();
+                    tpSlMults[i, 1] = (float)Random.NextDouble();
                 }
                 else
                 {
@@ -242,18 +215,16 @@ public class TorchAgent : IAgent, IDisposable
             }
         }
 
-        // Use Inference Network
         _inferenceNet.eval();
 
-        using (torch.no_grad())
+        using (no_grad())
         {
-            // Use INFERENCE buffers
             var tensors = PrepareInputTensors(inputs, useTrainingBuffers: false);
             var (qValues, tpSl) = _inferenceNet.forward(tensors);
             var argmax = qValues.argmax(1).data<long>().ToArray();
             var tpSlData = tpSl.data<float>().ToArray();
 
-            for (int i = 0; i < count; i++)
+            for (var i = 0; i < count; i++)
             {
                 if (actions[i] < 0)
                     actions[i] = (int)argmax[i];
@@ -274,14 +245,13 @@ public class TorchAgent : IAgent, IDisposable
         var (actions, _) = ActBatchWithTpSl(inputs, training);
         return actions;
     }
-    
-    public float TrainStep()
+
+    private float TrainStep()
     {
         Experience[] batch;
         int[] indices;
         float[] weights;
-        
-        // Thread-safe buffer access
+
         lock (_bufferLock)
         {
             if (_buffer.Count < _batchSize)
@@ -291,11 +261,9 @@ public class TorchAgent : IAgent, IDisposable
             batch = result.Samples;
             indices = result.Indices;
             weights = result.Weights;
-            _priorityIndices = result.Indices;
         }
 
-        // Fill pre-allocated TRAINING buffers
-        for (int i = 0; i < _batchSize; i++)
+        for (var i = 0; i < _batchSize; i++)
         {
             _trainStateBuffer[i] = batch[i].State;
             _trainNextStateBuffer[i] = batch[i].NextState ?? batch[i].State;
@@ -304,32 +272,28 @@ public class TorchAgent : IAgent, IDisposable
             _trainDoneBuffer[i] = batch[i].Done ? 1f : 0f;
         }
 
-        // Use TRAINING buffers for tensor creation
         var stateTensors = PrepareInputTensors(_trainStateBuffer, useTrainingBuffers: true);
 
-        var actions = torch.tensor(_trainActionBuffer, dtype: ScalarType.Int64, device: _device).unsqueeze(1);
-        var rewards = torch.tensor(_trainRewardBuffer, dtype: ScalarType.Float32, device: _device);
-        var dones = torch.tensor(_trainDoneBuffer, dtype: ScalarType.Float32, device: _device);
-        var isWeights = torch.tensor(weights, dtype: ScalarType.Float32, device: _device);
+        var actions = tensor(_trainActionBuffer, dtype: ScalarType.Int64, device: _device).unsqueeze(1);
+        var rewards = tensor(_trainRewardBuffer, dtype: ScalarType.Float32, device: _device);
+        var dones = tensor(_trainDoneBuffer, dtype: ScalarType.Float32, device: _device);
+        var isWeights = tensor(weights, dtype: ScalarType.Float32, device: _device);
 
-        // Forward pass returns (QValues, TpSlMultipliers)
         var (qValuesAll, _) = _policyNet.forward(stateTensors);
         var qValues = qValuesAll.gather(1, actions).squeeze(1);
 
-        Tensor nextQValues;
         Tensor targetQ;
-        using (torch.no_grad())
+        using (no_grad())
         {
             var nextStateTensors = PrepareInputTensors(_trainNextStateBuffer, useTrainingBuffers: true);
 
-            // DDQN: Use Policy for selection, Target for evaluation
             var (policyNextQ, _) = _policyNet.forward(nextStateTensors);
             var bestActions = policyNextQ.argmax(1).unsqueeze(1);
 
             var (targetNextQ, _) = _targetNet.forward(nextStateTensors);
             var nextQPositions = targetNextQ.gather(1, bestActions).squeeze(1);
 
-            nextQValues = nextQPositions * (1 - dones);
+            var nextQValues = nextQPositions * (1 - dones);
             targetQ = rewards + _gamma * nextQValues;
         }
 
@@ -341,21 +305,18 @@ public class TorchAgent : IAgent, IDisposable
             _buffer.UpdatePriorities(indices, tdErrorsArray);
         }
 
-        var elementWiseLoss = torch.nn.functional.smooth_l1_loss(qValues, targetQ, reduction: Reduction.None);
+        var elementWiseLoss = functional.smooth_l1_loss(qValues, targetQ, reduction: Reduction.None);
         var weightedLoss = (elementWiseLoss * isWeights).mean();
 
         _optimizer.zero_grad();
         weightedLoss.backward();
-        torch.nn.utils.clip_grad_norm_(_policyNet.parameters(), 1.0);
+        nn.utils.clip_grad_norm_(_policyNet.parameters(), 1.0);
         _optimizer.step();
 
         _stepCount++;
         
-        if (_stepCount % _targetUpdateFreq == 0) // Less frequent target update for stability
-            UpdateTargetNetwork();
-            
-        // Sync inference network periodically inside training loop if needed, 
-        // OR rely on explicit calls from Runner. Let's do it here every N steps to be safe.
+        if (_stepCount % _targetUpdateFreq == 0) UpdateTargetNetwork();
+
         if (_stepCount % 100 == 0)
             SyncInferenceNetwork();
 
@@ -373,24 +334,23 @@ public class TorchAgent : IAgent, IDisposable
     }
     
     /// <summary>
-    /// Train multiple batches in sequence to maximize GPU utilization.
+    /// Train multiple batches in a sequence to maximize GPU utilization.
     /// Returns average loss across all batches.
     /// </summary>
     public float TrainMultipleBatches(int numBatches)
     {
-        // Thread-safe check
         int count;
         lock(_bufferLock) count = _buffer.Count;
         
         if (count < _batchSize)
             return 0f;
             
-        float totalLoss = 0f;
-        int successfulBatches = 0;
+        var totalLoss = 0f;
+        var successfulBatches = 0;
         
-        for (int i = 0; i < numBatches; i++)
+        for (var i = 0; i < numBatches; i++)
         {
-            float loss = TrainStep();
+            var loss = TrainStep();
             if (loss > 0)
             {
                 totalLoss += loss;
@@ -424,7 +384,7 @@ public class TorchAgent : IAgent, IDisposable
     }
     
     /// <summary>
-    /// Decay epsilon by one step. Call once per episode for proper exploration schedule.
+    /// Decay epsilon by one step. Call once per episode for a proper exploration schedule.
     /// </summary>
     public void DecayEpsilon()
     {
@@ -465,7 +425,7 @@ public class TorchAgent : IAgent, IDisposable
     public (int[] Actions, float[,] TpSlMultipliers, float[] LogProbs) ActBatchWithTpSlAndLogProbs(AgentInput[] inputs, bool training = true)
     {
         var (actions, tpSl) = ActBatchWithTpSl(inputs, training);
-        return (actions, tpSl, new float[inputs.Length]); // DQN doesn't use log probs
+        return (actions, tpSl, new float[inputs.Length]);
     }
 
     public void AddExperienceBatchWithLogProbs(
@@ -476,63 +436,34 @@ public class TorchAgent : IAgent, IDisposable
         bool[] dones,
         float[] logProbs)
     {
-        AddExperienceBatch(states, actions, rewards, nextStates, dones); // DQN ignores log probs
+        AddExperienceBatch(states, actions, rewards, nextStates, dones);
     }
 
-    /// <summary>
-    /// Batch prediction for multiple symbols combined.
-    /// Single model call for all symbols - maximizes GPU utilization.
-    /// </summary>
-    public (int[] Actions, float[,] TpSlMultipliers) ActBatchMultiSymbol(
-        Dictionary<string, AgentInput[]> allSymbolStates,
-        bool training = true)
-    {
-        var allInputs = new List<AgentInput>();
-        var symbolOffsets = new Dictionary<string, (int Start, int Count)>();
-        int offset = 0;
-
-        foreach (var (symbol, inputs) in allSymbolStates)
-        {
-            symbolOffsets[symbol] = (offset, inputs.Length);
-            allInputs.AddRange(inputs);
-            offset += inputs.Length;
-        }
-
-        var (actions, tpSl) = ActBatchWithTpSl(allInputs.ToArray(), training);
-        return (actions, tpSl);
-    }
-    
-    // Memory Management helper - optimized with pre-allocated buffers
     private Tensor[] PrepareInputTensors(AgentInput[] inputs, bool useTrainingBuffers)
     {
-        int batchSize = inputs.Length;
-        var tensors = new Tensor[13]; // Fixed size: 5 TFs + symbolId + 5 features + 2 optional
-        int tensorIdx = 0;
+        var batchSize = inputs.Length;
+        var tensors = new Tensor[13];
+        var tensorIdx = 0;
         
-        string[] tfNames = { "M1", "M5", "M15", "H1", "H4" };
+        string[] tfNames = ["M1", "M5", "M15", "H1", "H4"];
         const int window = 20;
         const int feats = 45;
-        
-        // Select buffer set
+
         var tfBuffers = useTrainingBuffers ? _trainTfBatchBuffers : _inferenceTfBatchBuffers;
         
         foreach (var tf in tfNames)
         {
-            // Use pre-allocated buffer if batch fits (<=64), otherwise allocate
-            // Note: _train buffers are sized for _batchSize (usually 64), inference usually small.
-            // If batch size > 64, we allocate new.
             var buffer = batchSize <= 64 ? tfBuffers[tf] : new float[batchSize * window * feats];
             
-            for (int b = 0; b < batchSize; b++)
+            for (var b = 0; b < batchSize; b++)
             {
                 var tfData = inputs[b].TimeframeFeatures[tf];
                 Buffer.BlockCopy(tfData, 0, buffer, b * window * feats * sizeof(float), window * feats * sizeof(float));
             }
             
-            tensors[tensorIdx++] = torch.tensor(buffer, new long[] { batchSize, window, feats }, dtype: ScalarType.Float32, device: _device);
+            tensors[tensorIdx++] = tensor(buffer, new long[] { batchSize, window, feats }, dtype: ScalarType.Float32, device: _device);
         }
 
-        // Feature buffers selection
         long[] symBuffer;
         float[] triggerBuffer, confluenceBuffer, portfolioBuffer, riskBuffer, newsBuffer, correlationBuffer, exposureBuffer;
 
@@ -559,63 +490,54 @@ public class TorchAgent : IAgent, IDisposable
              exposureBuffer = _inferenceExposureBuffer;
         }
 
-        // Symbol ID
-        long[] activeSymBuffer = batchSize <= 64 ? symBuffer : new long[batchSize];
-        for (int i = 0; i < batchSize; i++)
+        var activeSymBuffer = batchSize <= 64 ? symBuffer : new long[batchSize];
+        for (var i = 0; i < batchSize; i++)
             activeSymBuffer[i] = inputs[i].SymbolId;
-        tensors[tensorIdx++] = torch.tensor(activeSymBuffer, new long[] { batchSize, 1 }, dtype: ScalarType.Int64, device: _device);
-        
-        // Trigger (5)
+        tensors[tensorIdx++] = tensor(activeSymBuffer, new long[] { batchSize, 1 }, dtype: ScalarType.Int64, device: _device);
+
         tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.TriggerContext, 5, batchSize <= 64 ? triggerBuffer : null);
-        
-        // Confluence (10)
+
         tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.ConfluenceFeatures, 10, batchSize <= 64 ? confluenceBuffer : null);
-        
-        // Portfolio (5)
+
         tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.PortfolioFeatures, 5, batchSize <= 64 ? portfolioBuffer : null);
-        
-        // Risk (9)
+
         tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.RiskState, 9, batchSize <= 64 ? riskBuffer : null);
-        
-        // News (16)
+
         if (inputs[0].NewsFeatures != null)
             tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.NewsFeatures!, 16, batchSize <= 64 ? newsBuffer : null);
         else
-            tensors[tensorIdx++] = torch.zeros(new long[] { batchSize, 16 }, device: _device);
+            tensors[tensorIdx++] = zeros(new long[] { batchSize, 16 }, device: _device);
 
-        // Correlation (20)
         if (inputs[0].CorrelationFeatures != null)
             tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.CorrelationFeatures!, 20, batchSize <= 64 ? correlationBuffer : null);
         else
-            tensors[tensorIdx++] = torch.zeros(new long[] { batchSize, 20 }, device: _device);
+            tensors[tensorIdx++] = zeros(new long[] { batchSize, 20 }, device: _device);
 
-        // Portfolio Exposure (12)
         if (inputs[0].PortfolioExposure != null)
-            tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.PortfolioExposure!, 12, batchSize <= 64 ? exposureBuffer : null);
+            tensors[tensorIdx] = BatchFloatArrayOptimized(inputs, i => i.PortfolioExposure!, 12, batchSize <= 64 ? exposureBuffer : null);
         else
-            tensors[tensorIdx++] = torch.zeros(new long[] { batchSize, 12 }, device: _device);
+            tensors[tensorIdx] = zeros(new long[] { batchSize, 12 }, device: _device);
              
         return tensors;
     }
     
     private Tensor BatchFloatArrayOptimized(AgentInput[] inputs, Func<AgentInput, float[]> selector, int dim, float[]? buffer)
     {
-        int batch = inputs.Length;
-        // Use provided buffer or allocate if null/too small
-        float[] flat = buffer ?? new float[batch * dim];
-        for (int i = 0; i < batch; i++)
+        var batch = inputs.Length;
+        var flat = buffer ?? new float[batch * dim];
+        for (var i = 0; i < batch; i++)
         {
             var arr = selector(inputs[i]);
             Array.Copy(arr, 0, flat, i * dim, dim);
         }
-        return torch.tensor(flat, new long[] { batch, dim }, dtype: ScalarType.Float32, device: _device);
+        return tensor(flat, new long[] { batch, dim }, dtype: ScalarType.Float32, device: _device);
     }
 
     public void Dispose()
     {
         _policyNet.Dispose();
         _targetNet.Dispose();
-        _inferenceNet.Dispose(); // Dispose inference net
+        _inferenceNet.Dispose();
         _optimizer.Dispose();
     }
 }

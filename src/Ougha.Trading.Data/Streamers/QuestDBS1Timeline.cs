@@ -6,33 +6,15 @@ namespace Ougha.Trading.Data.Streamers;
 /// Timeline that streams S1 (1-second) candles from QuestDB materialized view
 /// and converts them to ticks for BacktestExecutor compatibility.
 /// </summary>
-public class QuestDBS1Timeline
+public class QuestDbs1Timeline(
+    QuestDbDataLoader dataLoader,
+    IEnumerable<string> symbols,
+    DateTime startDate,
+    DateTime endDate,
+    string timeframe = "s1")
 {
-    private readonly QuestDbDataLoader _dataLoader;
-    private readonly List<string> _symbols;
-    private readonly DateTime _startDate;
-    private readonly DateTime _endDate;
-    private readonly string _timeframe;
-
+    private readonly List<string> _symbols = symbols.ToList();
     private long? _totalCandles;
-
-    public QuestDBS1Timeline(
-        QuestDbDataLoader dataLoader,
-        IEnumerable<string> symbols,
-        DateTime startDate,
-        DateTime endDate,
-        string timeframe = "s1")
-    {
-        _dataLoader = dataLoader;
-        _symbols = symbols.ToList();
-        _startDate = startDate;
-        _endDate = endDate;
-        _timeframe = timeframe;
-    }
-
-    public List<string> Symbols => _symbols;
-    public DateTime StartDate => _startDate;
-    public DateTime EndDate => _endDate;
 
     /// <summary>
     /// Get total candle count (lazy loaded).
@@ -45,7 +27,7 @@ public class QuestDBS1Timeline
         long total = 0;
         foreach (var symbol in _symbols)
         {
-            total += await _dataLoader.CountCandlesAsync(symbol, _timeframe, _startDate, _endDate);
+            total += await dataLoader.CountCandlesAsync(symbol, timeframe, startDate, endDate);
         }
 
         _totalCandles = total;
@@ -57,24 +39,28 @@ public class QuestDBS1Timeline
     /// </summary>
     public async IAsyncEnumerable<(string Symbol, Candle Candle)> StreamAsync()
     {
-        if (_symbols.Count == 0)
-            yield break;
-
-        if (_symbols.Count == 1)
+        switch (_symbols.Count)
         {
-            await foreach (var item in StreamSingleSymbolAsync(_symbols[0]))
-                yield return item;
-        }
-        else
-        {
-            await foreach (var item in StreamMultiSymbolAsync())
-                yield return item;
+            case 0:
+                yield break;
+            case 1:
+            {
+                await foreach (var item in StreamSingleSymbolAsync(_symbols[0]))
+                    yield return item;
+                break;
+            }
+            default:
+            {
+                await foreach (var item in StreamMultiSymbolAsync())
+                    yield return item;
+                break;
+            }
         }
     }
 
     private async IAsyncEnumerable<(string Symbol, Candle Candle)> StreamSingleSymbolAsync(string symbol)
     {
-        await foreach (var candle in _dataLoader.StreamCandlesAsync(symbol, _timeframe, _startDate, _endDate))
+        await foreach (var candle in dataLoader.StreamCandlesAsync(symbol, timeframe, startDate, endDate))
         {
             yield return (symbol, candle);
         }
@@ -82,14 +68,12 @@ public class QuestDBS1Timeline
 
     private async IAsyncEnumerable<(string Symbol, Candle Candle)> StreamMultiSymbolAsync()
     {
-        // Use heap-based merge for multi-symbol chronological ordering
         var heap = new PriorityQueue<(string Symbol, Candle Candle, IAsyncEnumerator<Candle> Enumerator), DateTime>();
         var enumerators = new List<IAsyncEnumerator<Candle>>();
 
-        // Initialize enumerators for each symbol
         foreach (var symbol in _symbols)
         {
-            var enumerator = _dataLoader.StreamCandlesAsync(symbol, _timeframe, _startDate, _endDate).GetAsyncEnumerator();
+            var enumerator = dataLoader.StreamCandlesAsync(symbol, timeframe, startDate, endDate).GetAsyncEnumerator();
             enumerators.Add(enumerator);
 
             if (await enumerator.MoveNextAsync())
@@ -98,7 +82,6 @@ public class QuestDBS1Timeline
             }
         }
 
-        // Merge streams chronologically
         while (heap.Count > 0)
         {
             var (symbol, candle, enumerator) = heap.Dequeue();
@@ -110,29 +93,9 @@ public class QuestDBS1Timeline
             }
         }
 
-        // Dispose enumerators
         foreach (var enumerator in enumerators)
         {
             await enumerator.DisposeAsync();
         }
-    }
-
-    /// <summary>
-    /// Loads ALL candles for the configured range and symbols into memory,
-    /// returning a sorted list suitable for creating a CandleTimeline.
-    /// Uses parallel chunk loading for performance.
-    /// </summary>
-    public async Task<List<(DateTime Time, string Symbol, Candle Candle)>> LoadAllTimelineAsync()
-    {
-        var allCandles = new List<(DateTime Time, string Symbol, Candle Candle)>();
-
-        foreach (var symbol in _symbols)
-        {
-            Console.WriteLine($"Loading {symbol}...");
-            var lel = await _dataLoader.LoadCandlesAsync(symbol, _timeframe, _startDate, _endDate);
-            allCandles.AddRange(lel.Select(c => (c.Time, symbol, c)));
-        }
-
-        return allCandles.OrderBy(c => c.Time).ToList();
     }
 }

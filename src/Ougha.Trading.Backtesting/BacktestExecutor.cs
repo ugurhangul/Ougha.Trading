@@ -4,7 +4,7 @@ using Ougha.Trading.Risk;
 
 namespace Ougha.Trading.Backtesting;
 
-public record PendingCloseInfo(string Symbol, double Profit, int HoldingTicks, ExitReason ExitReason);
+public record PendingCloseInfo(string Symbol, double Profit, int HoldingTicks);
 
 public class BacktestExecutor : IOrderExecutor
 {
@@ -21,13 +21,10 @@ public class BacktestExecutor : IOrderExecutor
     private readonly List<double> _equityHistory = new();
     private DateTime _lastSampleDate;
 
-    // We need to track current index in timeline
     private int _currentTickIndex;
 
-    // We need to track current time
     public DateTime CurrentTime { get; private set; }
 
-    // Streaming mode fields
     private IAsyncEnumerator<(string Symbol, Candle Candle)>? _candleStream;
     private readonly bool _isStreaming;
     private string? _lastTickedSymbol;
@@ -40,7 +37,6 @@ public class BacktestExecutor : IOrderExecutor
     /// </summary>
     public string? LastTickedSymbol => _lastTickedSymbol;
 
-    // New CandleTimeline Constructor
     public BacktestExecutor(
         CandleTimeline candleTimeline,
         Dictionary<string, SymbolInfo> symbolInfo,
@@ -53,17 +49,16 @@ public class BacktestExecutor : IOrderExecutor
         _initialBalance = initialBalance;
         _balance = initialBalance;
         _equity = initialBalance;
-        _currentTickIndex = -1; // Not started
+        _currentTickIndex = -1;
         _isStreaming = false;
         
         if (_candleTimeline.Count > 0)
-            CurrentTime = _candleTimeline.GetAtIndex(0).Time; // Init with first candle time
-            
+            CurrentTime = _candleTimeline.GetAtIndex(0).Time;
+
         _lastSampleDate = CurrentTime.Date;
         _equityHistory.Add(_equity);
     }
 
-    // New streaming constructor
     public BacktestExecutor(
         IAsyncEnumerable<(string Symbol, Candle Candle)> candleStream,
         Dictionary<string, SymbolInfo> symbolInfo,
@@ -134,7 +129,6 @@ public class BacktestExecutor : IOrderExecutor
         }
         else
         {
-            // Non-streaming: delegate to sync method
             return Advance();
         }
     }
@@ -147,20 +141,10 @@ public class BacktestExecutor : IOrderExecutor
         CurrentTime = time;
         _lastTickedSymbol = symbol;
 
-        // In a real multi-symbol simulator, we'd update the "Latest Known Price" for 'symbol'.
-        // And check SL/TP for *all* positions using their latest known prices.
-        // For simplicity and speed in this strictly sequential tick stream:
-        // We only definitely know the price of 'symbol' changed.
-
-        // However, checking SL/TP acts on the price.
         CheckStopLossTakeProfit(symbol, candle);
 
-        // Update equity (mark-to-market).
-        // Ideal: Update equity for all positions. But we only have new price for 'symbol'.
-        // We assume other prices haven't changed since their last tick? YES.
         UpdateEquity(symbol, candle);
 
-        // Track Equity Daily
         if (CurrentTime.Date > _lastSampleDate)
         {
             _equityHistory.Add(_equity);
@@ -173,27 +157,22 @@ public class BacktestExecutor : IOrderExecutor
         string symbol, TradeType type, double volume,
         double sl = 0, double tp = 0, string comment = "", RiskLevel riskLevel = RiskLevel.Conservative)
     {
-        // Net position mode
         if (_positions.TryGetValue(symbol, out var existing))
         {
             ClosePositionInternal(symbol, existing, CurrentTime, ExitReason.Signal);
         }
 
-        // Get execution price using Candle Close (or spread adjusted)
         var candle = GetLastKnownCandle(symbol);
         if (candle == null) 
              return Task.FromResult(new OrderResult(false, 0, 0, 0, "No price data for symbol"));
 
-        // Use Close price for market execution assumption
-        // Or if we want more realism, simulate spread around Close
-        double mid = candle.Close;
-        double spread = CalculateSpread(symbol);
-        double halfSpread = spread / 2.0;
+        var mid = candle.Close;
+        var spread = CalculateSpread(symbol);
+        var halfSpread = spread / 2.0;
 
-        double price = type == TradeType.Buy ? mid + halfSpread : mid - halfSpread;
+        var price = type == TradeType.Buy ? mid + halfSpread : mid - halfSpread;
 
-        // Slippage
-        double slippage = CalculateSlippage(symbol);
+        var slippage = CalculateSlippage(symbol);
         price += type == TradeType.Buy ? slippage : -slippage;
 
         var position = new Position
@@ -202,14 +181,14 @@ public class BacktestExecutor : IOrderExecutor
             Type = type,
             Volume = 0.01,
             OpenPrice = price,
-            CurrentPrice = price, // Init
-            BestPrice = price,    // Init BestPrice
+            CurrentPrice = price,
+            BestPrice = price,
             OpenTime = CurrentTime,
             StopLoss = sl,
-            InitialStopLoss = sl, // Track initial
+            InitialStopLoss = sl,
             TakeProfit = tp,
             Ticket = GenerateTicket(),
-            RiskLevel = riskLevel // Track Risk Level
+            RiskLevel = riskLevel
         };
 
         _positions[symbol] = position;
@@ -223,31 +202,28 @@ public class BacktestExecutor : IOrderExecutor
         if (!_positions.TryGetValue(symbol, out var position))
             return Task.FromResult(new CloseResult(false, 0, 0, "No position"));
 
-        double profit = ClosePositionInternal(symbol, position, CurrentTime);
-        // Position removed in Internal
-        
+        var profit = ClosePositionInternal(symbol, position, CurrentTime);
+
         return Task.FromResult(new CloseResult(true, profit, 0)); 
     }
 
     private double ClosePositionInternal(string symbol, Position position, DateTime time, ExitReason exitReason = ExitReason.Manual)
     {
         var candle = GetLastKnownCandle(symbol);
-        
-        // Use Close price for closing logic by default 
-        // (unless we knew we hit partial candle, but for simple backtest Close is safe proxy for "current" price)
-        double closePrice = position.CurrentPrice; 
+
+        var closePrice = position.CurrentPrice; 
 
         if (candle != null)
         {
-             double mid = candle.Close;
-             double spread = CalculateSpread(symbol);
-             double halfSpread = spread / 2.0;
+             var mid = candle.Close;
+             var spread = CalculateSpread(symbol);
+             var halfSpread = spread / 2.0;
              closePrice = position.Type == TradeType.Buy 
-                ? mid - halfSpread  // Sell to close Buy
-                : mid + halfSpread; // Buy to close Sell
+                ? mid - halfSpread
+                : mid + halfSpread;
         }
 
-        double priceDiff = position.Type == TradeType.Buy
+        var priceDiff = position.Type == TradeType.Buy
             ? closePrice - position.OpenPrice
             : position.OpenPrice - closePrice;
 
@@ -256,7 +232,7 @@ public class BacktestExecutor : IOrderExecutor
             info = new SymbolInfo(symbol, 0.00001, 100000, 1, 0.00001, "USD", "USD", 5);
         }
 
-        double profit = (priceDiff / info.Point) * info.TickValue * position.Volume;
+        var profit = (priceDiff / info.Point) * info.TickValue * position.Volume;
 
         _balance += profit;
         _positions.Remove(symbol);
@@ -277,10 +253,8 @@ public class BacktestExecutor : IOrderExecutor
         return profit;
     }
 
-    // Cache logic
     private readonly Dictionary<string, Candle> _lastCandles = new();
-    
-    // Called by Advance when a new candle arrives
+
     private void UpdateCandleCache(string symbol, Candle candle)
     {
         _lastCandles[symbol] = candle;
@@ -294,80 +268,47 @@ public class BacktestExecutor : IOrderExecutor
     
     private void CheckStopLossTakeProfit(string currentSymbol, Candle currentCandle)
     {
-        // Update cache
         UpdateCandleCache(currentSymbol, currentCandle);
-        
-        // Only check the symbol that just ticked? Yes.
+
         if (_positions.TryGetValue(currentSymbol, out var position))
         {
-            // Update current price - Close is safest single-point proxy
-            position.CurrentPrice = currentCandle.Close; 
+            position.CurrentPrice = currentCandle.Close;
 
-            // OHLC Logic for SL/TP
-            double high = currentCandle.High;
-            double low = currentCandle.Low;
-            
-            // --- Trailing Stop Logic ---
+            var high = currentCandle.High;
+            var low = currentCandle.Low;
+
             if (_symbolInfo.TryGetValue(currentSymbol, out var info))
             {
-                // We use High for Buy (best possible price to trigger trailing calc off?)
-                // Or Close? Let's use Close to be conservative on trailing updates?
-                // Actually, trailing usually tracks 'best reached price'.
                 if (position.Type == TradeType.Buy)
                     position.BestPrice = Math.Max(position.BestPrice, high);
                 else
                     position.BestPrice = Math.Min(position.BestPrice, low);
                     
-                double? newSl = _portfolioManager.CalculateTrailingStop(position, currentCandle.Close, info); // Calc off Close?
+                var newSl = _portfolioManager.CalculateTrailingStop(position, currentCandle.Close, info);
                 if (newSl.HasValue)
                 {
                     ModifyPositionAsync(currentSymbol, newSl.Value, position.TakeProfit);
                 }
             }
-            // ---------------------------
 
-            // SL Check (Hit if price touches SL)
-            bool slHit = false;
+            var slHit = false;
             if (position.StopLoss > 0)
             {
                 slHit = position.Type == TradeType.Buy
-                    ? low <= position.StopLoss  // Low touched SL
-                    : high >= position.StopLoss; // High touched SL
+                    ? low <= position.StopLoss
+                    : high >= position.StopLoss;
             }
 
             if (slHit)
             {
-                int holdingTicks = _currentTickIndex - _positionOpenTicks.GetValueOrDefault(currentSymbol);
-                // Assume filled at SL price (slippage ignored for SL here for simplicity, or could add)
-                // Actually, we should fill at SL price exactly if gap didn't jump over it.
-                // For simplicity, fill at SL.
-                
-                // Close Internal recalculates profit based on "current price" or passed close price.
-                // We need to simulate the exit price.
-                double exitPrice = position.StopLoss;
-                
-                // Just use internal helper but we need to trick it or refactor it to accept price.
-                // Use a 'simulated' exit candle? Or just refactor Internal takes price?
-                // Internal takes 'time' and uses 'GetLastKnownCandle' -> 'CurrentPrice'. 
-                // We should probably update the position 'CurrentPrice' to exitPrice temporarily?
-                // Or assume Internal uses 'Close' which might be wrong for SL.
-                
-                // Fix: Let's pass 'exitPrice' to ClosePositionInternal if we want manual override?
-                // For now, let's just use the Internal which pulls from `GetLastKnownCandle`.
-                // That uses 'Close'. That is WRONG for SL hit on a wick.
-                // Refactoring ClosePositionInternal to accept 'overridePrice' seems best.
-                // But as quick fix/logic in existing constrained method:
-                // We will manually calculate profit and remove position here to be precise.
-                
+                var holdingTicks = _currentTickIndex - _positionOpenTicks.GetValueOrDefault(currentSymbol);
                 ClosePositionAtPrice(currentSymbol, position, position.StopLoss, currentCandle.Time, ExitReason.StopLoss);
-                
-                _pendingCloses.Add(new PendingCloseInfo(currentSymbol, 0, holdingTicks, ExitReason.StopLoss)); // Profit in CloseAtPrice
+                _pendingCloses.Add(new PendingCloseInfo(currentSymbol, 0, holdingTicks));
                 _positionOpenTicks.Remove(currentSymbol);
                 return;
             }
 
-            // TP Check
-            bool tpHit = false;
+            var tpHit = false;
             if (position.TakeProfit > 0)
             {
                 tpHit = position.Type == TradeType.Buy
@@ -377,19 +318,18 @@ public class BacktestExecutor : IOrderExecutor
 
             if (tpHit)
             {
-                 int holdingTicks = _currentTickIndex - _positionOpenTicks.GetValueOrDefault(currentSymbol);
+                 var holdingTicks = _currentTickIndex - _positionOpenTicks.GetValueOrDefault(currentSymbol);
                  ClosePositionAtPrice(currentSymbol, position, position.TakeProfit, currentCandle.Time, ExitReason.TakeProfit);
                  
-                 _pendingCloses.Add(new PendingCloseInfo(currentSymbol, 0, holdingTicks, ExitReason.TakeProfit));
+                 _pendingCloses.Add(new PendingCloseInfo(currentSymbol, 0, holdingTicks));
                  _positionOpenTicks.Remove(currentSymbol);
-                 return;
             }
         }
     }
 
-    private double ClosePositionAtPrice(string symbol, Position position, double exitPrice, DateTime time, ExitReason reason)
+    private void ClosePositionAtPrice(string symbol, Position position, double exitPrice, DateTime time, ExitReason reason)
     {
-         double priceDiff = position.Type == TradeType.Buy
+         var priceDiff = position.Type == TradeType.Buy
             ? exitPrice - position.OpenPrice
             : position.OpenPrice - exitPrice;
 
@@ -398,7 +338,7 @@ public class BacktestExecutor : IOrderExecutor
             info = new SymbolInfo(symbol, 0.00001, 100000, 1, 0.00001, "USD", "USD", 5);
         }
 
-        double profit = (priceDiff / info.Point) * info.TickValue * position.Volume;
+        var profit = (priceDiff / info.Point) * info.TickValue * position.Volume;
 
         _balance += profit;
         _positions.Remove(symbol);
@@ -415,8 +355,6 @@ public class BacktestExecutor : IOrderExecutor
             Profit = profit,
             ExitReason = reason
         });
-        
-        return profit;
     }
 
     public Task<bool> ModifyPositionAsync(string symbol, double sl, double tp)
@@ -432,28 +370,23 @@ public class BacktestExecutor : IOrderExecutor
 
     private void UpdateEquity(string currentSymbol, Candle currentCandle)
     {
-        // Equity = Balance + Sum(Unrealized PnL)
         double unrealized = 0;
         
-        foreach (var kvp in _positions)
+        foreach (var (symbol, pos) in _positions)
         {
-            var symbol = kvp.Key;
-            var pos = kvp.Value;
-            
-            // Use current tick for 'currentSymbol', cached for others
-            Candle? candle = (symbol == currentSymbol) ? currentCandle : GetLastKnownCandle(symbol);
+            var candle = (symbol == currentSymbol) ? currentCandle : GetLastKnownCandle(symbol);
             
             if (candle == null) continue;
             
-            double mid = candle.Close;
-             double spread = CalculateSpread(symbol);
-             double halfSpread = spread / 2.0;
+            var mid = candle.Close;
+             var spread = CalculateSpread(symbol);
+             var halfSpread = spread / 2.0;
 
-            double price = pos.Type == TradeType.Buy 
-                ? mid - halfSpread // Bid
-                : mid + halfSpread; // Ask
-                
-            double diff = pos.Type == TradeType.Buy ? price - pos.OpenPrice : pos.OpenPrice - price;
+            var price = pos.Type == TradeType.Buy 
+                ? mid - halfSpread
+                : mid + halfSpread;
+
+            var diff = pos.Type == TradeType.Buy ? price - pos.OpenPrice : pos.OpenPrice - price;
             
             if (_symbolInfo.TryGetValue(symbol, out var info))
             {
@@ -464,20 +397,20 @@ public class BacktestExecutor : IOrderExecutor
         _equity = _balance + unrealized;
     }
 
-    public BacktestResults GetResults() => new BacktestResults
+    public BacktestResults GetResults() => new()
     {
         InitialBalance = _initialBalance,
         FinalBalance = _balance,
         FinalEquity = _equity,
         TotalTrades = _tradeLog.Count,
-        TradeLog = _tradeLog.ToList(), // Copy
-        EquityCurve = _equityHistory.ToList() // Copy history
+        TradeLog = _tradeLog.ToList(),
+        EquityCurve = _equityHistory.ToList()
     };
 
     public Task CloseAllPositionsAsync()
     {
         foreach (var symbol in _positions.Keys.ToList())
-             ClosePositionAsync(symbol); // Sync wait?
+             ClosePositionAsync(symbol);
         return Task.CompletedTask;
     }
 
@@ -515,7 +448,6 @@ public class BacktestExecutor : IOrderExecutor
         _lastSampleDate = DateTime.MinValue;
         _lastTickedSymbol = null;
 
-        // For non-streaming mode, reset to beginning of timeline
         if (!_isStreaming && _candleTimeline != null && _candleTimeline.Count > 0)
         {
             CurrentTime = _candleTimeline.GetAtIndex(0).Time;
@@ -533,8 +465,8 @@ public class BacktestExecutor : IOrderExecutor
             return;
             
         var random = new Random();
-        int minIdx = (int)(_candleTimeline.Count * minProgressPct);
-        int maxIdx = (int)(_candleTimeline.Count * maxProgressPct);
+        var minIdx = (int)(_candleTimeline.Count * minProgressPct);
+        var maxIdx = (int)(_candleTimeline.Count * maxProgressPct);
         
         if (maxIdx <= minIdx)
             maxIdx = minIdx + 1;
@@ -551,14 +483,13 @@ public class BacktestExecutor : IOrderExecutor
     
     public double GetFreeMargin()
     {
-        // Equity - UsedMargin
         double usedMargin = 0;
         foreach(var kvp in _positions)
         {
             var pos = kvp.Value;
             var symbol = kvp.Key;
             
-             double leverage = 100.0;
+             var leverage = 100.0;
             
             if (_symbolInfo.TryGetValue(symbol, out var info))
             {
@@ -575,10 +506,8 @@ public class BacktestExecutor : IOrderExecutor
     
     private double CalculateSpread(string symbol)
     {
-        // Simple fixed spread simulation
-        // 1 Pip?
         if (_symbolInfo.TryGetValue(symbol, out var info))
-             return info.Point * 10; // 1 pip (10 points)
+             return info.Point * 10;
         return 0.0001;
     }
 
@@ -596,20 +525,17 @@ public class BacktestExecutor : IOrderExecutor
         return c.Close + (CalculateSpread(symbol)/2);
     }
     
-    public bool IsMarketOpen(string symbol) => true; // Simulated always open
-    
-    // Slippage: Points-based model matching Python simulated_broker.py
-    // Base slippage: 0.5 points for normal conditions
+    public bool IsMarketOpen(string symbol) => true;
+
     private const double BaseSlippagePoints = 0.5;
 
     private double CalculateSlippage(string symbol)
     {
         if (!_symbolInfo.TryGetValue(symbol, out var info))
-            return 0.0001; // Default 1 pip fallback
+            return 0.0001;
 
-        // Base slippage in price terms
         return BaseSlippagePoints * info.Point;
     }
     
-    private long GenerateTicket() => DateTime.UtcNow.Ticks; // Only unique ID needed
+    private long GenerateTicket() => DateTime.UtcNow.Ticks;
 }

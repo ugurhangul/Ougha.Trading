@@ -19,7 +19,6 @@ public class PortfolioStateBuilder
         _featureBuilder = featureBuilder;
         _windowSize = windowSize;
         _featuresPerCandle = featureBuilder.FeatureCount;
-        // market features + 4 portfolio features + 1 symbol id
         _statePerSymbol = _windowSize * _featuresPerCandle + 4 + 1;
     }
 
@@ -42,19 +41,16 @@ public class PortfolioStateBuilder
         string[] symbols)
     {
         var state = new float[GetStateSize(symbols.Length)];
-        int offset = 0;
+        var offset = 0;
 
         foreach (var symbol in symbols)
         {
-            // Get candles for this symbol, or empty if not found
             if (!symbolCandles.TryGetValue(symbol, out var candles))
                 candles = Array.Empty<Candle>();
-            
-            // Get portfolio state, or Flat if not found
+
             if (!portfolioStates.TryGetValue(symbol, out var portfolioState))
                 portfolioState = SymbolPortfolioState.Flat;
-            
-            // Build state for this symbol
+
             var symbolState = BuildSymbolState(candles, symbol, portfolioState);
 
             Array.Copy(symbolState, 0, state, offset, symbolState.Length);
@@ -70,9 +66,8 @@ public class PortfolioStateBuilder
         SymbolPortfolioState portfolioState)
     {
         var state = new float[_statePerSymbol];
-        int idx = 0;
+        var idx = 0;
 
-        // 1. Market features (flattened window)
         if (candles.Count >= _windowSize)
         {
             var marketFeatures = _featureBuilder.BuildFlattenedFeatures(candles, symbol, _windowSize);
@@ -81,12 +76,9 @@ public class PortfolioStateBuilder
         }
         else
         {
-            // Not enough candles, fill with zeros
             idx += _windowSize * _featuresPerCandle;
         }
 
-        // 2. Portfolio features (4 values)
-        // Position Type: 1 (Long), -1 (Short), 0 (Flat)
         state[idx++] = portfolioState.HasPosition 
             ? (portfolioState.PositionType == TradeType.Buy ? 1f : -1f) 
             : 0f;
@@ -94,8 +86,7 @@ public class PortfolioStateBuilder
         state[idx++] = (float)portfolioState.HoldingTimeNorm;
         state[idx++] = (float)portfolioState.DrawdownPct * 100f;
 
-        // 3. Symbol ID (CRC32-based, matching Python's zlib.crc32)
-        state[idx++] = SymbolIdMapper.GetSymbolId(symbol);
+        state[idx] = SymbolIdMapper.GetSymbolId(symbol);
 
         return state;
     }

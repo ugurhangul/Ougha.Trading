@@ -8,8 +8,8 @@ public class FeatureBuilder : IFeatureBuilder
 {
     public int FeatureCount => 45;
 
-    public IReadOnlyList<string> FeatureNames { get; } = new[]
-    {
+    public IReadOnlyList<string> FeatureNames { get; } =
+    [
         "close_open_diff_pct", "price_range_pct", "previous_close_diff_pct", "typical_price_pct",
         "sma_7_pct", "sma_14_pct", "sma_21_pct", "ema_7_pct",
         "close_lag_1_pct", "close_lag_2_pct", "close_lag_3_pct", "close_lag_4_pct",
@@ -24,7 +24,7 @@ public class FeatureBuilder : IFeatureBuilder
         "roc_14",
         "adx_14", "trend_strength", "volatility_regime",
         "spread_pct", "hour_sin", "hour_cos", "day_sin", "day_cos"
-    };
+    ];
 
     public float[] BuildFlattenedFeatures(
         IReadOnlyList<Candle> candles,
@@ -32,15 +32,14 @@ public class FeatureBuilder : IFeatureBuilder
         int windowSize)
     {
         var features = BuildFeatures(candles, symbol);
-        int rows = Math.Min(windowSize, features.GetLength(0));
-        int cols = features.GetLength(1);
+        var rows = Math.Min(windowSize, features.GetLength(0));
+        var cols = features.GetLength(1);
 
         var result = new float[rows * cols];
-        int idx = 0;
-        // Take the last 'rows' features
-        for (int i = features.GetLength(0) - rows; i < features.GetLength(0); i++)
+        var idx = 0;
+        for (var i = features.GetLength(0) - rows; i < features.GetLength(0); i++)
         {
-            for (int j = 0; j < cols; j++)
+            for (var j = 0; j < cols; j++)
             {
                 result[idx++] = features[i, j];
             }
@@ -50,18 +49,16 @@ public class FeatureBuilder : IFeatureBuilder
 
     public float[,] BuildFeatures(IReadOnlyList<Candle> candles, string symbol)
     {
-        int n = candles.Count;
+        var n = candles.Count;
         var features = new float[n, FeatureCount];
 
-        // Extract arrays for calculation
-        // Ensure we handle conversions from List to Array efficiently or allow Indicators to take ReadOnlyList
         var close = new double[n];
         var open = new double[n];
         var high = new double[n];
         var low = new double[n];
         var volume = new double[n];
         
-        for (int i = 0; i < n; i++)
+        for (var i = 0; i < n; i++)
         {
             close[i] = candles[i].Close;
             open[i] = candles[i].Open;
@@ -70,7 +67,6 @@ public class FeatureBuilder : IFeatureBuilder
             volume[i] = candles[i].Volume;
         }
 
-        // Calculate Indicators
         var sma7 = Technicals.Sma(close, 7);
         var sma14 = Technicals.Sma(close, 14);
         var sma21 = Technicals.Sma(close, 21);
@@ -78,120 +74,96 @@ public class FeatureBuilder : IFeatureBuilder
 
         var atr14 = Technicals.Atr(high, low, close, 14);
         var atr7 = Technicals.Atr(high, low, close, 7);
-        
-        // Bollinger Bands (20, 2)
-        var (bbUpper, bbMiddle, bbLower) = Technicals.BollingerBands(close, 20, 2);
+
+        var (bbUpper, _, bbLower) = Technicals.BollingerBands(close, 20, 2);
 
         var rsi14 = Technicals.Rsi(close, 14);
         var rsi7 = Technicals.Rsi(close, 7);
 
-        // MACD (12, 26, 9)
         var (macd, signal, hist) = Technicals.Macd(close, 12, 26, 9);
 
-        // Stochastic (14, 3, 3) - fastk=14, slowk=3, slowd=3
         var (stochK, stochD) = Technicals.Stochastic(high, low, close, 14, 3, 3);
 
         var roc14 = Technicals.Roc(close, 14);
         
         var adx14 = Technicals.Adx(high, low, close, 14);
-        
-        // Volume SMA
+
         var volSma7 = Technicals.Sma(volume, 7);
-        
-        // ATR ma for regime
+
         var atr14Ma = Technicals.Sma(atr14, 50);
 
-        // Fill features
-        for (int i = 0; i < n; i++)
+        for (var i = 0; i < n; i++)
         {
-            double c = close[i];
-            int col = 0;
+            var c = close[i];
+            var col = 0;
 
-            // 1. Price features
             features[i, col++] = (float)((c - open[i]) / open[i]);
             features[i, col++] = (float)((high[i] - low[i]) / c);
             features[i, col++] = i > 0 ? (float)((c - close[i - 1]) / close[i - 1]) : 0f;
             
-            double typicalPrice = (high[i] + low[i] + c) / 3.0;
+            var typicalPrice = (high[i] + low[i] + c) / 3.0;
             features[i, col++] = (float)((typicalPrice - c) / c);
 
-            // 2. MA features
             features[i, col++] = (float)((sma7[i] - c) / c);
             features[i, col++] = (float)((sma14[i] - c) / c);
             features[i, col++] = (float)((sma21[i] - c) / c);
             features[i, col++] = (float)((ema7[i] - c) / c);
 
-            // 3. Lag features (Returns)
-            for (int lag = 1; lag <= 7; lag++)
+            for (var lag = 1; lag <= 7; lag++)
             {
                 features[i, col++] = i >= lag 
                     ? (float)((c - close[i - lag]) / close[i - lag]) 
                     : 0f;
             }
 
-            // 4. Volume features
             features[i, col++] = (float)Math.Log(volume[i] + 1);
             features[i, col++] = (float)Math.Log(Math.Max(volSma7[i], 0) + 1);
-            
-            // Volume ratio
-            double vSma = volSma7[i];
+
+            var vSma = volSma7[i];
             features[i, col++] = vSma > 0 ? (float)(volume[i] / vSma) : 1f;
 
-            // Lag volume
-            for (int lag = 1; lag <= 7; lag++)
+            for (var lag = 1; lag <= 7; lag++)
             {
                 features[i, col++] = i >= lag 
                     ? (float)Math.Log(Math.Max(volume[i - lag], 0) + 1) 
                     : 0f;
             }
 
-            // 5. Volatility
             features[i, col++] = (float)(atr14[i] / c);
             features[i, col++] = (float)(atr7[i] / c);
             
-            double bbRange = bbUpper[i] - bbLower[i];
+            var bbRange = bbUpper[i] - bbLower[i];
             features[i, col++] = (float)(bbRange / c);
-            
-            // BB Position
+
             if (bbRange > 0)
                 features[i, col++] = (float)((c - bbLower[i]) / bbRange);
             else
                 features[i, col++] = 0.5f;
 
-            // 6. RSI
             features[i, col++] = (float)rsi14[i];
             features[i, col++] = (float)rsi7[i];
 
-            // 7. MACD
             features[i, col++] = (float)(macd[i] / c);
             features[i, col++] = (float)(signal[i] / c);
             features[i, col++] = (float)(hist[i] / c);
 
-            // 8. Stoch
             features[i, col++] = (float)stochK[i];
             features[i, col++] = (float)stochD[i];
 
-            // 9. ROC
             features[i, col++] = (float)roc14[i];
 
-            // 10. Trend/Regime
             features[i, col++] = (float)adx14[i];
             features[i, col++] = (float)(adx14[i] / 100.0);
             features[i, col++] = atr14[i] > atr14Ma[i] ? 1f : 0f;
 
-            // 11. Spread (Assuming 0.1 * ATR if provider null, matching Python default)
-            // Python: spread = atr_14 * 0.1 ... data['spread_pct'] = spread / close
-            double spread = atr14[i] * 0.1;
+            var spread = atr14[i] * 0.1;
             features[i, col++] = (float)(spread / c);
 
-            // 12. Time (Sin/Cos)
-            // Python: hour_sin, hour_cos, day_sin, day_cos
-            // Hour 0-23, Day 0-6
             var t = candles[i].Time;
             features[i, col++] = (float)Math.Sin(2 * Math.PI * t.Hour / 24.0);
             features[i, col++] = (float)Math.Cos(2 * Math.PI * t.Hour / 24.0);
             features[i, col++] = (float)Math.Sin(2 * Math.PI * (int)t.DayOfWeek / 7.0);
-            features[i, col++] = (float)Math.Cos(2 * Math.PI * (int)t.DayOfWeek / 7.0);
+            features[i, col] = (float)Math.Cos(2 * Math.PI * (int)t.DayOfWeek / 7.0);
         }
 
         return features;

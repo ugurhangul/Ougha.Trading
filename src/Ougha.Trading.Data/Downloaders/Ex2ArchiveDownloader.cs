@@ -1,5 +1,4 @@
 using System.IO.Compression;
-using System.Text;
 using Ougha.Trading.Core.Models;
 using System.Globalization;
 
@@ -22,16 +21,13 @@ public class Ex2ArchiveDownloader
 
     public async Task<List<Tick>> DownloadTicksAsync(string symbol, DateTime date, string broker = "Exness")
     {
-        // Try Day
         var dayTicks = await TryDownloadDayAsync(symbol, date, broker);
         if (dayTicks != null) return dayTicks;
 
-        // Try Month (and filter)
         var monthTicks = await TryDownloadMonthAsync(symbol, date, broker);
         if (monthTicks != null) 
             return FilterToDay(monthTicks, date);
 
-        // Try Year (and filter)
         var yearTicks = await TryDownloadYearAsync(symbol, date, broker);
         if (yearTicks != null)
              return FilterToDay(yearTicks, date);
@@ -48,30 +44,29 @@ public class Ex2ArchiveDownloader
 
     private async Task<List<Tick>?> TryDownloadDayAsync(string symbol, DateTime date, string broker)
     {
-        // URL: /ticks/{symbol}/{year}/{month:02}/{day:02}/{Broker}_{Symbol}_{Year}_{Month:02}_{Day:02}.zip
-        int year = date.Year;
-        int month = date.Month;
-        int day = date.Day;
-        string url = $"{BaseUrl}/ticks/{symbol}/{year}/{month:D2}/{day:D2}/{broker}_{symbol}_{year}_{month:D2}_{day:D2}.zip";
-        string cacheFile = Path.Combine(_cacheDir, $"{symbol}_{year}_{month:D2}_{day:D2}.zip");
+        var year = date.Year;
+        var month = date.Month;
+        var day = date.Day;
+        var url = $"{BaseUrl}/ticks/{symbol}/{year}/{month:D2}/{day:D2}/{broker}_{symbol}_{year}_{month:D2}_{day:D2}.zip";
+        var cacheFile = Path.Combine(_cacheDir, $"{symbol}_{year}_{month:D2}_{day:D2}.zip");
 
         return await DownloadAndParseAsync(url, cacheFile);
     }
 
     private async Task<List<Tick>?> TryDownloadMonthAsync(string symbol, DateTime date, string broker)
     {
-        int year = date.Year;
-        int month = date.Month;
-        string url = $"{BaseUrl}/ticks/{symbol}/{year}/{month:D2}/{broker}_{symbol}_{year}_{month:D2}.zip";
-        string cacheFile = Path.Combine(_cacheDir, $"{symbol}_{year}_{month:D2}.zip");
+        var year = date.Year;
+        var month = date.Month;
+        var url = $"{BaseUrl}/ticks/{symbol}/{year}/{month:D2}/{broker}_{symbol}_{year}_{month:D2}.zip";
+        var cacheFile = Path.Combine(_cacheDir, $"{symbol}_{year}_{month:D2}.zip");
         return await DownloadAndParseAsync(url, cacheFile);
     }
     
     private async Task<List<Tick>?> TryDownloadYearAsync(string symbol, DateTime date, string broker)
     {
-        int year = date.Year;
-        string url = $"{BaseUrl}/ticks/{symbol}/{year}/{broker}_{symbol}_{year}.zip";
-        string cacheFile = Path.Combine(_cacheDir, $"{symbol}_{year}.zip");
+        var year = date.Year;
+        var url = $"{BaseUrl}/ticks/{symbol}/{year}/{broker}_{symbol}_{year}.zip";
+        var cacheFile = Path.Combine(_cacheDir, $"{symbol}_{year}.zip");
         return await DownloadAndParseAsync(url, cacheFile);
     }
 
@@ -114,14 +109,7 @@ public class Ex2ArchiveDownloader
             using var stream = entry.Open();
             using var reader = new StreamReader(stream);
             
-            // Assuming header exists or implied? Python code had detection.
-            // Python code detected: timestamp, bid, ask, volume
-            // Let's assume standard format: timestamp,bid,ask,volume
-            // Or try to parse header?
-            
-            string? header = reader.ReadLine();
-            // Simple parsing for now - assume standard format
-            
+
             while (!reader.EndOfStream)
             {
                 var line = reader.ReadLine();
@@ -136,9 +124,8 @@ public class Ex2ArchiveDownloader
                 {
                      double vol = 0;
                      if (parts.Length > 3) double.TryParse(parts[3], NumberStyles.Any, CultureInfo.InvariantCulture, out vol);
-                     
-                     // Last = Bid (approx)
-                     ticks.Add(new Tick(time, bid, ask, 1, false, vol)); // TickType 1=Info/Quote?
+
+                     ticks.Add(new Tick(time, bid, ask, 1, false, vol));
                 }
             }
         }

@@ -49,7 +49,6 @@ public static class TrainingRunner
     {
         var symbols = symbolArg.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
 
-        // 1. Setup Data Loader
         var qdbSection = config.GetSection("QuestDB");
         var host = qdbSection["Host"] ?? "localhost";
         var port = qdbSection.GetValue("Port", 8812);
@@ -60,7 +59,6 @@ public static class TrainingRunner
         var endDate = config.GetValue("Training:End", new DateTime(DateTime.UtcNow.Year, DateTime.UtcNow.Month, DateTime.UtcNow.Day));
         var startDate = config.GetValue("Training:Start", new DateTime(2025, 01, 01));
 
-        // 2. Auto-calculate training budget based on hardware and data
         AnsiConsole.MarkupLine("[bold cyan]Calculating optimal training budget...[/]");
 
         var budget = TrainingBudgetCalculator.CalculateTrainingBudget(
@@ -77,29 +75,24 @@ public static class TrainingRunner
             useChunkedLoading: config.GetValue<bool?>("Training:UseChunkedLoading", null)
         );
 
-        // Display budget summary (escape markup to prevent `:N0` format causing parse errors)
         AnsiConsole.Write(new Panel(Markup.Escape(budget.GetSummary()))
             .Header("[bold yellow]Training Budget[/]")
             .Border(BoxBorder.Rounded));
 
-        // Use budget values
         var trainMaxSteps = budget.MaxSteps;
         var batchSize = budget.BatchSize;
         var bufferSize = budget.MemorySize;
 
 
-        // 2. Setup date range for random episode starts
         AnsiConsole.MarkupLine($"Training date range: {startDate:yyyy-MM-dd} to {endDate:yyyy-MM-dd}");
 
-        // Calculate episode window - leave room at end for each episode
         var totalDays = (int)(endDate - startDate).TotalDays;
         var episodeDays = Math.Max(1, (int)Math.Ceiling(budget.DaysPerEpisode));
         var maxStartOffset = Math.Max(0, totalDays - episodeDays - 1);
 
         AnsiConsole.MarkupLine($"[grey]Episode length: ~{episodeDays} days, {maxStartOffset + 1} possible start positions[/]");
 
-        // Quick S1 candle count check (using 1-second data instead of ticks)
-        var questTimeline = new QuestDBS1Timeline(dbLoader, symbols, startDate, endDate);
+        var questTimeline = new QuestDbs1Timeline(dbLoader, symbols, startDate, endDate);
         var totalCandles = await questTimeline.GetCountAsync();
 
         if (totalCandles == 0)
@@ -110,7 +103,6 @@ public static class TrainingRunner
 
         AnsiConsole.MarkupLine($"[grey]Found {totalCandles:N0} total S1 candles in date range[/]");
 
-        // 3. Setup Chunk-Based Data Provider (Memory Efficient)
         var chunkConfig = new ChunkConfig(
             ChunkDays: budget.ChunkDays,
             PrefetchChunks: budget.ChunkPrefetchCount,
@@ -126,10 +118,6 @@ public static class TrainingRunner
 
         chunkProvider.StartPrefetching();
 
-        // Note: Don't call chunkProvider.GetNextChunkAsync() here - 
-        // EnvironmentPool will do it internally and we'd skip chunk 1
-
-        // 4. Create Environment Pool with prefetching
         var mt5Executor = new Mt5Executor(config);
         var symbolService = new SymbolInfoService(mt5Executor);
 
@@ -146,8 +134,7 @@ public static class TrainingRunner
         );
 
         var envPoolConfig = new EnvironmentPoolConfig(
-            PoolSize: config.GetValue("Training:EnvPoolSize", 3),
-            EpisodeDays: episodeDays
+            PoolSize: config.GetValue("Training:EnvPoolSize", 3)
         );
 
         using var envPool = new EnvironmentPool(
@@ -161,7 +148,6 @@ public static class TrainingRunner
         envPool.StartPrefetching();
         AnsiConsole.MarkupLine($"[grey]Environment pool started with {envPoolConfig.PoolSize} prefetch slots[/]");
 
-        // 5. Setup Agent
         using var agent = CreateAgent(config, budget, batchSize, bufferSize);
 
         var earlyStop = new EarlyStopTracker(
@@ -172,7 +158,6 @@ public static class TrainingRunner
 
         AnsiConsole.MarkupLine($"[green]Environment & Agent Ready. Starting in-memory training loop.[/]");
 
-        // 6. Training Loop
         var stats = new TrainingStats
         {
             TotalEpisodes = budget.Episodes,
@@ -191,7 +176,6 @@ public static class TrainingRunner
             .AutoClear(false)
             .StartAsync(async ctx =>
             {
-                // Get first pre-warmed environment from pool
                 var preparedEnv = await envPool.GetNextEnvironmentAsync();
                 if (preparedEnv == null)
                 {
@@ -224,7 +208,6 @@ public static class TrainingRunner
 
                     if (ep > 1)
                     {
-                        // Get next pre-warmed environment from pool (already prefetched)
                         var nextEnv = await envPool.GetNextEnvironmentAsync();
                         if (nextEnv != null)
                         {
@@ -251,7 +234,6 @@ public static class TrainingRunner
                     double episodeReward = 0;
                     var step = 0;
 
-                    // Track per-symbol rewards for this episode
                     var symbolRewards = new Dictionary<string, double>();
                     foreach (var sym in symbols) symbolRewards[sym] = 0;
 
@@ -268,7 +250,6 @@ public static class TrainingRunner
                         actionTimer.Stop();
                         stats.ActionTimeMs = actionTimer.Elapsed.TotalMilliseconds;
 
-                        // Pass TP/SL multipliers to environment
                         env.SetTpSlMultipliersBatch(tpSlMults);
 
                         if (actions.Length > 0)
@@ -285,22 +266,17 @@ public static class TrainingRunner
 
                         var episodeDone = dones.All(d => d);
 
-                        // Store experiences with timing - use batch add for efficiency
                         bufferTimer.Restart();
 
-                        // Prepare batch arrays for vectorized buffer add
                         var doneFlags = new bool[stateInputs.Length];
                         Array.Fill(doneFlags, episodeDone);
 
-                        // Batch add all experiences at once with log probs (for PPO support)
                         agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs);
 
-                        // Accumulate rewards (still need to iterate for stats)
                         for (var i = 0; i < stateInputs.Length; i++)
                         {
                             episodeReward += rewards[i];
 
-                            // Track per-symbol rewards
                             if (i < symbols.Count)
                                 symbolRewards[symbols[i]] += rewards[i];
                         }
@@ -308,13 +284,11 @@ public static class TrainingRunner
                         bufferTimer.Stop();
                         stats.BufferAddTimeMs = bufferTimer.Elapsed.TotalMilliseconds;
 
-                        // ASYNC TRAINING SCHEDULER
-                        // Check if previous training finished
                         if (trainingTask is { IsCompleted: true })
                         {
                             try
                             {
-                                await trainingTask; // Await cleanly
+                                await trainingTask;
                                 stats.TrainCalls++;
                             }
                             catch (Exception ex)
@@ -327,7 +301,6 @@ public static class TrainingRunner
                             }
                         }
 
-                        // Start new training task if idle and buffer ready
                         if (trainingTask == null && step % budget.TrainFreq == 0)
                         {
                             var bufferCount = GetBufferSize(agent);
@@ -335,9 +308,9 @@ public static class TrainingRunner
                             {
                                 trainTimer.Restart();
 
-                                // Offload to thread pool
                                 trainingTask = Task.Run(() =>
                                 {
+                                    // ReSharper disable once AccessToDisposedClosure
                                     var loss = agent.TrainMultipleBatches(budget.TrainBatches);
                                     trainTimer.Stop();
                                     stats.TrainTimeMs = trainTimer.Elapsed.TotalMilliseconds;
@@ -363,30 +336,25 @@ public static class TrainingRunner
                     }
 
 
-                    // Ensure any pending training finishes before end of episode
                     if (trainingTask != null)
                     {
                         await trainingTask;
                         trainingTask = null;
                     }
 
-                    // Sync Inference Network at end of episode 
                     agent.SyncInferenceNetwork();
 
-                    // End of episode updates
                     stats.EpisodeReward = episodeReward;
                     stats.AddReward(episodeReward);
-                    stats.IncrementEpisode(); // Track completed episodes for ETA calculation
+                    stats.IncrementEpisode();
 
                     if (episodeReward > stats.BestReward)
                     {
                         stats.BestReward = episodeReward;
                     }
 
-                    // Update early stop tracker
                     var shouldStop = earlyStop.Update(episodeReward, ep);
 
-                    // Accumulate global stats from this episode BEFORE reset
                     var allResults = env.Executor.GetResults();
                     var episodeTrades = allResults.TradeLog;
                     stats.TradesOpened += allResults.TotalTrades;
@@ -396,14 +364,11 @@ public static class TrainingRunner
                     stats.TotalProfit += episodeTrades.Where(t => t.Profit > 0).Sum(t => t.Profit);
                     stats.TotalLoss += Math.Abs(episodeTrades.Where(t => t.Profit < 0).Sum(t => t.Profit));
 
-                    // Update symbol stats using per-symbol rewards and trades
                     foreach (var symbol in symbols)
                     {
                         var symStats = stats.GetOrCreateSymbolStats(symbol);
                         symStats.Episodes++;
 
-                        // Track per-symbol reward from episode rewards array (accumulated during episode)
-                        // The symbolRewards dictionary tracks rewards per symbol for this episode
                         double symbolReward = 0;
                         if (symbolRewards.TryGetValue(symbol, out var reward))
                             symbolReward = reward;
@@ -414,7 +379,6 @@ public static class TrainingRunner
                         {
                             symStats.BestReward = symbolReward;
 
-                            // Filter trades by this symbol
                             var symbol1 = symbol;
                             var symbolTrades = allResults.TradeLog.Where(t => t.Symbol == symbol1).ToList();
                             var grossProfit = symbolTrades.Where(t => t.Profit > 0).Sum(t => t.Profit);
@@ -425,7 +389,6 @@ public static class TrainingRunner
                             symStats.BestTrades = symbolTrades.Count;
                         }
 
-                        // Per-symbol early stopping - use symbol-specific tracker
                         if (!symbolEarlyStops.TryGetValue(symbol, out var symbolEarlyStop))
                         {
                             symbolEarlyStop = new EarlyStopTracker(
@@ -439,22 +402,18 @@ public static class TrainingRunner
                         symStats.EarlyStopped = symbolEarlyStop.ShouldStop;
                     }
 
-                    // Decay epsilon once per episode (not per step) for proper exploration
                     agent.DecayEpsilon();
 
-                    // Final update for this episode
                     stats.Epsilon = GetEpsilon(agent);
                     stats.Entropy = GetEntropy(agent);
                     ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
 
-                    // Periodically save
                     if (ep % budget.SaveFrequency == 0)
                     {
                         var checkpointPath = Path.Combine(modelDir, $"checkpoint_ep{ep}.pt");
                         agent.Save(checkpointPath);
                     }
 
-                    // Early stopping check
                     if (shouldStop)
                     {
                         AnsiConsole.MarkupLine($"[yellow]Early stopping triggered at episode {ep}[/]");
@@ -464,12 +423,10 @@ public static class TrainingRunner
                 
             });
 
-        // Save final model
         var finalModelPath = Path.Combine(modelDir, $"model_{DateTime.UtcNow:yyyyMMdd_HHmmss}.pt");
         agent.Save(finalModelPath);
         AnsiConsole.MarkupLine($"[bold green]Model saved to: {Markup.Escape(finalModelPath)}[/]");
 
-        // Also save as "latest" for easy access
         var latestPath = Path.Combine(modelDir, "model_latest.pt");
         agent.Save(latestPath);
 
@@ -480,12 +437,11 @@ public static class TrainingRunner
     {
         if (agent is TorchAgent)
         {
-            // Reflection hack to get epsilon for display
             var field = typeof(TorchAgent).GetField("_epsilon", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
             return (float)(field?.GetValue(agent) ?? 0f);
         }
 
-        return 0f; // PPO doesn't use epsilon-greedy
+        return 0f;
     }
 
     private static float GetEntropy(IAgent agent)
@@ -495,7 +451,7 @@ public static class TrainingRunner
             return ppo.GetEntropyCoef();
         }
 
-        return 0f; // DQN doesn't use entropy coefficient
+        return 0f;
     }
 
     private static int GetBufferSize(IAgent agent)
