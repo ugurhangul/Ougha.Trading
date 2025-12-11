@@ -42,7 +42,7 @@ public static class BacktestRunner
         // 2. Services Init
         var httpClient = new HttpClient();
         var downloader = new Ex2ArchiveDownloader(httpClient);
-        var dbLoader = new QuestDBDataLoader();
+        var dbLoader = new QuestDbDataLoader();
         
         // Initialize MT5 executor from config and inject into SymbolInfoService
         var mt5Executor = new Mt5Executor(config);
@@ -63,37 +63,37 @@ public static class BacktestRunner
                 }
             });
 
-        // 4. Stream Data using QuestDBTickTimeline (heap-based merge for multi-symbol)
+        // 4. Stream Data using QuestDBS1Timeline (heap-based merge for multi-symbol)
         var symbolInfos = new Dictionary<string, SymbolInfo>();
         foreach (var sym in symbols)
         {
             symbolInfos[sym] = symbolService.GetSymbolInfo(sym);
         }
 
-        var tickTimeline = new QuestDBTickTimeline(dbLoader, symbols, start, end);
+        var candleTimeline = new QuestDBS1Timeline(dbLoader, symbols, start, end);
         
         // Get total count for progress display (quick query, doesn't load data)
-        long totalTicks = 0;
+        long totalCandles = 0;
         await AnsiConsole.Status()
-            .StartAsync("[green]Counting ticks...[/]", async ctx =>
+            .StartAsync("[green]Counting candles...[/]", async ctx =>
             {
-                totalTicks = await tickTimeline.GetCountAsync();
-                ctx.Status($"[green]Found {totalTicks:N0} ticks to stream[/]");
+                totalCandles = await candleTimeline.GetCountAsync();
+                ctx.Status($"[green]Found {totalCandles:N0} candles to stream[/]");
             });
 
-        if (totalTicks == 0)
+        if (totalCandles == 0)
         {
             AnsiConsole.MarkupLine("[red]No data found![/]");
             return;
         }
 
-        AnsiConsole.MarkupLine($"[grey]Streaming {totalTicks:N0} ticks (heap-merged chronologically)[/]");
+        AnsiConsole.MarkupLine($"[grey]Streaming {totalCandles:N0} candles (heap-merged chronologically)[/]");
         
         // 5. Build Engine Components with STREAMING mode
         var portfolioManager = new PortfolioManager(riskConfig);
         
-        // Use streaming constructor - ticks loaded on-demand during backtest
-        var executor = new BacktestExecutor(tickTimeline.StreamAsync(), symbolInfos, portfolioManager, initialBalance);
+        // Use streaming constructor - candles loaded on-demand during backtest
+        var executor = new BacktestExecutor(candleTimeline.StreamAsync(), symbolInfos, portfolioManager, initialBalance);
         
         var featureBuilder = new FeatureBuilder();
         
@@ -160,6 +160,12 @@ public static class BacktestRunner
             {
                 var state = await env.ResetAsync();
                 
+                // Preload historical candles from QuestDB materialized views
+                // This replaces the old tick-based warmup - candles are already pre-built
+                AnsiConsole.MarkupLine("[grey]Preloading historical candles from materialized views...[/]");
+                await env.PreloadHistoricalCandlesAsync(dbLoader, start);
+                AnsiConsole.MarkupLine("[grey]Historical candles loaded.[/]");
+                
                 // For online training, we need previous inputs to store transitions
                 AgentInput[]? prevInputs = null;
                 int[]? prevActions = null;
@@ -169,7 +175,6 @@ public static class BacktestRunner
                 var stopwatch = Stopwatch.StartNew();
 
                 const int UI_UPDATE_INTERVAL = 1;
-                const int WARMUP_TICKS = 1500;
 
                 int[] cachedActions = new int[symbols.Length];
                 AgentInput[]? cachedInputs = null;
@@ -180,7 +185,8 @@ public static class BacktestRunner
 
                     var (rewards, dones, m1CandleClosed) = await env.StepFastAsync(cachedActions);
 
-                    bool shouldDecide = m1CandleClosed && step > WARMUP_TICKS;
+                    // No warmup needed - we preloaded historical candles from QuestDB
+                    bool shouldDecide = m1CandleClosed;
 
                     if (agent != null && shouldDecide)
                     {
@@ -200,7 +206,7 @@ public static class BacktestRunner
 
                         for(int i=0; i<symbols.Length; i++)
                         {
-                             agent.Observe(cachedInputs[i], cachedActions[i], rewards[i], nextInputs[i], episodeDone);
+                             agent.AddExperience(cachedInputs[i], cachedActions[i], rewards[i], nextInputs[i], episodeDone);
                         }
 
                         agent.Train();
@@ -252,7 +258,7 @@ public static class BacktestRunner
                             $"[bold]WR:[/] [{wrColor}]{winRate:F1}%[/]",
                             $"[bold]PF:[/] [{pfColor}]{pfDisplay}[/]",
                             $"[bold]DD:[/] [{ddColor}]{drawdownPct:F2}%[/]",
-                            $"[bold]Spd:[/] [yellow]{ticksPerSec:N0}/s[/]",
+                            $"[bold]Spd:[/] [yellow]{ticksPerSec:N0} candles/s[/]",
                             $"[bold]Trd:[/] [white]{totalTrades} ({wins}W/{losses}L)[/]",
                             $"[bold]Act:[/] [magenta]{string.Join(", ", symbols.Select((s, i) => $"{s}:{GetActionName(cachedActions[i])}"))}[/]"
                         );

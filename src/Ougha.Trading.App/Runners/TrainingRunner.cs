@@ -1,62 +1,42 @@
-using System;
-using System.IO;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Spectre.Console;
 using Ougha.Trading.Core.Models;
 using Ougha.Trading.Data;
+using Ougha.Trading.Data.Services;
 using Ougha.Trading.Data.Streamers;
-using Ougha.Trading.Features;
-using Ougha.Trading.Risk;
 using Ougha.Trading.RL;
 using Ougha.Trading.RL.Agents;
 using Ougha.Trading.RL.Training;
-using Ougha.Trading.Backtesting;
 
 namespace Ougha.Trading.App.Runners;
 
-public class EarlyStopTracker
+public class EarlyStopTracker(int patience = 300, int minEpisodes = 500, int window = 50)
 {
-    private readonly int _patience;
-    private readonly int _minEpisodes;
-    private readonly int _window;
-    
     private readonly Queue<double> _rewardHistory = new();
     private double _bestMovingAverage = double.MinValue;
-    private int _noImprovementCount = 0;
 
-    public EarlyStopTracker(int patience = 300, int minEpisodes = 500, int window = 50)
-    {
-        _patience = patience;
-        _minEpisodes = minEpisodes;
-        _window = window;
-    }
-
-    public bool ShouldStop => _noImprovementCount >= _patience;
-    public double BestAverage => _bestMovingAverage;
-    public int NoImprovementCount => _noImprovementCount;
+    public bool ShouldStop => NoImprovementCount >= patience;
+    public int NoImprovementCount { get; private set; }
 
     public bool Update(double reward, int episode)
     {
         _rewardHistory.Enqueue(reward);
-        if (_rewardHistory.Count > _window)
+        if (_rewardHistory.Count > window)
             _rewardHistory.Dequeue();
 
-        if (episode < _minEpisodes)
+        if (episode < minEpisodes)
             return false;
 
         var movingAvg = _rewardHistory.Average();
-        
+
         if (movingAvg > _bestMovingAverage)
         {
             _bestMovingAverage = movingAvg;
-            _noImprovementCount = 0;
+            NoImprovementCount = 0;
         }
         else
         {
-            _noImprovementCount++;
+            NoImprovementCount++;
         }
 
         return ShouldStop;
@@ -65,181 +45,520 @@ public class EarlyStopTracker
 
 public static class TrainingRunner
 {
-    public static async Task RunAsync(string symbolArg, int episodes, IConfiguration config)
+    public static async Task RunAsync(string symbolArg, int? episodes, IConfiguration config)
     {
         var symbols = symbolArg.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-        AnsiConsole.MarkupLine($"[bold yellow]Starting Native .NET RL Training for: {string.Join(", ", symbols)} ({episodes} episodes)[/]");
 
         // 1. Setup Data Loader
         var qdbSection = config.GetSection("QuestDB");
         var host = qdbSection["Host"] ?? "localhost";
-        var port = qdbSection.GetValue<int>("Port", 8812);
-        var dbLoader = new QuestDBDataLoader(host, port);
-        
-        var lookbackDays = config.GetValue<int>("Training:LookbackDays", 7);
-        var trainWindow = config.GetValue<int>("Training:WindowSize", 20);
-        var trainMaxSteps = config.GetValue<int>("Training:MaxSteps", 2000);
-        var batchSize = config.GetValue<int>("Training:BatchSize", 64);
-        var bufferSize = config.GetValue<int>("Training:BufferSize", 100000);
-        
-        var startDate = DateTime.UtcNow.Date.AddDays(-lookbackDays); 
-        var endDate = DateTime.UtcNow;
+        var port = qdbSection.GetValue("Port", 8812);
+        var dbLoader = new QuestDbDataLoader(host, port);
 
-        // 2. Load Data
-        AnsiConsole.MarkupLine($"Loading tick data ({startDate:yyyy-MM-dd} to {endDate:yyyy-MM-dd})...");
-        
-        var tickTimeline = new QuestDBTickTimeline(dbLoader, symbols, startDate, endDate);
-        await tickTimeline.LoadAllAsync();
-        
-        if (tickTimeline.Count == 0)
+        var trainWindow = config.GetValue("Training:WindowSize", 20);
+
+        var endDate = config.GetValue("Training:End", new DateTime(DateTime.UtcNow.Year, DateTime.UtcNow.Month, DateTime.UtcNow.Day));
+        var startDate = config.GetValue("Training:Start", new DateTime(2025, 01, 01));
+
+        // 2. Auto-calculate training budget based on hardware and data
+        AnsiConsole.MarkupLine("[bold cyan]Calculating optimal training budget...[/]");
+
+        var budget = TrainingBudgetCalculator.CalculateTrainingBudget(
+            startDate: startDate,
+            endDate: endDate,
+            numSymbols: symbols.Count,
+            episodes: episodes > 0 ? episodes : null,
+            maxSteps: config.GetValue<int?>("Training:MaxSteps", null),
+            batchSize: config.GetValue<int?>("Training:BatchSize", null),
+            learningRate: config.GetValue<double?>("Training:LearningRate", null),
+            chunkDays: config.GetValue<int?>("Training:ChunkDays", null),
+            chunkPrefetchCount: config.GetValue<int?>("Training:ChunkPrefetchCount", null),
+            chunkHistoryBufferDays: config.GetValue<int?>("Training:ChunkHistoryBufferDays", null),
+            useChunkedLoading: config.GetValue<bool?>("Training:UseChunkedLoading", null)
+        );
+
+        // Display budget summary (escape markup to prevent `:N0` format causing parse errors)
+        AnsiConsole.Write(new Panel(Markup.Escape(budget.GetSummary()))
+            .Header("[bold yellow]Training Budget[/]")
+            .Border(BoxBorder.Rounded));
+
+        // Use budget values
+        var trainMaxSteps = budget.MaxSteps;
+        var batchSize = budget.BatchSize;
+        var bufferSize = budget.MemorySize;
+
+
+        // 2. Setup date range for random episode starts
+        AnsiConsole.MarkupLine($"Training date range: {startDate:yyyy-MM-dd} to {endDate:yyyy-MM-dd}");
+
+        // Calculate episode window - leave room at end for each episode
+        var totalDays = (int)(endDate - startDate).TotalDays;
+        var episodeDays = Math.Max(1, (int)Math.Ceiling(budget.DaysPerEpisode));
+        var maxStartOffset = Math.Max(0, totalDays - episodeDays - 1);
+
+        AnsiConsole.MarkupLine($"[grey]Episode length: ~{episodeDays} days, {maxStartOffset + 1} possible start positions[/]");
+
+        // Quick S1 candle count check (using 1-second data instead of ticks)
+        var questTimeline = new QuestDBS1Timeline(dbLoader, symbols, startDate, endDate);
+        var totalCandles = await questTimeline.GetCountAsync();
+
+        if (totalCandles == 0)
         {
-            AnsiConsole.MarkupLine("[red]No data found. Exiting.[/]");
+            AnsiConsole.MarkupLine("[red]No S1 data found. Exiting.[/]");
             return;
         }
 
-        // Convert to TickTimeline
-        var cachedTicks = tickTimeline.GetCachedTicks();
-        var timeline = new TickTimeline(cachedTicks);
+        AnsiConsole.MarkupLine($"[grey]Found {totalCandles:N0} total S1 candles in date range[/]");
 
-        // 3. Create Environment
+        // 3. Setup Chunk-Based Data Provider (Memory Efficient)
+        var chunkConfig = new ChunkConfig(
+            ChunkDays: budget.ChunkDays,
+            PrefetchChunks: budget.ChunkPrefetchCount,
+            HistoryBufferDays: budget.ChunkHistoryBufferDays,
+            EpisodeDays: episodeDays
+        );
+
+        using var chunkProvider = new ChunkBasedDataProvider(
+            dbLoader, symbols, startDate, endDate, chunkConfig);
+
+        AnsiConsole.MarkupLine($"[bold cyan]Chunk-based loading enabled: {chunkProvider.TotalChunks} chunks of {budget.ChunkDays} days each[/]");
+        AnsiConsole.MarkupLine($"[grey]Prefetch buffer: {budget.ChunkPrefetchCount} chunks, History buffer: {budget.ChunkHistoryBufferDays} days[/]");
+
+        chunkProvider.StartPrefetching();
+
+        // Note: Don't call chunkProvider.GetNextChunkAsync() here - 
+        // EnvironmentPool will do it internally and we'd skip chunk 1
+
+        // 4. Create Environment Pool with prefetching
+        var mt5Executor = new Mt5Executor(config);
+        var symbolService = new SymbolInfoService(mt5Executor);
+
         var symbolInfo = new Dictionary<string, SymbolInfo>();
         foreach (var sym in symbols)
         {
-            // Default symbol info - ideally fetch from DB or Config
-            symbolInfo[sym] = new SymbolInfo(sym, 0.00001, 100000, 1, 0.00001, "USD", "USD", 5);
+            symbolInfo[sym] = symbolService.GetSymbolInfo(sym);
         }
 
-        var executor = new BacktestExecutor(timeline, symbolInfo);
-        
-        // Use PortfolioEnvironmentConfig
         var envConfig = new PortfolioEnvironmentConfig(
             Symbols: symbols.ToArray(),
             WindowSize: trainWindow,
             MaxSteps: trainMaxSteps
         );
-        
-        var env = new PortfolioTradingEnvironment(
-            executor,
-            new FeatureBuilder(),
-            new PortfolioManager(),
-            new RewardCalculator(),
-            envConfig
+
+        var envPoolConfig = new EnvironmentPoolConfig(
+            PoolSize: config.GetValue("Training:EnvPoolSize", 3),
+            EpisodeDays: episodeDays
         );
 
-        // 4. Setup Agent
-        // Use TorchAgent
-        using var agent = new TorchAgent(
-            batchSize: batchSize,
-            gamma: 0.99f, 
-            epsilon: 1.0f,
-            epsilonMin: 0.05f,
-            epsilonDecay: 0.998f, // Slow decay for long training
-            bufferSize: bufferSize,
-            useCuda: true // Try CUDA
+        using var envPool = new EnvironmentPool(
+            chunkProvider,
+            symbolInfo,
+            envConfig,
+            budget.Episodes,
+            envPoolConfig
         );
-        
-        var earlyStop = new EarlyStopTracker(patience: 300, minEpisodes: episodes / 10);
+
+        envPool.StartPrefetching();
+        AnsiConsole.MarkupLine($"[grey]Environment pool started with {envPoolConfig.PoolSize} prefetch slots[/]");
+
+        // 5. Setup Agent
+        using var agent = CreateAgent(config, budget, batchSize, bufferSize);
+
+        var earlyStop = new EarlyStopTracker(
+            patience: budget.EarlyStopPatience,
+            minEpisodes: budget.EarlyStopMinEpisodes);
         var modelDir = Path.Combine(Environment.CurrentDirectory, "models_dotnet");
         Directory.CreateDirectory(modelDir);
 
-        AnsiConsole.MarkupLine($"[green]Environment & Agent Ready.[/]");
+        AnsiConsole.MarkupLine($"[green]Environment & Agent Ready. Starting in-memory training loop.[/]");
 
-        // 5. Training Loop
-        var table = new Table().Border(TableBorder.Rounded);
-        table.AddColumn("Episode");
-        table.AddColumn("Total Reward");
-        table.AddColumn("Loss");
-        table.AddColumn("Epsilon");
-        table.AddColumn("Trades");
+        // 6. Training Loop
+        var stats = new TrainingStats
+        {
+            TotalEpisodes = budget.Episodes,
+            MaxSteps = trainMaxSteps,
+            InitialBalance = 10000,
+            GpuAvailable = budget.Hardware.GpuAvailable,
+            EarlyStopPatience = budget.EarlyStopPatience,
+            EarlyStopMinEpisodes = budget.EarlyStopMinEpisodes,
+            IsPpoAgent = agent is PpoAgent,
+            TotalChunks = envPool.TotalChunks
+        };
 
-        await AnsiConsole.Live(table)
+        foreach (var sym in symbols) stats.GetOrCreateSymbolStats(sym);
+
+        await AnsiConsole.Live(TrainingDisplay.BuildDisplay(stats, budget))
             .AutoClear(false)
-            .StartAsync(async ctx => 
+            .StartAsync(async ctx =>
             {
-                var totalRewards = new List<double>();
-                
-                for (int ep = 1; ep <= episodes; ep++)
+                // Get first pre-warmed environment from pool
+                var preparedEnv = await envPool.GetNextEnvironmentAsync();
+                if (preparedEnv == null)
                 {
-                    // Reset
-                    await env.ResetAsync();
-                    
-                    // Warmup
-                    int warmupSteps = 1500;
-                    for(int w=0; w<warmupSteps; w++)
+                    AnsiConsole.MarkupLine("[red]Failed to get initial environment from pool[/]");
+                    return;
+                }
+
+                var env = preparedEnv.Env;
+                var lastChunkIndex = preparedEnv.ChunkIndex;
+                stats.CurrentChunk = lastChunkIndex;
+                stats.ChunkStartDate = preparedEnv.ChunkStartDate;
+                stats.ChunkEndDate = preparedEnv.ChunkEndDate;
+                stats.EpisodesPerChunk = preparedEnv.EpisodesPerChunk;
+                stats.EpisodeInChunk = preparedEnv.EpisodeInChunk;
+                stats.EpisodeStartDate = preparedEnv.EpisodeStart;
+                stats.EpisodeEndDate = preparedEnv.EpisodeEnd;
+
+                var actionTimer = new System.Diagnostics.Stopwatch();
+                var envTimer = new System.Diagnostics.Stopwatch();
+                var trainTimer = new System.Diagnostics.Stopwatch();
+                var bufferTimer = new System.Diagnostics.Stopwatch();
+                var symbolEarlyStops = new Dictionary<string, EarlyStopTracker>();
+                Task<float>? trainingTask = null;
+
+                for (var ep = 1; ep <= budget.Episodes; ep++)
+                {
+                    stats.Episode = ep;
+                    stats.EpisodeReward = 0;
+                    stats.EpisodeLoss = 0;
+
+                    if (ep > 1)
                     {
-                        var actions = new int[symbols.Count]; // all 0 (HOLD)
-                        await env.StepTrainingAsync(actions);
+                        // Get next pre-warmed environment from pool (already prefetched)
+                        var nextEnv = await envPool.GetNextEnvironmentAsync();
+                        if (nextEnv != null)
+                        {
+                            env = nextEnv.Env;
+                            stats.EpisodeInChunk = nextEnv.EpisodeInChunk;
+                            stats.EpisodeStartDate = nextEnv.EpisodeStart;
+                            stats.EpisodeEndDate = nextEnv.EpisodeEnd;
+                            
+                            if (nextEnv.ChunkIndex != lastChunkIndex)
+                            {
+                                AnsiConsole.MarkupLine($"[cyan]Switched to chunk {nextEnv.ChunkIndex}/{envPool.TotalChunks}[/]");
+                                lastChunkIndex = nextEnv.ChunkIndex;
+                                stats.CurrentChunk = lastChunkIndex;
+                                stats.ChunkStartDate = nextEnv.ChunkStartDate;
+                                stats.ChunkEndDate = nextEnv.ChunkEndDate;
+                            }
+                        }
                     }
-                    
+
+                    await env.ResetAsync();
                     var stateInputs = env.BuildAgentInputs();
-                    
-                    bool done = false;
+
+                    var done = false;
                     double episodeReward = 0;
-                    float episodeLoss = 0;
-                    int trainSteps = 0;
-                    int step = 0;
-                    
+                    var step = 0;
+
+                    // Track per-symbol rewards for this episode
+                    var symbolRewards = new Dictionary<string, double>();
+                    foreach (var sym in symbols) symbolRewards[sym] = 0;
+
                     while (!done && step < trainMaxSteps)
                     {
                         step++;
-                        
-                        // Select actions
-                        int[] actions = new int[stateInputs.Length];
-                        for(int i=0; i<stateInputs.Length; i++)
+                        stats.CurrentStep = step;
+                        stats.TotalSteps++;
+                        stats.StartStepTimer();
+
+                        actionTimer.Restart();
+                        var (actions, tpSlMults, logProbs) = agent.ActBatchWithTpSlAndLogProbs(stateInputs, training: true);
+                        foreach (var a in actions) stats.RecordAction(a);
+                        actionTimer.Stop();
+                        stats.ActionTimeMs = actionTimer.Elapsed.TotalMilliseconds;
+
+                        // Pass TP/SL multipliers to environment
+                        env.SetTpSlMultipliersBatch(tpSlMults);
+
+                        if (actions.Length > 0)
                         {
-                            actions[i] = agent.Act(stateInputs[i], training: true);
+                            stats.CurrentAction = GetActionName(actions[0]);
+                            stats.CurrentSymbol = symbols[0];
                         }
-                        
-                        // Step using specialized training method
-                        var (nextStates, rewards, dones, infos) = await env.StepTrainingAsync(actions);
-                        
-                        bool episodeDone = dones.All(d => d);
-                        
-                        // Store & Train
-                        for(int i=0; i<stateInputs.Length; i++)
+
+                        envTimer.Restart();
+                        var (nextStates, rewards, dones) = await env.StepTrainingAsync(actions);
+                        envTimer.Stop();
+                        stats.EnvStepTimeMs = envTimer.Elapsed.TotalMilliseconds;
+
+
+                        var episodeDone = dones.All(d => d);
+
+                        // Store experiences with timing - use batch add for efficiency
+                        bufferTimer.Restart();
+
+                        // Prepare batch arrays for vectorized buffer add
+                        var doneFlags = new bool[stateInputs.Length];
+                        Array.Fill(doneFlags, episodeDone);
+
+                        // Batch add all experiences at once with log probs (for PPO support)
+                        agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs);
+
+                        // Accumulate rewards (still need to iterate for stats)
+                        for (var i = 0; i < stateInputs.Length; i++)
                         {
-                            agent.AddExperience(stateInputs[i], actions[i], rewards[i], nextStates[i], episodeDone);
                             episodeReward += rewards[i];
+
+                            // Track per-symbol rewards
+                            if (i < symbols.Count)
+                                symbolRewards[symbols[i]] += rewards[i];
                         }
-                        
-                        // Train Step
-                        float loss = agent.TrainStep();
-                        if (loss > 0)
+
+                        bufferTimer.Stop();
+                        stats.BufferAddTimeMs = bufferTimer.Elapsed.TotalMilliseconds;
+
+                        // ASYNC TRAINING SCHEDULER
+                        // Check if previous training finished
+                        if (trainingTask is { IsCompleted: true })
                         {
-                            episodeLoss += loss;
-                            trainSteps++;
+                            try
+                            {
+                                await trainingTask; // Await cleanly
+                                stats.TrainCalls++;
+                            }
+                            catch (Exception ex)
+                            {
+                                AnsiConsole.MarkupLine($"[red]Training error: {Markup.Escape(ex.Message)}[/]");
+                            }
+                            finally
+                            {
+                                trainingTask = null;
+                            }
                         }
-                        
+
+                        // Start new training task if idle and buffer ready
+                        if (trainingTask == null && step % budget.TrainFreq == 0)
+                        {
+                            var bufferCount = GetBufferSize(agent);
+                            if (bufferCount >= batchSize)
+                            {
+                                trainTimer.Restart();
+
+                                // Offload to thread pool
+                                trainingTask = Task.Run(() =>
+                                {
+                                    var loss = agent.TrainMultipleBatches(budget.TrainBatches);
+                                    trainTimer.Stop();
+                                    stats.TrainTimeMs = trainTimer.Elapsed.TotalMilliseconds;
+                                    return loss;
+                                });
+                            }
+                        }
+
+                        stats.EndStepTimer();
                         stateInputs = nextStates;
-                        if (episodeDone) done = true;
+
+                        done = episodeDone;
+
+
+                        stats.EpisodeReward = episodeReward;
+                        stats.Epsilon = GetEpsilon(agent);
+                        stats.Entropy = GetEntropy(agent);
+                        stats.BufferSize = GetBufferSize(agent);
+                        stats.Positions = env.Executor.GetPositions().Count();
+                        stats.Equity = env.Executor.GetBalance();
+
+                        ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
                     }
-                    
-                    float avgLoss = trainSteps > 0 ? episodeLoss / trainSteps : 0;
-                    
-                    table.AddRow(
-                        new Markup($"[blue]{ep}[/]"),
-                        new Markup($"[green]{episodeReward:F2}[/]"),
-                        new Markup($"[red]{avgLoss:F4}[/]"),
-                        new Markup($"{GetEpsilon(agent):F4}"),
-                        new Markup($"{executor.GetResults().TotalTrades}") 
-                    );
-                    ctx.Refresh();
-                    
-                    // Periodically save
-                    if (ep % 20 == 0)
+
+
+                    // Ensure any pending training finishes before end of episode
+                    if (trainingTask != null)
                     {
-                         // TBD: agent.Save(...)
+                        await trainingTask;
+                        trainingTask = null;
+                    }
+
+                    // Sync Inference Network at end of episode 
+                    agent.SyncInferenceNetwork();
+
+                    // End of episode updates
+                    stats.EpisodeReward = episodeReward;
+                    stats.AddReward(episodeReward);
+                    stats.IncrementEpisode(); // Track completed episodes for ETA calculation
+
+                    if (episodeReward > stats.BestReward)
+                    {
+                        stats.BestReward = episodeReward;
+                    }
+
+                    // Update early stop tracker
+                    var shouldStop = earlyStop.Update(episodeReward, ep);
+
+                    // Accumulate global stats from this episode BEFORE reset
+                    var allResults = env.Executor.GetResults();
+                    var episodeTrades = allResults.TradeLog;
+                    stats.TradesOpened += allResults.TotalTrades;
+                    stats.TradesClosed += episodeTrades.Count;
+                    stats.Wins += episodeTrades.Count(t => t.Profit > 0);
+                    stats.Losses += episodeTrades.Count(t => t.Profit <= 0);
+                    stats.TotalProfit += episodeTrades.Where(t => t.Profit > 0).Sum(t => t.Profit);
+                    stats.TotalLoss += Math.Abs(episodeTrades.Where(t => t.Profit < 0).Sum(t => t.Profit));
+
+                    // Update symbol stats using per-symbol rewards and trades
+                    foreach (var symbol in symbols)
+                    {
+                        var symStats = stats.GetOrCreateSymbolStats(symbol);
+                        symStats.Episodes++;
+
+                        // Track per-symbol reward from episode rewards array (accumulated during episode)
+                        // The symbolRewards dictionary tracks rewards per symbol for this episode
+                        double symbolReward = 0;
+                        if (symbolRewards.TryGetValue(symbol, out var reward))
+                            symbolReward = reward;
+
+                        symStats.TotalReward += symbolReward;
+
+                        if (symbolReward > symStats.BestReward)
+                        {
+                            symStats.BestReward = symbolReward;
+
+                            // Filter trades by this symbol
+                            var symbol1 = symbol;
+                            var symbolTrades = allResults.TradeLog.Where(t => t.Symbol == symbol1).ToList();
+                            var grossProfit = symbolTrades.Where(t => t.Profit > 0).Sum(t => t.Profit);
+                            var grossLoss = Math.Abs(symbolTrades.Where(t => t.Profit < 0).Sum(t => t.Profit));
+                            symStats.BestProfitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 999.0 : 0.0;
+                            var wins = symbolTrades.Count(t => t.Profit > 0);
+                            symStats.BestWinRate = symbolTrades.Count > 0 ? (double)wins / symbolTrades.Count * 100 : 0;
+                            symStats.BestTrades = symbolTrades.Count;
+                        }
+
+                        // Per-symbol early stopping - use symbol-specific tracker
+                        if (!symbolEarlyStops.TryGetValue(symbol, out var symbolEarlyStop))
+                        {
+                            symbolEarlyStop = new EarlyStopTracker(
+                                patience: budget.EarlyStopPatience,
+                                minEpisodes: budget.EarlyStopMinEpisodes);
+                            symbolEarlyStops[symbol] = symbolEarlyStop;
+                        }
+
+                        symbolEarlyStop.Update(symbolReward, symStats.Episodes);
+                        symStats.NoImprovementCount = symbolEarlyStop.NoImprovementCount;
+                        symStats.EarlyStopped = symbolEarlyStop.ShouldStop;
+                    }
+
+                    // Decay epsilon once per episode (not per step) for proper exploration
+                    agent.DecayEpsilon();
+
+                    // Final update for this episode
+                    stats.Epsilon = GetEpsilon(agent);
+                    stats.Entropy = GetEntropy(agent);
+                    ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
+
+                    // Periodically save
+                    if (ep % budget.SaveFrequency == 0)
+                    {
+                        var checkpointPath = Path.Combine(modelDir, $"checkpoint_ep{ep}.pt");
+                        agent.Save(checkpointPath);
+                    }
+
+                    // Early stopping check
+                    if (shouldStop)
+                    {
+                        AnsiConsole.MarkupLine($"[yellow]Early stopping triggered at episode {ep}[/]");
+                        break;
                     }
                 }
+                
             });
-            
+
+        // Save final model
+        var finalModelPath = Path.Combine(modelDir, $"model_{DateTime.UtcNow:yyyyMMdd_HHmmss}.pt");
+        agent.Save(finalModelPath);
+        AnsiConsole.MarkupLine($"[bold green]Model saved to: {Markup.Escape(finalModelPath)}[/]");
+
+        // Also save as "latest" for easy access
+        var latestPath = Path.Combine(modelDir, "model_latest.pt");
+        agent.Save(latestPath);
+
         AnsiConsole.MarkupLine("[bold green]Training Complete![/]");
     }
-    
-    private static float GetEpsilon(TorchAgent agent)
+
+    private static float GetEpsilon(IAgent agent)
     {
-        // Reflection hack to get epsilon for display
-        var field = typeof(TorchAgent).GetField("_epsilon", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        return (float)(field?.GetValue(agent) ?? 0f);
+        if (agent is TorchAgent)
+        {
+            // Reflection hack to get epsilon for display
+            var field = typeof(TorchAgent).GetField("_epsilon", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            return (float)(field?.GetValue(agent) ?? 0f);
+        }
+
+        return 0f; // PPO doesn't use epsilon-greedy
+    }
+
+    private static float GetEntropy(IAgent agent)
+    {
+        if (agent is PpoAgent ppo)
+        {
+            return ppo.GetEntropyCoef();
+        }
+
+        return 0f; // DQN doesn't use entropy coefficient
+    }
+
+    private static int GetBufferSize(IAgent agent)
+    {
+        if (agent is TorchAgent)
+        {
+            var field = typeof(TorchAgent).GetField("_buffer", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var buffer = field?.GetValue(agent);
+            if (buffer == null) return 0;
+
+            var countProp = buffer.GetType().GetProperty("Count");
+            return (int)(countProp?.GetValue(buffer) ?? 0);
+        }
+        else if (agent is PpoAgent)
+        {
+            var field = typeof(PpoAgent).GetField("_rolloutBuffer", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var buffer = field?.GetValue(agent);
+            if (buffer == null) return 0;
+            var list = buffer as System.Collections.IList;
+            return list?.Count ?? 0;
+        }
+
+        return 0;
+    }
+
+    private static string GetActionName(int action)
+    {
+        return action switch
+        {
+            0 => "HOLD",
+            1 => "BUY",
+            2 => "SELL",
+            _ => $"ACT_{action}"
+        };
+    }
+    
+    private static IAgent CreateAgent(IConfiguration config, TrainingBudget budget, int batchSize, int bufferSize)
+    {
+        var strategy = config.GetValue<string>("Training:Strategy", "DQN");
+
+        if (strategy.Equals("PPO", StringComparison.OrdinalIgnoreCase))
+        {
+            AnsiConsole.MarkupLine("[bold cyan]Using PPO Strategy[/]");
+            return new PpoAgent(
+                batchSize: batchSize,
+                rolloutHorizon: 2048,
+                gamma: 0.99f,
+                learningRate: 3e-4f,
+                useCuda: budget.Hardware.GpuAvailable
+            );
+        }
+        else
+        {
+            AnsiConsole.MarkupLine("[bold cyan]Using DQN Strategy[/]");
+            return new TorchAgent(
+                batchSize: batchSize,
+                gamma: 0.99f,
+                epsilon: 1.0f,
+                epsilonMin: 0.01f,
+                epsilonDecay: (float)budget.EpsilonDecay,
+                bufferSize: bufferSize,
+                useCuda: budget.Hardware.GpuAvailable
+            );
+        }
     }
 }

@@ -76,6 +76,6 @@ Desktop.ini
 .DS_Store
 /.idea
 /augment-kv-store
-/augment-kv-store
 test_symbol_ids.csx
-build_log.txt
+*.txt
+*.log

@@ -27,10 +27,9 @@ class Program
             description: "Symbol to trade/test (overrides appsettings.json)",
             getDefaultValue: () => null);
 
-        var episodesOption = new Option<int>(
+        var episodesOption = new Option<int?>(
             name: "--episodes",
-            description: "Number of episodes for training",
-            getDefaultValue: () => 1000);
+            description: "Number of episodes for training (null = auto-calculate)");
 
         var trainOption = new Option<bool>(
             name: "--train",

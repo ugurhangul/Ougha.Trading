@@ -5,12 +5,12 @@ namespace Ougha.Trading.Data.Services;
 
 public class DataService
 {
-    private readonly QuestDBDataLoader _repo;
+    private readonly QuestDbDataLoader _repo;
     private readonly Ex2ArchiveDownloader _downloader;
     private readonly SymbolInfoService _symbolService;
 
     public DataService(
-        QuestDBDataLoader repo,
+        QuestDbDataLoader repo,
         Ex2ArchiveDownloader downloader,
         SymbolInfoService symbolService)
     {

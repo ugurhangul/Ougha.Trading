@@ -31,7 +31,7 @@ public class CandleBuilder
             _currentCandle = new Candle(
                 candleTime, 
                 tick.Bid, tick.Bid, tick.Bid, tick.Bid, 
-                tick.Volume);
+                (long)tick.Volume);
         }
         else if (_currentCandle.Time != candleTime)
         {
@@ -42,7 +42,7 @@ public class CandleBuilder
             _currentCandle = new Candle(
                 candleTime, 
                 tick.Bid, tick.Bid, tick.Bid, tick.Bid, 
-                tick.Volume);
+                (long)tick.Volume);
         }
         else
         {
@@ -53,7 +53,7 @@ public class CandleBuilder
                 Math.Max(_currentCandle.High, tick.Bid),
                 Math.Min(_currentCandle.Low, tick.Bid),
                 tick.Bid,
-                _currentCandle.Volume + tick.Volume);
+                _currentCandle.Volume + (long)tick.Volume);
         }
     }
     

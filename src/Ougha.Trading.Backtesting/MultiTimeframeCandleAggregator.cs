@@ -81,28 +81,29 @@ public class MultiTimeframeCandleAggregator
     }
 
     /// <summary>
-    /// Add an M1 candle and aggregate into higher timeframes.
+    /// Add a generic candle (e.g. S1) and update all timeframe candles.
+    /// Values are aggregated (High=Max, Low=Min, Volume=Sum).
     /// </summary>
     /// <returns>List of timeframes that just closed a candle</returns>
-    public List<string> AddM1Candle(Candle m1Candle)
+    public List<string> AddCandle(Candle inputCandle)
     {
         var closedTimeframes = new List<string>();
 
         foreach (var tf in Timeframes)
         {
             var period = _timeframePeriods[tf];
-            var candleTime = AlignToTimeframe(m1Candle.Time, period);
+            var candleTime = AlignToTimeframe(inputCandle.Time, period);
 
             if (_currentCandles[tf] == null)
             {
                 // Start first candle
                 _currentCandles[tf] = new Candle(
                     candleTime,
-                    m1Candle.Open,
-                    m1Candle.High,
-                    m1Candle.Low,
-                    m1Candle.Close,
-                    m1Candle.Volume);
+                    inputCandle.Open,
+                    inputCandle.High,
+                    inputCandle.Low,
+                    inputCandle.Close,
+                    inputCandle.Volume);
             }
             else if (_currentCandles[tf]!.Time != candleTime)
             {
@@ -118,27 +119,42 @@ public class MultiTimeframeCandleAggregator
 
                 _currentCandles[tf] = new Candle(
                     candleTime,
-                    m1Candle.Open,
-                    m1Candle.High,
-                    m1Candle.Low,
-                    m1Candle.Close,
-                    m1Candle.Volume);
+                    inputCandle.Open,
+                    inputCandle.High,
+                    inputCandle.Low,
+                    inputCandle.Close,
+                    inputCandle.Volume);
             }
             else
             {
-                // Merge M1 candle into current higher-timeframe candle
+                // Merge input candle into current higher-timeframe candle
                 var current = _currentCandles[tf]!;
                 _currentCandles[tf] = new Candle(
                     current.Time,
-                    current.Open,                                     // Keep original open
-                    Math.Max(current.High, m1Candle.High),           // Highest high
-                    Math.Min(current.Low, m1Candle.Low),             // Lowest low
-                    m1Candle.Close,                                   // Latest close
-                    current.Volume + m1Candle.Volume);               // Sum volume
+                    current.Open,                                       // Keep original open
+                    Math.Max(current.High, inputCandle.High),           // Highest high
+                    Math.Min(current.Low, inputCandle.Low),             // Lowest low
+                    inputCandle.Close,                                  // Latest close
+                    current.Volume + inputCandle.Volume);               // Sum volume
             }
         }
 
         return closedTimeframes;
+    }
+
+    /// <summary>
+    /// Add an M1 candle and aggregate into higher timeframes.
+    /// </summary>
+    /// <returns>List of timeframes that just closed a candle</returns>
+    public List<string> AddM1Candle(Candle m1Candle)
+    {
+        // Re-use generic AddCandle logic, or keep separate if M1 handling needs specific optimization? 
+        // For now, identical logic to generic AddCandle but specifically M1 is often base.
+        // Actually, AddM1Candle iterates ALL timeframes, including M1? 
+        // If input IS M1, then M1 logic in loop (period=1m) will just always be "Start new" or "Update"?
+        // If input is M1 aligned, it will simply replace/update. 
+        // Logic in AddCandle handles it correctly.
+        return AddCandle(m1Candle);
     }
 
     /// <summary>
@@ -203,6 +219,50 @@ public class MultiTimeframeCandleAggregator
         }
     }
 
+    /// <summary>
+    /// Preload historical candles into the aggregator.
+    /// This allows skipping warmup by loading pre-built candles from QuestDB materialized views.
+    /// </summary>
+    /// <param name="timeframe">Timeframe key (M1, M5, M15, H1, H4)</param>
+    /// <param name="candles">Candles ordered chronologically (oldest first)</param>
+    public void PreloadCandles(string timeframe, IReadOnlyList<Candle> candles)
+    {
+        if (!_completedCandles.ContainsKey(timeframe))
+            return;
+
+        _completedCandles[timeframe].Clear();
+        
+        // Add all candles except the last one (which might still be forming)
+        int count = candles.Count;
+        if (count == 0) return;
+        
+        // Add completed candles
+        for (int i = 0; i < count - 1; i++)
+        {
+            _completedCandles[timeframe].Add(candles[i]);
+        }
+        
+        // Keep latest as "current" (potentially still forming)
+        _currentCandles[timeframe] = candles[count - 1];
+        
+        // Trim to max size
+        while (_completedCandles[timeframe].Count > _maxCandlesPerTimeframe)
+        {
+            _completedCandles[timeframe].RemoveAt(0);
+        }
+    }
+
+    /// <summary>
+    /// Preload all timeframes at once from a dictionary.
+    /// </summary>
+    public void PreloadAllTimeframes(Dictionary<string, IReadOnlyList<Candle>> candlesByTimeframe)
+    {
+        foreach (var (tf, candles) in candlesByTimeframe)
+        {
+            PreloadCandles(tf, candles);
+        }
+    }
+
     private static DateTime AlignToTimeframe(DateTime time, TimeSpan period)
     {
         var periodTicks = period.Ticks;
@@ -212,7 +272,7 @@ public class MultiTimeframeCandleAggregator
 
     private static Candle CreateCandle(DateTime time, Tick tick)
     {
-        return new Candle(time, tick.Bid, tick.Bid, tick.Bid, tick.Bid, tick.Volume);
+        return new Candle(time, tick.Bid, tick.Bid, tick.Bid, tick.Bid, (long)tick.Volume);
     }
 
     private static Candle UpdateCandle(Candle current, Tick tick)
@@ -223,6 +283,6 @@ public class MultiTimeframeCandleAggregator
             Math.Max(current.High, tick.Bid),
             Math.Min(current.Low, tick.Bid),
             tick.Bid,
-            current.Volume + tick.Volume);
+            current.Volume + (long)tick.Volume);
     }
 }

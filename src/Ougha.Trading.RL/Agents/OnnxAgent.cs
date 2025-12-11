@@ -104,10 +104,50 @@ public class OnnxAgent : IAgent, IDisposable
         return SelectAction(state);
     }
 
-    public void Observe(AgentInput state, int action, float reward, AgentInput nextState, bool done)
+    public void AddExperience(AgentInput state, int action, float reward, AgentInput? nextState, bool done)
     {
         // No-op for inference-only agent
     }
+
+    public void AddExperienceBatch(
+        AgentInput[] states,
+        int[] actions,
+        float[] rewards,
+        AgentInput?[] nextStates,
+        bool[] dones)
+    {
+        // No-op for inference-only agent
+    }
+
+    public (int[] Actions, float[,] TpSlMultipliers) ActBatchWithTpSl(AgentInput[] inputs, bool training = true)
+    {
+        var actions = SelectPortfolioActions(inputs);
+        var tpSl = new float[inputs.Length, 2];
+        for(int i=0; i<inputs.Length; i++) { tpSl[i,0] = 1.0f; tpSl[i,1] = 1.0f; } 
+        return (actions, tpSl);
+    }
+
+    public (int[] Actions, float[,] TpSlMultipliers, float[] LogProbs) ActBatchWithTpSlAndLogProbs(AgentInput[] inputs, bool training = true)
+    {
+        var (actions, tpSl) = ActBatchWithTpSl(inputs, training);
+        return (actions, tpSl, new float[inputs.Length]); // Inference-only, no log probs
+    }
+
+    public void AddExperienceBatchWithLogProbs(
+        AgentInput[] states,
+        int[] actions,
+        float[] rewards,
+        AgentInput?[] nextStates,
+        bool[] dones,
+        float[] logProbs)
+    {
+        // No-op for inference-only agent
+    }
+    
+    public void SyncInferenceNetwork() { /* No-op */ }
+    public void DecayEpsilon() { /* No-op */ }
+    
+    public float TrainMultipleBatches(int batches) { return 0f; }
 
     public float Train()
     {
@@ -129,6 +169,8 @@ public class OnnxAgent : IAgent, IDisposable
     {
         // No-op for inference-only agent
     }
+
+    public int BufferCount => 0;
 
     #endregion
 

@@ -30,11 +30,14 @@ public class PortfolioTradingEnvironment
     // Action memory tracking (matches Python's action_memory_window)
     private readonly Dictionary<string, int> _lastExecutedAction;
     private readonly Dictionary<string, int> _lastExecutedTick;
-    private const int ACTION_MEMORY_WINDOW = 1050; // Ticks before same action can repeat
+    private readonly int _actionMemoryWindow; // Configurable, default 1050
     private const int MIN_HOLDING_TICKS = 50; // Minimum ticks before closing
 
     // Per-symbol action tracking for online learning (tracks every action, not just executed)
     private readonly Dictionary<string, int> _lastActionBySymbol;
+
+    // Per-symbol TP/SL multipliers from model output
+    private readonly Dictionary<string, (float TpMult, float SlMult)> _lastTpSlMultipliers;
 
     // Global state
     private int _currentTick;
@@ -44,8 +47,23 @@ public class PortfolioTradingEnvironment
     private int _lastM1Minute = -1;
 
     public int StateSize => _stateBuilder.GetStateSize(_config.Symbols.Length);
-    public int ActionSize => 8; // Per symbol: HOLD, BUY_CONS, BUY_MOD, BUY_AGG, SELL_CONS, SELL_MOD, SELL_AGG, CLOSE
+    public int ActionSize => ActionDecoder.NumActions; // 3 actions: HOLD, BUY, SELL
     public string[] Symbols => _config.Symbols;
+    
+    /// <summary>
+    /// Expose RewardCalculator for episode metric resets.
+    /// </summary>
+    public RewardCalculator RewardCalculator => _rewardCalculator;
+    
+    /// <summary>
+    /// Expose executor for stats access (positions, balance, results).
+    /// </summary>
+    public BacktestExecutor Executor => _executor;
+
+    /// <summary>
+    /// Expose MTF aggregator for internal preloading or debugging.
+    /// </summary>
+    public MultiTimeframeCandleAggregator GetMtFAggregator(string symbol) => _mtfAggregators[symbol];
 
     public PortfolioTradingEnvironment(
         BacktestExecutor executor,
@@ -72,6 +90,9 @@ public class PortfolioTradingEnvironment
         _lastExecutedAction = new Dictionary<string, int>();
         _lastExecutedTick = new Dictionary<string, int>();
         _lastActionBySymbol = new Dictionary<string, int>();
+        _lastTpSlMultipliers = new Dictionary<string, (float, float)>();
+
+        _actionMemoryWindow = config.ActionMemoryWindow;
 
         foreach (var symbol in config.Symbols)
         {
@@ -81,6 +102,7 @@ public class PortfolioTradingEnvironment
             _peakUnrealizedPnls[symbol] = 0;
             _lastClosedTimeframes[symbol] = new List<string>();
             _lastActionBySymbol[symbol] = 0;
+            _lastTpSlMultipliers[symbol] = (0.5f, 0.5f); // Default middle values
         }
 
         _reusableRewards = new float[config.Symbols.Length];
@@ -90,14 +112,32 @@ public class PortfolioTradingEnvironment
     /// <summary>
     /// Specialized step method for RL Training.
     /// Returns per-symbol rewards and structured AgentInput[] states.
-    /// In tick-by-tick mode, only the symbol that receives the next tick will have its action processed.
+    /// Optimized: Only rebuilds features when M1 candle closes.
     /// </summary>
-    public async Task<(AgentInput[] NextStates, float[] Rewards, bool[] Dones, Dictionary<string, object> Infos)> StepTrainingAsync(int[] actions)
+    public async Task<(AgentInput[] NextStates, float[] Rewards, bool[] Dones)> StepTrainingAsync(int[] actions)
     {
-        var (rewards, dones, _) = await StepFastAsync(actions);
-        var nextStates = _isDone ? _cachedAgentInputs ?? BuildAgentInputs() : BuildAgentInputs();
-        return (nextStates, rewards, dones, new Dictionary<string, object>());
+        var (rewards, dones, m1CandleClosed) = await StepFastAsync(actions);
+        
+        // OPTIMIZATION: Only rebuild features when M1 candle closes or cache is empty
+        // This avoids expensive feature computation on every tick
+        AgentInput[] nextStates;
+        if (_isDone)
+        {
+            nextStates = _cachedAgentInputs ?? BuildAgentInputs();
+        }
+        else if (m1CandleClosed || _cachedAgentInputs == null)
+        {
+            nextStates = BuildAgentInputs();
+            _cachedAgentInputs = nextStates;
+        }
+        else
+        {
+            nextStates = _cachedAgentInputs;
+        }
+        
+        return (nextStates, rewards, dones);
     }
+
 
     private AgentInput[]? _cachedAgentInputs;
     private static readonly float[] _emptyRewards = new float[8];
@@ -131,6 +171,34 @@ public class PortfolioTradingEnvironment
         bool moreData = await _executor.AdvanceAsync();
         _currentTick++;
 
+        // Process automatic TP/SL closes that happened during AdvanceAsync
+        // CRITICAL: This gives the agent reward signals for profitable closes!
+        var pendingCloses = _executor.GetAndClearPendingCloses();
+        foreach (var closeInfo in pendingCloses)
+        {
+            int symbolIndex = Array.IndexOf(_config.Symbols, closeInfo.Symbol);
+            if (symbolIndex >= 0)
+            {
+                double maxDrawdownPct = 0;
+                if (_peakEquity > 0)
+                    maxDrawdownPct = (_peakEquity - _executor.GetEquity()) / _peakEquity;
+
+                float closeReward = _rewardCalculator.Calculate(
+                    tradeClosed: true,
+                    tradeProfit: closeInfo.Profit,
+                    holdingTicks: closeInfo.HoldingTicks,
+                    hasPosition: false,
+                    unrealizedPnl: 0,
+                    peakUnrealizedPnl: _peakUnrealizedPnls.GetValueOrDefault(closeInfo.Symbol),
+                    initialBalance: _initialBalance,
+                    maxDrawdownPct: maxDrawdownPct);
+
+                _reusableRewards[symbolIndex] += closeReward;
+                _positionOpenTicks[closeInfo.Symbol] = 0;
+                _peakUnrealizedPnls[closeInfo.Symbol] = 0;
+            }
+        }
+
         string? tickedSymbol = _executor.LastTickedSymbol;
         bool m1CandleClosed = false;
 
@@ -141,13 +209,13 @@ public class PortfolioTradingEnvironment
             {
                 var action = actions[symbolIndex];
                 var (symbolReward, _) = await ProcessSymbolAction(tickedSymbol, action);
-                _reusableRewards[symbolIndex] = symbolReward;
+                _reusableRewards[symbolIndex] += symbolReward;
             }
 
-            var tick = _executor.GetLastKnownTick(tickedSymbol);
-            if (tick != null)
+            var candle = _executor.GetLastKnownCandle(tickedSymbol);
+            if (candle != null)
             {
-                var closedTimeframes = _mtfAggregators[tickedSymbol].AddTick(tick);
+                var closedTimeframes = _mtfAggregators[tickedSymbol].AddCandle(candle);
                 _lastClosedTimeframes[tickedSymbol] = closedTimeframes;
                 if (closedTimeframes.Contains("M1"))
                     m1CandleClosed = true;
@@ -177,11 +245,9 @@ public class PortfolioTradingEnvironment
     
     private async Task<(float Reward, bool TradeClosed)> ProcessSymbolAction(string symbol, int action)
     {
-        // Skip HOLD actions early - no need to process
-        if (action == 0) return (0, false);
+        if (ActionDecoder.IsHold(action)) return (0, false);
 
-        bool isClose = ActionDecoder.IsClose(action);
-        var (entryType, riskLevel) = ActionDecoder.Decode(action);
+        var entryType = ActionDecoder.Decode(action);
 
         bool tradeClosed = false;
         double tradeProfit = 0;
@@ -190,87 +256,100 @@ public class PortfolioTradingEnvironment
         var pos = _executor.GetPosition(symbol);
         bool hasPosition = pos != null;
 
-        // Action memory window check (Python: ticks_since_last_action < action_memory_window)
         int lastAction = _lastExecutedAction.GetValueOrDefault(symbol, -1);
-        int lastTick = _lastExecutedTick.GetValueOrDefault(symbol, -ACTION_MEMORY_WINDOW);
+        int lastTick = _lastExecutedTick.GetValueOrDefault(symbol, -_actionMemoryWindow);
         int ticksSinceLastAction = _currentTick - lastTick;
 
-        if (lastAction == action && ticksSinceLastAction < ACTION_MEMORY_WINDOW)
-        {
-            // Skip - same action within memory window
+        if (lastAction == action && ticksSinceLastAction < _actionMemoryWindow)
             return (0, false);
-        }
-        
-        // Min holding ticks check (Python: holding_ticks < min_holding_ticks)
+
         int currentHoldingTicks = hasPosition ? _currentTick - _positionOpenTicks.GetValueOrDefault(symbol) : 0;
-        if (hasPosition && currentHoldingTicks < MIN_HOLDING_TICKS)
+
+        // If we have a position and action is opposite direction, close first
+        if (hasPosition && entryType.HasValue && pos!.Type != entryType.Value)
         {
-            // Don't close or reverse too early
-            if (isClose || (entryType.HasValue && pos!.Type != (entryType.Value == TradeType.Buy ? TradeType.Buy : TradeType.Sell)))
+            if (currentHoldingTicks >= MIN_HOLDING_TICKS)
+            {
+                var closeResult = await _executor.ClosePositionAsync(symbol);
+                if (closeResult.Success)
+                {
+                    tradeClosed = true;
+                    tradeProfit = closeResult.Profit;
+                    holdingTicks = currentHoldingTicks;
+                    _positionOpenTicks[symbol] = 0;
+                    hasPosition = false;
+                }
+            }
+            else
             {
                 return (0, false);
             }
         }
 
-        // Execute action - MATCHING PYTHON BEHAVIOR:
-        // - BUY/SELL only work when NOT has_position (no flipping allowed)
-        // - CLOSE only works when has_position
-        if (isClose)
+        // Open new position if no position
+        if (entryType.HasValue && !hasPosition)
         {
-            if (hasPosition)
-            {
-                var result = await _executor.ClosePositionAsync(symbol);
-                if (result.Success)
-                {
-                    tradeClosed = true;
-                    tradeProfit = result.Profit;
-                    holdingTicks = _currentTick - _positionOpenTicks.GetValueOrDefault(symbol);
-                    _positionOpenTicks[symbol] = 0;
-
-                    // Update action memory
-                    _lastExecutedAction[symbol] = action;
-                    _lastExecutedTick[symbol] = _currentTick;
-                }
-            }
-            // else: CLOSE with no position - action is ignored (no penalty, just no-op)
-        }
-        else if (entryType.HasValue && riskLevel.HasValue && !hasPosition)
-        {
-            // Python: BUY/SELL only execute when NOT has_position
-            var tick = _executor.GetLastKnownTick(symbol);
-            if (tick != null)
+            var candle = _executor.GetLastKnownCandle(symbol);
+            if (candle != null)
             {
                 double atr = CalculateAtr(symbol);
                 if (atr <= 0 || double.IsNaN(atr))
-                    atr = tick.Bid * 0.001;
+                    atr = candle.Close * 0.001;
 
                 var symInfo = _executor.GetSymbolInfo(symbol)
                     ?? new SymbolInfo(symbol, 0.00001, 100000, 1, 0.00001, "USD", "USD", 5);
 
-                var sizing = _portfolioManager.CalculatePositionSize(
-                    symbol, entryType.Value, riskLevel.Value,
-                    _executor.GetEquity(), tick.Bid, atr, symInfo);
+                // Get TP/SL multipliers from model output
+                var (tpMult, slMult) = _lastTpSlMultipliers.GetValueOrDefault(symbol, (0.5f, 0.5f));
 
-                var result = await _executor.ExecuteAsync(symbol, entryType.Value, sizing.Volume,
-                    sizing.StopLoss, sizing.TakeProfit, "RL Portfolio Agent", riskLevel.Value);
+                // Scale multipliers to ATR ranges:
+                // TP: 1.0 - 5.0 ATR (tpMult is 0-1 from sigmoid)
+                // SL: 0.5 - 3.0 ATR (slMult is 0-1 from sigmoid)
+                double tpAtrMult = 1.0 + tpMult * 4.0;  // 1.0 to 5.0
+                double slAtrMult = 0.5 + slMult * 2.5;  // 0.5 to 3.0
+
+                double slDistance = atr * slAtrMult;
+                double tpDistance = atr * tpAtrMult;
+                
+                // Use Bid/Ask from executor (which uses Close +/- spread now)
+                double bid = _executor.GetBid(symbol);
+                double ask = _executor.GetAsk(symbol);
+
+                double sl = entryType.Value == TradeType.Buy
+                    ? bid - slDistance
+                    : ask + slDistance;
+
+                double tp = entryType.Value == TradeType.Buy
+                    ? bid + tpDistance
+                    : ask - tpDistance;
+
+                // Calculate position size based on risk
+                double riskAmount = _executor.GetEquity() * 0.01; // 1% risk per trade
+                double slPoints = slDistance / symInfo.Point;
+                double tickValue = symInfo.TickValue;
+                // Avoid DBZ
+                double volume = tickValue > 0 && slPoints > 0
+                    ? riskAmount / (tickValue * slPoints)
+                    : 0.01;
+                volume = Math.Max(0.01, Math.Min(volume, 100.0));
+                volume = Math.Round(volume, 2);
+
+                var result = await _executor.ExecuteAsync(symbol, entryType.Value, volume,
+                    sl, tp, "RL Portfolio Agent", RiskLevel.Moderate);
 
                 if (result.Success)
                 {
                     _positionOpenTicks[symbol] = _currentTick;
                     _peakUnrealizedPnls[symbol] = 0;
-
-                    // Update action memory
                     _lastExecutedAction[symbol] = action;
                     _lastExecutedTick[symbol] = _currentTick;
                 }
             }
         }
-        // If has_position and trying to BUY/SELL, do nothing (matches Python)
 
-        // Recalculate position state for reward
         pos = _executor.GetPosition(symbol);
         double unrealized = pos?.UnrealizedPnlPercent / 100.0 ?? 0;
-        
+
         if (unrealized > _peakUnrealizedPnls.GetValueOrDefault(symbol))
             _peakUnrealizedPnls[symbol] = unrealized;
 
@@ -284,6 +363,19 @@ public class PortfolioTradingEnvironment
             _initialBalance, maxDrawdownPct);
 
         return (reward, tradeClosed);
+    }
+
+    public void SetTpSlMultipliers(string symbol, float tpMult, float slMult)
+    {
+        _lastTpSlMultipliers[symbol] = (tpMult, slMult);
+    }
+
+    public void SetTpSlMultipliersBatch(float[,] tpSlMultipliers)
+    {
+        for (int i = 0; i < _config.Symbols.Length && i < tpSlMultipliers.GetLength(0); i++)
+        {
+            _lastTpSlMultipliers[_config.Symbols[i]] = (tpSlMultipliers[i, 0], tpSlMultipliers[i, 1]);
+        }
     }
 
     private double CalculateAtr(string symbol)
@@ -373,23 +465,25 @@ public class PortfolioTradingEnvironment
         // Fallback: copy M1 to missing timeframes if not enough data yet
         mtfBuilder.CopyM1ToMissingTimeframes();
 
-        // Get position info
         var pos = _executor.GetPosition(symbol);
         bool hasPosition = pos != null;
 
-        // Build portfolio features [4D] - EXACTLY matching Python's _get_portfolio_features()
-        // Python: portfolio[0] = position_type (1.0 for BUY, -1.0 for SELL, 0.0 for no position)
-        // Python: portfolio[1] = unrealized_pnl * 100 (percent)
-        // Python: portfolio[2] = min(1.0, holding_ticks / max_holding_ticks) (normalized)
-        // Python: portfolio[3] = drawdown * 100 (percent)
-        var portfolioFeatures = new float[4];
+        // Build portfolio features [5D] - includes balance
+        // [0] = position_type (1.0 for BUY, -1.0 for SELL, 0.0 for no position)
+        // [1] = unrealized_pnl * 100 (percent)
+        // [2] = min(1.0, holding_ticks / max_holding_ticks) (normalized)
+        // [3] = drawdown * 100 (percent)
+        // [4] = normalized balance (current_balance / initial_balance - 1.0)
+        var portfolioFeatures = new float[5];
+
+        // Normalized balance: (current / initial) - 1.0, so 0 = break-even, positive = profit, negative = loss
+        double currentBalance = _executor.GetBalance();
+        portfolioFeatures[4] = (float)((currentBalance / _initialBalance) - 1.0);
+
         if (hasPosition)
         {
-            // Python: position_type = 1 if pos.position_type == PositionType.BUY else -1
             portfolioFeatures[0] = pos!.Type == TradeType.Buy ? 1.0f : -1.0f;
 
-            // Python: unrealized_pnl = (current_price - open_price) / open_price
-            // Then multiplied by -1 if SELL, then * 100
             double unrealizedPnl = (pos.CurrentPrice - pos.OpenPrice) / pos.OpenPrice;
             if (pos.Type == TradeType.Sell) unrealizedPnl *= -1;
             portfolioFeatures[1] = (float)(unrealizedPnl * 100.0);
@@ -397,28 +491,21 @@ public class PortfolioTradingEnvironment
             int heldTicks = _currentTick - _positionOpenTicks.GetValueOrDefault(symbol);
             portfolioFeatures[2] = (float)Math.Min(1.0, heldTicks / (double)_config.MaxHoldingSteps);
 
-            // Update peak and calculate drawdown
             if (unrealizedPnl > _peakUnrealizedPnls.GetValueOrDefault(symbol))
                 _peakUnrealizedPnls[symbol] = unrealizedPnl;
             double drawdown = Math.Max(0.0, _peakUnrealizedPnls.GetValueOrDefault(symbol) - unrealizedPnl);
             portfolioFeatures[3] = (float)(drawdown * 100.0);
         }
-        // else: all zeros (no position) - matches Python behavior
 
-        // Build risk state [9D] - EXACTLY matching Python's _build_state()
-        // Python only fills: [0]=in_position, [1]=direction, [6]=profit/100, [8]=risk_level
         var riskState = new float[9];
         if (hasPosition)
         {
-            riskState[0] = 1.0f; // in position
-            riskState[1] = pos!.Type == TradeType.Buy ? 1.0f : -1.0f; // direction
-            // riskState[2-5] = 0 (Python doesn't fill these)
-            riskState[6] = (float)(pos.Profit / 100.0); // profit / 100 (Python: pos.profit / 100.0)
-            // riskState[7] = 0 (Python doesn't fill this)
-            riskState[8] = 1.0f; // risk_level.MODERATE = 1
+            riskState[0] = 1.0f;
+            riskState[1] = pos!.Type == TradeType.Buy ? 1.0f : -1.0f;
+            riskState[6] = (float)(pos.Profit / 100.0);
+            riskState[8] = 1.0f;
         }
 
-        // Get timeframes that just closed (for trigger context)
         var closedTfs = _lastClosedTimeframes.GetValueOrDefault(symbol) ?? new List<string>();
 
         return mtfBuilder.BuildAgentInput(
@@ -426,16 +513,24 @@ public class PortfolioTradingEnvironment
             portfolioFeatures: portfolioFeatures,
             riskState: riskState,
             closedTimeframes: closedTfs,
-            newsFeatures: null,     // Not implemented yet
-            correlationFeatures: null, // Not implemented yet
-            portfolioExposure: null    // Not implemented yet
+            newsFeatures: null,
+            correlationFeatures: null,
+            portfolioExposure: null
         );
     }
 
     public Task<float[]> ResetAsync()
     {
-        _currentTick = _config.WindowSize * 100;
+        // Reset executor to enable fresh episode data
+        _executor.Reset();
+        
+        // Reset reward calculator episode metrics for proper PF/Sharpe tracking
+        _rewardCalculator.ResetEpisode();
+        
+        // No warmup skip needed - candles are preloaded from QuestDB materialized views
+        _currentTick = 0;
         _isDone = false;
+        _initialBalance = _executor.GetBalance();
         _peakEquity = _initialBalance;
         _lastM1Minute = -1;
 
@@ -447,11 +542,57 @@ public class PortfolioTradingEnvironment
             _mtfAggregators[symbol].Reset();
             _lastClosedTimeframes[symbol].Clear();
             _lastActionBySymbol[symbol] = 0;
+            _lastTpSlMultipliers[symbol] = (0.5f, 0.5f);
             _lastExecutedAction.Remove(symbol);
             _lastExecutedTick.Remove(symbol);
         }
 
         return Task.FromResult(new float[StateSize]);
+    }
+
+    /// <summary>
+    /// Preload historical candles from QuestDB materialized views for all symbols.
+    /// This eliminates the need for warmup by loading pre-built candles.
+    /// Call this after ResetAsync if historical candles are available.
+    /// </summary>
+    /// <param name="dbLoader">QuestDB data loader</param>
+    /// <param name="episodeStartTime">The timestamp when the episode starts (loads candles before this)</param>
+    /// <param name="candleCount">Number of historical candles to load per timeframe (default: WindowSize + 50)</param>
+    public async Task PreloadHistoricalCandlesAsync(
+        Data.QuestDbDataLoader dbLoader, 
+        DateTime episodeStartTime,
+        int? candleCount = null)
+    {
+        int count = candleCount ?? _config.WindowSize + 50;
+        
+        // Map internal timeframe keys to QuestDB materialized view names
+        var timeframeMap = new Dictionary<string, string>
+        {
+            ["M1"] = "m1",
+            ["M5"] = "m5",
+            ["M15"] = "m15",
+            ["H1"] = "h1",
+            ["H4"] = "h4"
+        };
+
+        foreach (var symbol in _config.Symbols)
+        {
+            var aggregator = _mtfAggregators[symbol];
+            
+            foreach (var (internalTf, questdbTf) in timeframeMap)
+            {
+                var candles = await dbLoader.LoadHistoricalCandlesAsync(
+                    symbol, questdbTf, episodeStartTime, count);
+                
+                if (candles.Count > 0)
+                {
+                    aggregator.PreloadCandles(internalTf, candles);
+                }
+            }
+        }
+        
+        // Reset tick counter since we have pre-built candle history
+        _currentTick = 0;
     }
 
     /// <summary>

@@ -107,22 +107,17 @@ public class TradingEnvironment
     {
         if (_isDone) return (new float[StateSize], 0, true);
 
-        // Decode Action
-        bool isClose = ActionDecoder.IsClose(action);
-        var (entryType, riskLevel) = ActionDecoder.Decode(action);
+        var entryType = ActionDecoder.Decode(action);
 
         bool tradeClosed = false;
         double tradeProfit = 0;
         int holdingTicks = 0;
 
-        // Current State Info (Before Action)
         var pos = _executor.GetPosition(_config.Symbol);
         bool hasPosition = pos != null;
 
-        // Execute Action - MATCHING PYTHON BEHAVIOR:
-        // - BUY/SELL only work when NOT has_position (no flipping allowed)
-        // - CLOSE only works when has_position
-        if (isClose && hasPosition)
+        // Close position if opposite direction requested
+        if (hasPosition && entryType.HasValue && pos!.Type != entryType.Value)
         {
             var result = await _executor.ClosePositionAsync(_config.Symbol);
             if (result.Success)
@@ -131,13 +126,14 @@ public class TradingEnvironment
                 tradeProfit = result.Profit;
                 holdingTicks = _currentTick - _positionOpenTick;
                 _positionOpenTick = 0;
+                hasPosition = false;
             }
         }
-        else if (entryType.HasValue && riskLevel.HasValue && !hasPosition)
+
+        if (entryType.HasValue && !hasPosition)
         {
-            // Python: BUY/SELL only execute when NOT has_position
-            var tick = _executor.GetLastKnownTick(_config.Symbol);
-            if (tick != null)
+            var candle = _executor.GetLastKnownCandle(_config.Symbol);
+            if (candle != null)
             {
                 var history = _candleBuilder.GetRecent(50);
                 double atr = 0;
@@ -153,35 +149,52 @@ public class TradingEnvironment
                 }
 
                 if (atr <= 0 || double.IsNaN(atr))
-                    atr = tick.Bid * 0.001;
+                    atr = candle.Close * 0.001;
 
                 var symInfo = _executor.GetSymbolInfo(_config.Symbol)
                     ?? new SymbolInfo(_config.Symbol, 0.00001, 100000, 1, 0.00001, "USD", "USD", 5);
 
-                var sizing = _portfolioManager.CalculatePositionSize(
-                    _config.Symbol, entryType.Value, riskLevel.Value,
-                    _executor.GetEquity(), tick.Bid, atr, symInfo);
+                // Use Close (or calc bid/ask from close)
+                var bid = _executor.GetBid(_config.Symbol);
 
-                await _executor.ExecuteAsync(_config.Symbol, entryType.Value, sizing.Volume, sizing.StopLoss, sizing.TakeProfit, "RL Agent", riskLevel.Value);
+                var sizing = _portfolioManager.CalculatePositionSize(
+                    _config.Symbol, entryType.Value, RiskLevel.Moderate,
+                    _executor.GetEquity(), bid, atr, symInfo);
+
+                await _executor.ExecuteAsync(_config.Symbol, entryType.Value, sizing.Volume, sizing.StopLoss, sizing.TakeProfit, "RL Agent", RiskLevel.Moderate);
                 _positionOpenTick = _currentTick;
                 _peakUnrealizedPnl = 0;
             }
         }
-        // If has_position and trying to BUY/SELL, do nothing (matches Python)
 
         // Advance Simulation
         bool moreData = await _executor.AdvanceAsync();
         _currentTick++;
-        
+
+        // Process automatic TP/SL closes that happened during AdvanceAsync
+        // CRITICAL: This gives the agent reward signals for profitable closes!
+        var pendingCloses = _executor.GetAndClearPendingCloses();
+        foreach (var closeInfo in pendingCloses)
+        {
+            if (closeInfo.Symbol == _config.Symbol)
+            {
+                tradeClosed = true;
+                tradeProfit = closeInfo.Profit;
+                holdingTicks = closeInfo.HoldingTicks;
+                _positionOpenTick = 0;
+                _peakUnrealizedPnl = 0;
+            }
+        }
+
         // PnL/State for Reward
         pos = _executor.GetPosition(_config.Symbol); // Re-fetch
         double unrealized = pos?.UnrealizedPnlPercent / 100.0 ?? 0;
         if (unrealized > _peakUnrealizedPnl) _peakUnrealizedPnl = unrealized;
-        
+
         // Track Equity & Drawdown
         double currentEquity = _executor.GetEquity();
         if (currentEquity > _peakEquity) _peakEquity = currentEquity;
-        
+
         double maxDrawdownPct = 0;
         if (_peakEquity > 0)
             maxDrawdownPct = (_peakEquity - currentEquity) / _peakEquity;
@@ -200,8 +213,8 @@ public class TradingEnvironment
 
         // Calculate Reward
         float reward = _rewardCalculator.Calculate(
-            tradeClosed, tradeProfit, holdingTicks, 
-            pos != null, unrealized, _peakUnrealizedPnl, 
+            tradeClosed, tradeProfit, holdingTicks,
+            pos != null, unrealized, _peakUnrealizedPnl,
             _initialBalance, maxDrawdownPct);
 
         // Check Termination
@@ -212,11 +225,20 @@ public class TradingEnvironment
         _isDone = done;
 
         // Build Next State
-        // Feed current tick to CandleBuilder
-        var currentTick = _executor.GetLastKnownTick(_config.Symbol);
-        if (currentTick != null) 
+        // Feed current candle to CandleBuilder?
+        // Wait, _candleBuilder builds from Ticks. 
+        // If we have Candles natively, we might NOT need _candleBuilder tick aggregation!
+        // We can just feed the candle directly if we update CandleBuilder to generic,
+        // OR just use the candle list directly for StateBuilder.
+        // Assuming CandleBuilder aggregates ticks to M1. If we are inputting S1 candles, 
+        // we might still want to aggregate them to M1.
+        // Let's check CandleBuilder. It probably takes AddTick.
+        var currentCandle = _executor.GetLastKnownCandle(_config.Symbol);
+        // We can synthesize a tick from candle close for compatibility or update CandleBuilder 
+        if (currentCandle != null) 
         {
-            _candleBuilder.AddTick(currentTick);
+             // Hack: AddTick using Candle data to keep logic simple for now
+             _candleBuilder.AddTick(new Tick(currentCandle.Time, currentCandle.Close, currentCandle.Close, 1, false, currentCandle.Volume));
         }
 
         var candles = _candleBuilder.GetRecent(_config.WindowSize);
@@ -236,8 +258,8 @@ public class TradingEnvironment
     
     public Task<float[]> ResetAsync()
     {
-        // Reset Logic
-        _currentTick = _config.WindowSize * 100; // Skip warmup
+        // Reset Logic - no warmup skip needed since candles are preloaded from materialized views
+        _currentTick = 0;
         _isDone = false;
         return Task.FromResult(new float[StateSize]);
     }

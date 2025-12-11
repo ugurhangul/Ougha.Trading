@@ -8,7 +8,8 @@ public record PortfolioEnvironmentConfig(
     int WindowSize = 20,
     int MaxSteps = 50000,
     int MaxHoldingSteps = 1000,
-    double MaxLossPercent = 50.0)
+    double MaxLossPercent = 50.0,
+    int ActionMemoryWindow = 1050)
 {
     /// <summary>
     /// Creates a portfolio config from a comma-separated symbol string.

@@ -6,13 +6,13 @@ namespace Ougha.Trading.Data.Streamers;
 
 public class QuestDBTickStreamer
 {
-    private readonly QuestDBDataLoader _dataLoader;
+    private readonly QuestDbDataLoader _dataLoader;
     private readonly int _batchSize;
     private readonly int _chunkDays;
     private readonly int _prefetchChunks;
 
     public QuestDBTickStreamer(
-        QuestDBDataLoader dataLoader,
+        QuestDbDataLoader dataLoader,
         int batchSize = 100000,
         int chunkDays = 7,
         int prefetchChunks = 4)
@@ -178,7 +178,7 @@ internal readonly record struct SymbolTickEntry(string Symbol, Tick Tick);
 internal sealed class SymbolTickBuffer : IDisposable
 {
     private readonly string _symbol;
-    private readonly QuestDBDataLoader _dataLoader;
+    private readonly QuestDbDataLoader _dataLoader;
     private readonly DateTime _endDate;
     private readonly int _chunkDays;
     private readonly Channel<List<Tick>> _channel;
@@ -188,7 +188,7 @@ internal sealed class SymbolTickBuffer : IDisposable
     private int _currentIndex;
     private bool _disposed;
 
-    public SymbolTickBuffer(string symbol, QuestDBDataLoader dataLoader, DateTime startDate, DateTime endDate, int chunkDays, int prefetchChunks)
+    public SymbolTickBuffer(string symbol, QuestDbDataLoader dataLoader, DateTime startDate, DateTime endDate, int chunkDays, int prefetchChunks)
     {
         _symbol = symbol;
         _dataLoader = dataLoader;
@@ -286,7 +286,7 @@ public class QuestDBTickTimeline
     private int _currentIndex;
 
     public QuestDBTickTimeline(
-        QuestDBDataLoader dataLoader,
+        QuestDbDataLoader dataLoader,
         IEnumerable<string> symbols,
         DateTime startDate,
         DateTime endDate)

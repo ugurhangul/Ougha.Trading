@@ -6,4 +6,7 @@ public record Candle(
     double High,
     double Low,
     double Close,
-    double Volume);
+    long Volume)
+{
+    public Candle() : this(default, default, default, default, default, default) { }
+}

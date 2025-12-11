@@ -115,9 +115,9 @@ public class MultiTimeframeStateBuilder
 
     /// <summary>
     /// Get the current timeframe feature buffers.
+    /// Returns Direct reference for performance - avoid modification.
     /// </summary>
-    public Dictionary<string, float[,]> GetTimeframeFeatures() =>
-        new(_featureBuffers);
+    public Dictionary<string, float[,]> GetTimeframeFeatures() => _featureBuffers;
 
     /// <summary>
     /// Check if we have sufficient data for all required timeframes.

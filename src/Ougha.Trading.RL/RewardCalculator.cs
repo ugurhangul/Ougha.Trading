@@ -2,22 +2,26 @@ namespace Ougha.Trading.RL;
 
 public class RewardConfig
 {
-    // Values from Python code
-    public float RealizedProfitScale { get; set; } = 100f;
-    public float UnrealizedPnlScale { get; set; } = 10f;
+    // Dense reward shaping - balanced for continuous feedback
+    public float RealizedProfitScale { get; set; } = 200f;      // Doubled - primary learning signal
+    public float UnrealizedPnlScale { get; set; } = 50f;        // 5x increase - earlier feedback
     public float EquityChangeScale { get; set; } = 100f;
-    public float HoldingTimePenalty { get; set; } = 0.0001f;
+    public float HoldingTimePenalty { get; set; } = 0.0001f;    // 10x increase - gentle holding cost
     public int MaxHoldingTicks { get; set; } = 1000;
-    public float DrawdownPenalty { get; set; } = 0.01f;
-    public float DrawdownThreshold { get; set; } = 0.005f;
-    public float FlatPenalty { get; set; } = 0.0001f;
-    public float WinBonus { get; set; } = 50f;
-    public float LossPenalty { get; set; } = 25f;
-    public float QuickProfitBonus { get; set; } = 30f;
+    public float DrawdownPenalty { get; set; } = 0.005f;        // Increased - punish drawdown more
+    public float DrawdownThreshold { get; set; } = 0.01f;
+    public float FlatPenalty { get; set; } = 0f;                // REMOVED - was causing HOLD bias
+    public float WinBonus { get; set; } = 10f;                  // Reduced - less sparse bonus
+    public float LossPenalty { get; set; } = 5f;                // Reduced - allow recovery learning
+    public float QuickProfitBonus { get; set; } = 20f;
     public int QuickProfitTicks { get; set; } = 200;
     
     public int MinHoldingTicks { get; set; } = 50;
-    public float EarlyClosePenalty { get; set; } = 100f;
+    public float EarlyClosePenalty { get; set; } = 10f;         // Reduced - less punishing
+    
+    // Dense position quality reward (NEW)
+    public float PositionQualityScale { get; set; } = 20f;      // Continuous position feedback
+    public float EquityMomentumScale { get; set; } = 30f;       // Reward equity growth momentum
     
     // PF/Sharpe reward shaping (from Python)
     public float ProfitFactorWeight { get; set; } = 50f;
@@ -33,6 +37,10 @@ public class RewardConfig
     public float MddPenaltyWeight { get; set; } = 50f;
     public float MddThreshold { get; set; } = 10f;
     public float MddPenaltyScale { get; set; } = 2f;
+    
+    // Reward normalization - widened range for better gradients
+    public float RewardNormalizationScale { get; set; } = 50f;  // Halved for larger gradients
+    public bool NormalizeRewards { get; set; } = true;
 }
 
 /// <summary>
@@ -168,6 +176,10 @@ public class RewardCalculator
         return (float)(excessMdd * _config.MddPenaltyWeight / 100.0 * _config.MddPenaltyScale);
     }
 
+    // Track previous unrealized PnL for momentum calculation
+    private double _previousUnrealizedPnl = 0;
+    private double _previousEquity = 0;
+    
     public float Calculate(
         bool tradeClosed,
         double tradeProfit,
@@ -176,7 +188,10 @@ public class RewardCalculator
         double unrealizedPnl,
         double peakUnrealizedPnl,
         double initialBalance,
-        double maxDrawdownPct)
+        double maxDrawdownPct,
+        double currentEquity = 0,        // NEW: for equity momentum
+        int positionDirection = 0,       // NEW: 1=long, -1=short, 0=flat
+        double priceChange = 0)          // NEW: price change since last step
     {
         float reward = 0f;
 
@@ -222,17 +237,36 @@ public class RewardCalculator
              reward += CalculatePfSharpeReward();
              
              reward -= mddPenalty;
-             return reward;
+             // NOTE: Don't return here - fall through to normalization!
         }
-
-        if (hasPosition)
+        else if (hasPosition)
         {
+            // Gentle holding cost
             reward -= _config.HoldingTimePenalty;
             
-            // Unrealized PnL reward (scaled down)
-            if (unrealizedPnl > 0)
+            // Dense unrealized PnL reward (both positive and negative feedback)
+            float unrealizedReward = (float)(unrealizedPnl / initialBalance) * 100f * _config.UnrealizedPnlScale;
+            reward += unrealizedReward * 0.01f; // Scale normalized
+            
+            // NEW: Position quality - reward alignment with price movement
+            if (positionDirection != 0 && priceChange != 0)
             {
-                reward += (float)unrealizedPnl * _config.UnrealizedPnlScale * 0.1f;
+                float directionReward = (float)(priceChange * positionDirection) * _config.PositionQualityScale;
+                reward += directionReward;
+            }
+            
+            // NEW: Equity momentum - reward growing equity
+            if (currentEquity > 0 && _previousEquity > 0)
+            {
+                double equityChange = (currentEquity - _previousEquity) / initialBalance * 100;
+                reward += (float)equityChange * _config.EquityMomentumScale;
+            }
+            
+            // Unrealized PnL momentum (delta from previous step)
+            double pnlDelta = unrealizedPnl - _previousUnrealizedPnl;
+            if (pnlDelta > 0)
+            {
+                reward += (float)(pnlDelta / initialBalance) * 50f; // Positive momentum bonus
             }
 
             // Drawdown from peak unrealized
@@ -241,13 +275,29 @@ public class RewardCalculator
             {
                 reward -= _config.DrawdownPenalty;
             }
+            
+            reward -= mddPenalty;
+            
+            // Update tracking for next step
+            _previousUnrealizedPnl = unrealizedPnl;
+            _previousEquity = currentEquity > 0 ? currentEquity : _previousEquity;
         }
         else
         {
-            reward -= _config.FlatPenalty;
+            // NO flat penalty - removed to prevent HOLD bias
+            // Only apply MDD penalty when flat
+            reward -= mddPenalty * 0.5f; // Reduced when not in position
+            
+            // Reset tracking
+            _previousUnrealizedPnl = 0;
         }
 
-        reward -= mddPenalty;
+        // Normalize reward to [-1, 1] for stable DQN training
+        // CRITICAL: This must apply to ALL rewards including trade closes!
+        if (_config.NormalizeRewards)
+        {
+            reward = Math.Clamp(reward / _config.RewardNormalizationScale, -1f, 1f);
+        }
 
         return reward;
     }

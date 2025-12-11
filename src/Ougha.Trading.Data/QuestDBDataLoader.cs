@@ -4,13 +4,13 @@ using Ougha.Trading.Core.Models;
 
 namespace Ougha.Trading.Data;
 
-public class QuestDBDataLoader
+public class QuestDbDataLoader
 {
     private readonly string _connectionString;
 
-    public QuestDBDataLoader(string host = "localhost", int port = 8812, string username = "admin", string password = "quest", string database = "qdb")
+    public QuestDbDataLoader(string host = "localhost", int port = 8812, string username = "admin", string password = "quest", string database = "qdb")
     {
-        _connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};ServerCompatibilityMode=NoTypeLoading;CommandTimeout=300;";
+        _connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};ServerCompatibilityMode=NoTypeLoading;CommandTimeout=3600;Timeout=120;Pooling=true;MaxPoolSize=100;";
         DefaultTypeMap.MatchNamesWithUnderscores = true;
     }
 
@@ -76,23 +76,27 @@ public class QuestDBDataLoader
 
         return await conn.QueryAsync<Tick>(sql, new { symbol, start = startParam, end = endParam });
     }
+    
 
-    public async Task<List<Candle>> LoadCandlesAsync(
-        string symbol, string timeframe, DateTime startDate, DateTime endDate, int parallelism = 4)
+    public async Task<IEnumerable<Candle>> LoadCandlesAsync(string symbol, string timeframe, DateTime startDate, DateTime endDate)
     {
-        var chunks = CreateTimeChunks(startDate, endDate, parallelism);
-        var tasks = new List<Task<IEnumerable<Candle>>>();
+        var table = timeframe.ToLower();
 
-        foreach (var (chunkStart, chunkEnd) in chunks)
-        {
-            tasks.Add(LoadCandlesChunkAsync(symbol, timeframe, chunkStart, chunkEnd));
-        }
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
 
-        await Task.WhenAll(tasks);
+        var sql = $@"
+            SELECT timestamp as Time, open, high, low, close, volume
+            FROM {table}
+            WHERE symbol = @symbol and timestamp Between @start and @end";
 
-        return tasks.SelectMany(t => t.Result).OrderBy(c => c.Time).ToList();
+        var startParam = NormalizeDateTime(startDate);
+        var endParam = NormalizeDateTime(endDate);
+
+        return await conn.QueryAsync<Candle>(sql, new { symbol, start = startParam, end = endParam });
     }
-
+    
+    
     private async Task<IEnumerable<Candle>> LoadCandlesChunkAsync(string symbol, string timeframe, DateTime startDate, DateTime endDate)
     {
         var table = timeframe.ToLower();
@@ -281,6 +285,85 @@ public class QuestDBDataLoader
               AND (has_no_data IS NULL OR has_no_data = false)";
 
         var result = await conn.QuerySingleAsync<(DateTime?, DateTime?)>(sql, new { symbol });
+        return result;
+    }
+
+    /// <summary>
+    /// Load the N most recent candles BEFORE a given timestamp.
+    /// Used for preloading historical context from materialized views.
+    /// </summary>
+    public async Task<List<Candle>> LoadHistoricalCandlesAsync(
+        string symbol, string timeframe, DateTime beforeTimestamp, int count)
+    {
+        var table = timeframe.ToLower();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+
+        var sql = $@"
+            SELECT timestamp as Time, open, high, low, close, volume
+            FROM {table}
+            WHERE symbol = @symbol
+              AND timestamp < @before
+            ORDER BY timestamp DESC
+            LIMIT @count";
+
+        var beforeParam = NormalizeDateTime(beforeTimestamp);
+
+        var candles = await conn.QueryAsync<Candle>(sql, new { symbol, before = beforeParam, count });
+        
+        // Reverse to get chronological order (oldest first)
+        return candles.Reverse().ToList();
+    }
+
+    /// <summary>
+    /// Stream candles from a materialized view (s1, m1, etc.) for a single symbol.
+    /// </summary>
+    public async IAsyncEnumerable<Candle> StreamCandlesAsync(
+        string symbol, string timeframe, DateTime startDate, DateTime endDate)
+    {
+        var table = timeframe.ToLower();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+
+        var sql = $@"
+            SELECT timestamp as Time, open, high, low, close, volume
+            FROM {table}
+            WHERE symbol = @symbol
+              AND timestamp >= @start
+              AND timestamp < @end
+            ORDER BY timestamp";
+
+        var startParam = NormalizeDateTime(startDate);
+        var endParam = NormalizeDateTime(endDate);
+
+        await foreach (var candle in conn.QueryUnbufferedAsync<Candle>(sql, new { symbol, start = startParam, end = endParam }))
+        {
+            yield return candle;
+        }
+    }
+
+    /// <summary>
+    /// Count total candles for a symbol in a date range from a materialized view.
+    /// </summary>
+    public async Task<long> CountCandlesAsync(string symbol, string timeframe, DateTime start, DateTime end)
+    {
+        var table = timeframe.ToLower();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+
+        var sql = $@"
+            SELECT COUNT(*) FROM {table} 
+            WHERE symbol = @symbol 
+              AND timestamp >= @start 
+              AND timestamp < @end";
+
+        var startParam = NormalizeDateTime(start);
+        var endParam = NormalizeDateTime(end);
+
+        var result = await conn.ExecuteScalarAsync<long>(sql, new { symbol, start = startParam, end = endParam });
         return result;
     }
 

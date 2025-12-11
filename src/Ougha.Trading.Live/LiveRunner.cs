@@ -108,20 +108,15 @@ public class LiveRunner
                      drawdown
                  );
                  
-                 // 3. Query Agent
                  int action = agentPolicy(state);
-                 
-                 // 4. Execute Action
-                 var (entryType, riskLevel) = ActionDecoder.Decode(action);
-                 bool isClose = ActionDecoder.IsClose(action);
-                 
-                 if (isClose && position != null)
+
+                 var entryType = ActionDecoder.Decode(action);
+
+                 if (ActionDecoder.IsHold(action))
                  {
-                     await _executor.ClosePositionAsync(_config.Symbol);
-                     _localState.Remove(_config.Symbol);
-                     position = null;
+                     // Do nothing
                  }
-                 else if (entryType.HasValue && riskLevel.HasValue)
+                 else if (entryType.HasValue)
                  {
                       if (position != null && position.Type != entryType.Value)
                       {
@@ -129,12 +124,11 @@ public class LiveRunner
                            _localState.Remove(_config.Symbol);
                            position = null;
                       }
-                      
-                      // TRAILING STOP CHECK
-                      if (position != null) 
+
+                      if (position != null)
                       {
                            double currentPrice = candles.Last().Close;
-                           var symInfo = _executor.GetSymbolInfo(_config.Symbol); 
+                           var symInfo = _executor.GetSymbolInfo(_config.Symbol);
                            if (symInfo != null)
                            {
                                double? newSl = _portfolioManager.CalculateTrailingStop(position, currentPrice, symInfo);
@@ -146,35 +140,32 @@ public class LiveRunner
                                }
                            }
                       }
-                      
+
                       if (position == null)
                       {
-                          // Check Global Risk Limits
                           var currentPositions = _executor.GetPositions().ToList();
                           var (canOpen, reason) = _portfolioManager.CanOpenDirection(
                               _config.Symbol, entryType.Value, currentPositions);
-                          
+
                           if (!canOpen)
                           {
                               Console.WriteLine($"Cannot open position: {reason}");
                           }
-                          else 
+                          else
                           {
-                              // Calculate Volume
                               double currentPrice = candles.Last().Close;
-                              double atr = 0; // TODO: Calculate ATR from candles
-                              var symInfo = _executor.GetSymbolInfo(_config.Symbol) 
+                              double atr = currentPrice * 0.001;
+                              var symInfo = _executor.GetSymbolInfo(_config.Symbol)
                                             ?? new SymbolInfo(_config.Symbol, 0.00001, 100000, 1, 0.00001, "USD", "USD", 5);
 
                               var sizing = _portfolioManager.CalculatePositionSize(
-                                  _config.Symbol, entryType.Value, riskLevel.Value, 
+                                  _config.Symbol, entryType.Value, RiskLevel.Moderate,
                                   _executor.GetEquity(), currentPrice, atr, symInfo);
-                              
-                              // Validate trade risk
+
                               var (isValid, validateReason, adjustedLot) = _portfolioManager.ValidateTradeRisk(
                                   _config.Symbol, sizing.Volume, currentPrice, sizing.StopLoss,
                                   _executor.GetEquity(), symInfo);
-                              
+
                               if (!isValid)
                               {
                                   Console.WriteLine($"Trade risk validation failed: {validateReason}");
@@ -183,9 +174,9 @@ public class LiveRunner
                               {
                                   if (!string.IsNullOrEmpty(validateReason))
                                       Console.WriteLine($"Risk adjusted: {validateReason}");
-                                  
-                                  await _executor.ExecuteAsync(_config.Symbol, entryType.Value, adjustedLot, 
-                                      sizing.StopLoss, sizing.TakeProfit, "RL Agent", riskLevel.Value);
+
+                                  await _executor.ExecuteAsync(_config.Symbol, entryType.Value, adjustedLot,
+                                      sizing.StopLoss, sizing.TakeProfit, "RL Agent", RiskLevel.Moderate);
                               }
                           }
                       }
