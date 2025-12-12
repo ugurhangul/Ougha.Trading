@@ -17,7 +17,7 @@ public static class TrainingBudgetCalculator
     /// <summary>
     /// Detect available hardware (CPU, RAM, GPU).
     /// </summary>
-    public static HardwareInfo DetectHardware()
+    private static HardwareInfo DetectHardware()
     {
         var cpuCores = Environment.ProcessorCount;
         var ramGb = GetTotalRamGb();
@@ -113,34 +113,28 @@ public static class TrainingBudgetCalculator
     #region Budget Calculation
     
     /// <summary>
-    /// Calculate complete training budget with all parameters.
+    /// Calculate the complete training budget with all parameters.
     /// </summary>
     public static TrainingBudget CalculateTrainingBudget(
         DateTime startDate,
         DateTime endDate,
         int numSymbols,
         int? episodes = null,
-        int? maxSteps = null,
         int? tickSkipMin = null,
         int? tickSkipMax = null,
         int? batchSize = null,
         int? envsPerSymbol = null,
-        int? workers = null,
-        int? lstmUnits = null,
-        int? attentionHeads = null,
-        int[]? hiddenLayers = null,
         double? learningRate = null,
         double targetDaysPerEpisode = 5.0,
         double? gpuMemoryGbOverride = null,
         int? cpuCoresOverride = null,
         double? maxTrainingHours = null,
         int minEpisodes = 500,
-        int maxEpisodes = 10000,
         int? ticksPerDay = null,
         int? chunkDays = null,
         int? chunkPrefetchCount = null,
-        int? chunkHistoryBufferDays = null,
-        bool? useChunkedLoading = null)
+        int? chunkHistoryBufferDays = null
+        )
     {
         var hardware = DetectHardware();
         if (gpuMemoryGbOverride.HasValue)
@@ -160,9 +154,8 @@ public static class TrainingBudgetCalculator
         
         var effectiveTicksPerDay = ticksPerDay ?? DefaultTicksPerDay;
 
-        var (calcEnvs, calcWorkers) = CalculateParallelism();
+        var calcEnvs = CalculateParallelism();
         var effectiveEnvsPerSymbol = envsPerSymbol ?? calcEnvs;
-        var effectiveWorkers = workers ?? calcWorkers;
 
         var effectiveEpisodes = episodes ?? CalculateEpisodes(
             trainingDays, numSymbols);
@@ -173,14 +166,7 @@ public static class TrainingBudgetCalculator
         var tickSkipAvg = (effectiveTickSkipMin + effectiveTickSkipMax) / 2.0;
 
         var effectiveMaxSteps =CalculateMaxSteps(tickSkipAvg, targetDaysPerEpisode, effectiveTicksPerDay);
-
-        var (calcLstm, calcHeads, calcLayers) = CalculateModelArchitecture();
-        var effectiveLstmUnits = lstmUnits ?? calcLstm;
-        var effectiveAttentionHeads = attentionHeads ?? calcHeads;
-        var effectiveHiddenLayers = hiddenLayers ?? calcLayers;
-
         var effectiveBatchSize = batchSize ?? CalculateBatchSize(hardware.GpuMemoryGb);
-
         var effectiveLearningRate = learningRate ?? CalculateLearningRate(effectiveBatchSize);
 
         int trainFreq, trainBatches;
@@ -207,8 +193,6 @@ public static class TrainingBudgetCalculator
 
         var (earlyStopPatience, earlyStopMinEpisodes) = CalculateEarlyStopping(effectiveEpisodes);
 
-        var totalSamples = (long)effectiveEpisodes * effectiveMaxSteps * numSymbols * effectiveEnvsPerSymbol;
-        var samplesPerSymbol = totalSamples / numSymbols;
         var stepsPerTradingDay = effectiveTicksPerDay / tickSkipAvg;
         var daysPerEpisode = effectiveMaxSteps / stepsPerTradingDay;
         
@@ -220,46 +204,29 @@ public static class TrainingBudgetCalculator
         {
             var scaleFactor = maxTrainingHours.Value / estimatedHours;
             effectiveEpisodes = Math.Max(minEpisodes, (int)(effectiveEpisodes * scaleFactor));
-            estimatedHours = maxTrainingHours.Value;
-            totalSamples = (long)effectiveEpisodes * effectiveMaxSteps * numSymbols * effectiveEnvsPerSymbol;
-            samplesPerSymbol = totalSamples / numSymbols;
         }
         
         var effectiveChunkDays = chunkDays ?? 7;
         var effectiveChunkPrefetch = chunkPrefetchCount ?? 2;
         var effectiveChunkHistoryBuffer = chunkHistoryBufferDays ?? 1;
-        var effectiveUseChunkedLoading = useChunkedLoading ?? true;
 
         return new TrainingBudget(
             Episodes: effectiveEpisodes,
             MaxSteps: effectiveMaxSteps,
-            TickSkipMin: effectiveTickSkipMin,
-            TickSkipMax: effectiveTickSkipMax,
-            EnvsPerSymbol: effectiveEnvsPerSymbol,
-            Workers: effectiveWorkers,
             BatchSize: effectiveBatchSize,
             TrainBatches: trainBatches,
             TrainFreq: trainFreq,
             MemorySize: memorySize,
             SaveFrequency: saveFrequency,
-            LstmUnits: effectiveLstmUnits,
-            AttentionHeads: effectiveAttentionHeads,
-            HiddenLayers: effectiveHiddenLayers,
             LearningRate: effectiveLearningRate,
             EpsilonDecay: epsilonDecay,
             EarlyStopPatience: earlyStopPatience,
             EarlyStopMinEpisodes: earlyStopMinEpisodes,
-            NumSymbols: numSymbols,
-            TotalSamples: totalSamples,
-            SamplesPerSymbol: samplesPerSymbol,
-            StepsPerTradingDay: stepsPerTradingDay,
             DaysPerEpisode: daysPerEpisode,
-            EstimatedTrainingHours: estimatedHours,
             Hardware: hardware,
             ChunkDays: effectiveChunkDays,
             ChunkPrefetchCount: effectiveChunkPrefetch,
-            ChunkHistoryBufferDays: effectiveChunkHistoryBuffer,
-            UseChunkedLoading: effectiveUseChunkedLoading
+            ChunkHistoryBufferDays: effectiveChunkHistoryBuffer
         );
     }
     
@@ -313,16 +280,7 @@ public static class TrainingBudgetCalculator
             _ => gpuMemoryGb >= 6 ? 128 : 64
         };
     }
-    
-    private static (int LstmUnits, int AttentionHeads, int[] HiddenLayers) CalculateModelArchitecture()
-    {
-        const int lstmUnits = 1024;
-        const int attentionHeads = 16;
-        int[] hiddenLayers = [2048,1024,512, 256];
-        
-        return (lstmUnits, attentionHeads, hiddenLayers);
-    }
-    
+
     private static double CalculateLearningRate(int batchSize, double baseLr = 0.0003)
     {
         const int referenceBatch = 2048;
@@ -352,11 +310,10 @@ public static class TrainingBudgetCalculator
         return (patience, minEpisodes);
     }
     
-    private static (int EnvsPerSymbol, int Workers) CalculateParallelism()
+    private static int  CalculateParallelism()
     {
         var envsPerSymbol = 512;
-        var workers = 64;
-        return (envsPerSymbol, workers);
+        return envsPerSymbol;
     }
     
     private static double EstimateTrainingTime(

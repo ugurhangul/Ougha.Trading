@@ -30,107 +30,37 @@ public record DataDensityInfo(
 public record TrainingBudget(
   int Episodes,
     int MaxSteps,
-    int TickSkipMin,
-    int TickSkipMax,
-    int EnvsPerSymbol,
-    int Workers,
     int BatchSize,
     int TrainBatches,
     int TrainFreq,
     int MemorySize,
     int SaveFrequency,
-    int LstmUnits,
-    int AttentionHeads,
-    int[] HiddenLayers,
     double LearningRate,
     double EpsilonDecay,
     int EarlyStopPatience,
     int EarlyStopMinEpisodes,
-    int NumSymbols,
-    long TotalSamples,
-    long SamplesPerSymbol,
-    double StepsPerTradingDay,
     double DaysPerEpisode,
-    double EstimatedTrainingHours,
     HardwareInfo Hardware,
     int ChunkDays = 7,
     int ChunkPrefetchCount = 2,
-    int ChunkHistoryBufferDays = 1,
-    bool UseChunkedLoading = true
+    int ChunkHistoryBufferDays = 1
 )
 {
-    /// <summary>
-    /// Return formatted summary string matching Python output.
-    /// </summary>
-    public string GetSummary()
-    {
-        var gpuInfo = Hardware.GpuAvailable 
-            ? $"{Hardware.GpuName} ({Hardware.GpuMemoryGb:F0} GB)" 
-            : "Not available";
-        
-        return $"""
-════════════════════════════════════════════════════════════════════
-                    AUTO-CALCULATED TRAINING BUDGET
-════════════════════════════════════════════════════════════════════
 
-Hardware Detected:
-  GPU:              {gpuInfo}
-  CPU:              {Hardware.CpuCores} cores
-  RAM:              {Hardware.RamGb:F0} GB
-
-────────────────────────────────────────────────────────────────────
-                         CALCULATED PARAMETERS
-────────────────────────────────────────────────────────────────────
-
-Episode Budget:
-  Episodes:         {Episodes:N0}
-  Max Steps:        {MaxSteps:N0}
-  Tick Skip:        {TickSkipMin} - {TickSkipMax}
-
-Parallelism:
-  Envs/Symbol:      {EnvsPerSymbol}
-  Workers:          {Workers}
-
-Training Loop:
-  Batch Size:       {BatchSize:N0}
-  Train Batches:    {TrainBatches}
-  Train Frequency:  {TrainFreq}
-  Replay Buffer:    {MemorySize:N0}
-
-Model Architecture:
-  LSTM Units:       {LstmUnits}
-  Attention Heads:  {AttentionHeads}
-  Hidden Layers:    [{string.Join(", ", HiddenLayers)}]
-  Learning Rate:    {LearningRate:F6}
-
-Schedule:
-  Epsilon Decay:    {EpsilonDecay:F6}
-  Save Frequency:   {SaveFrequency} episodes
-  Early Stop:       patience={EarlyStopPatience}, min_episodes={EarlyStopMinEpisodes}
-
-Data Loading:
-  Chunked Loading:  {(UseChunkedLoading ? "Enabled" : "Disabled")}
-  Chunk Size:       {ChunkDays} days
-  Prefetch Chunks:  {ChunkPrefetchCount}
-  History Buffer:   {ChunkHistoryBufferDays} days
-
-────────────────────────────────────────────────────────────────────
-                           COVERAGE METRICS
-────────────────────────────────────────────────────────────────────
-
-  Total Samples:              {TotalSamples:N0}
-  Samples/Symbol:             {SamplesPerSymbol:N0}
-  Episodes/Symbol:            {(double)Episodes / NumSymbols:F1}
-  Steps/Trading Day:          {StepsPerTradingDay:F0}
-  Days/Episode:               {DaysPerEpisode:F1}
-
-────────────────────────────────────────────────────────────────────
-                            ESTIMATES
-────────────────────────────────────────────────────────────────────
-
-  Estimated Training Time:    ~{EstimatedTrainingHours:F1} hours
-
-════════════════════════════════════════════════════════════════════
-""";
-    }
+    public int Episodes { get; init; } = Episodes;
+    public int MaxSteps { get; init; } = MaxSteps;
+    public int BatchSize { get; init; } = BatchSize;
+    public int TrainBatches { get; init; } = TrainBatches;
+    public int TrainFreq { get; init; } = TrainFreq;
+    public int MemorySize { get; init; } = MemorySize;
+    public int SaveFrequency { get; init; } = SaveFrequency;
+    public double LearningRate { get; init; } = LearningRate;
+    public double EpsilonDecay { get; init; } = EpsilonDecay;
+    public int EarlyStopPatience { get; init; } = EarlyStopPatience;
+    public int EarlyStopMinEpisodes { get; init; } = EarlyStopMinEpisodes;
+    public double DaysPerEpisode { get; init; } = DaysPerEpisode;
+    public HardwareInfo Hardware { get; init; } = Hardware;
+    public int ChunkDays { get; init; } = ChunkDays;
+    public int ChunkPrefetchCount { get; init; } = ChunkPrefetchCount;
+    public int ChunkHistoryBufferDays { get; init; } = ChunkHistoryBufferDays;
 }

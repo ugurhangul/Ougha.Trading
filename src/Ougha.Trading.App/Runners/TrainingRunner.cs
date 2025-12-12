@@ -69,18 +69,12 @@ public static class TrainingRunner
             endDate: endDate,
             numSymbols: symbols.Count,
             episodes: episodes > 0 ? episodes : null,
-            maxSteps: config.GetValue<int?>("Training:MaxSteps", null),
             batchSize: config.GetValue<int?>("Training:BatchSize", null),
             learningRate: config.GetValue<double?>("Training:LearningRate", null),
             chunkDays: config.GetValue<int?>("Training:ChunkDays", null),
             chunkPrefetchCount: config.GetValue<int?>("Training:ChunkPrefetchCount", null),
-            chunkHistoryBufferDays: config.GetValue<int?>("Training:ChunkHistoryBufferDays", null),
-            useChunkedLoading: config.GetValue<bool?>("Training:UseChunkedLoading", null)
+            chunkHistoryBufferDays: config.GetValue<int?>("Training:ChunkHistoryBufferDays", null)
         );
-
-        AnsiConsole.Write(new Panel(Markup.Escape(budget.GetSummary()))
-            .Header("[bold yellow]Training Budget[/]")
-            .Border(BoxBorder.Rounded));
 
         var trainMaxSteps = budget.MaxSteps;
         var batchSize = budget.BatchSize;
@@ -582,19 +576,17 @@ public static class TrainingRunner
                 newsFeatureSize: newsFeatureSize
             );
         }
-        else
-        {
-            AnsiConsole.MarkupLine("[bold cyan]Using DQN Strategy[/]");
-            return new TorchAgent(
-                batchSize: batchSize,
-                gamma: 0.99f,
-                epsilon: 1.0f,
-                epsilonMin: 0.01f,
-                epsilonDecay: (float)budget.EpsilonDecay,
-                bufferSize: bufferSize,
-                useCuda: budget.Hardware.GpuAvailable,
-                newsFeatureSize: newsFeatureSize
-            );
-        }
+
+        AnsiConsole.MarkupLine("[bold cyan]Using DQN Strategy[/]");
+        return new TorchAgent(
+            batchSize: batchSize,
+            gamma: 0.99f,
+            epsilon: 1.0f,
+            epsilonMin: 0.01f,
+            epsilonDecay: (float)budget.EpsilonDecay,
+            bufferSize: bufferSize,
+            useCuda: budget.Hardware.GpuAvailable,
+            newsFeatureSize: newsFeatureSize
+        );
     }
 }
