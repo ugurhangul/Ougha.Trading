@@ -236,6 +236,9 @@ public class PortfolioTradingEnvironment
                 if (_peakEquity > 0)
                     maxDrawdownPct = (_peakEquity - _executor.GetEquity()) / _peakEquity;
 
+                // Get ATR for volatility-normalized rewards
+                var symbolAtr = CalculateAtr(closeInfo.Symbol);
+
                 var closeReward = _rewardCalculator.Calculate(
                     tradeClosed: true,
                     tradeProfit: closeInfo.Profit,
@@ -244,7 +247,8 @@ public class PortfolioTradingEnvironment
                     unrealizedPnl: 0,
                     peakUnrealizedPnl: _peakUnrealizedPnls.GetValueOrDefault(closeInfo.Symbol),
                     initialBalance: _initialBalance,
-                    maxDrawdownPct: maxDrawdownPct);
+                    maxDrawdownPct: maxDrawdownPct,
+                    symbolAtr: symbolAtr);
 
                 _reusableRewards[symbolIndex] += closeReward;
                 _positionOpenTicks[closeInfo.Symbol] = 0;
@@ -400,10 +404,23 @@ public class PortfolioTradingEnvironment
         if (_peakEquity > 0)
             maxDrawdownPct = (_peakEquity - _executor.GetEquity()) / _peakEquity;
 
+        // Get ATR for volatility-normalized rewards
+        var symbolAtr = CalculateAtr(symbol);
+        
+        // Get position direction and price change for shaping rewards
+        var posDirection = pos?.Type == Core.Models.TradeType.Buy ? 1 : (pos?.Type == Core.Models.TradeType.Sell ? -1 : 0);
+        var currentPrice = _executor.GetBid(symbol);
+        var lastCandle = _executor.GetLastKnownCandle(symbol);
+        var priceChange = lastCandle != null ? currentPrice - lastCandle.Close : 0;
+
         var reward = _rewardCalculator.Calculate(
             tradeClosed, tradeProfit, holdingTicks,
             pos != null, unrealized, _peakUnrealizedPnls.GetValueOrDefault(symbol),
-            _initialBalance, maxDrawdownPct);
+            _initialBalance, maxDrawdownPct,
+            currentEquity: _executor.GetEquity(),
+            positionDirection: posDirection,
+            priceChange: priceChange,
+            symbolAtr: symbolAtr);
 
         return (reward, tradeClosed);
     }

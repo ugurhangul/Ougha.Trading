@@ -6,8 +6,8 @@ namespace Ougha.Trading.RL.Models;
 
 /// <summary>
 /// Actor-Critic Network for PPO.
-/// Improved architecture: MLP+LayerNorm body, cross-timeframe attention,
-/// separate value body for better value estimation, cross-symbol attention.
+/// Enhanced architecture: MLP+LayerNorm body, cross-timeframe attention,
+/// LSTM temporal memory, separate value body, cross-symbol attention.
 /// </summary>
 public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Tensor Value, Tensor TpSlParams)>
 {
@@ -25,6 +25,10 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
 
     private readonly Sequential _sharedBody;
     
+    // LSTM for temporal memory - learns sequential trading patterns
+    private readonly LSTM _temporalLstm;
+    private readonly LayerNorm _lstmLayerNorm;
+    
     // Separate value body for better value estimation (reduces actor-critic interference)
     private readonly Sequential _valueBody;
     
@@ -36,10 +40,11 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     private readonly Sequential _criticHead;
     private readonly Sequential _tpSlHead;
 
-    private const int TimeframeEmbedDim = 64;
+    private const int TimeframeEmbedDim = 256;  // Doubled from 128
     private const int FeatureDim = 120;
-    private const int HiddenDim = 512;
-    private const int ValueHiddenDim = 256;
+    private const int HiddenDim = 1024;         // Increased from 768
+    private const int ValueHiddenDim = 512;     // Increased from 384
+    private const int LstmHiddenDim = 512;      // LSTM hidden size
 
     public ActorCriticModel(string name, int numActions = 3, float dropout = 0.1f) : base(name)
     {
@@ -49,15 +54,15 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
         _cnnH1 = CreateTimeframeEncoder();
         _cnnH4 = CreateTimeframeEncoder();
 
-        _tfAttention = MultiheadAttention(TimeframeEmbedDim, 4, dropout: 0.0, bias: true, add_bias_kv: false, add_zero_attn: false, kdim: null, vdim: null);
+        _tfAttention = MultiheadAttention(TimeframeEmbedDim, 8, dropout: 0.0, bias: true, add_bias_kv: false, add_zero_attn: false, kdim: null, vdim: null);
         _tfLayerNorm = LayerNorm([TimeframeEmbedDim]);
 
-        _featureNet = Linear(FeatureDim, 128);
-        _featureLayerNorm = LayerNorm([128]);
+        _featureNet = Linear(FeatureDim, 256);  // Increased from 128
+        _featureLayerNorm = LayerNorm([256]);
 
-        long inputDim = 5 * TimeframeEmbedDim + 128;
+        long inputDim = 5 * TimeframeEmbedDim + 256;  // Updated for larger feature net
         
-        // Shared body for feature extraction
+        // Shared body for feature extraction - now 3 layers deep
         _sharedBody = Sequential(
             Linear(inputDim, HiddenDim),
             LayerNorm([HiddenDim]),
@@ -66,8 +71,16 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
             Linear(HiddenDim, HiddenDim),
             LayerNorm([HiddenDim]),
             ReLU(),
+            Dropout(dropout),
+            Linear(HiddenDim, HiddenDim),  // 3rd layer
+            LayerNorm([HiddenDim]),
+            ReLU(),
             Dropout(dropout)
         );
+        
+        // LSTM for temporal memory - single layer, bidirectional=false for causal
+        _temporalLstm = LSTM(HiddenDim, LstmHiddenDim, numLayers: 1, bidirectional: false, dropout: dropout, batchFirst: true);
+        _lstmLayerNorm = LayerNorm([LstmHiddenDim]);
         
         // Separate value body - processes fused features independently for value estimation
         _valueBody = Sequential(
@@ -77,34 +90,38 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
             Dropout(dropout),
             Linear(ValueHiddenDim, ValueHiddenDim),
             LayerNorm([ValueHiddenDim]),
+            ReLU(),
+            Dropout(dropout),
+            Linear(ValueHiddenDim, ValueHiddenDim),  // 3rd layer for value too
+            LayerNorm([ValueHiddenDim]),
             ReLU()
         );
         
         // Cross-symbol attention: allows symbols to attend to each other
-        _symbolAttention = MultiheadAttention(HiddenDim, 8, dropout: 0.1, bias: true);
-        _symbolLayerNorm = LayerNorm([HiddenDim]);
+        _symbolAttention = MultiheadAttention(LstmHiddenDim, 8, dropout: 0.1, bias: true);
+        _symbolLayerNorm = LayerNorm([LstmHiddenDim]);
 
         _actorHead = Sequential(
-            Linear(HiddenDim, 256),
+            Linear(LstmHiddenDim, 256),  // Takes from LSTM output
             LayerNorm([256]),
             ReLU(),
             Dropout(dropout),
             Linear(256, numActions)
         );
 
-        // Critic head now takes from separate value body
+        // Critic head takes from separate value body
         _criticHead = Sequential(
-            Linear(ValueHiddenDim, 128),
-            LayerNorm([128]),
+            Linear(ValueHiddenDim, 256),  // Increased intermediate
+            LayerNorm([256]),
             ReLU(),
-            Linear(128, 1)
+            Linear(256, 1)
         );
 
         _tpSlHead = Sequential(
-            Linear(HiddenDim, 128),
-            LayerNorm([128]),
+            Linear(LstmHiddenDim, 256),  // Takes from LSTM output
+            LayerNorm([256]),
             ReLU(),
-            Linear(128, 2),
+            Linear(256, 2),
             Sigmoid()
         );
         
@@ -141,9 +158,9 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     private Module<Tensor, Tensor> CreateTimeframeEncoder()
     {
         return Sequential(
-            Conv1d(in_channels: 45, out_channels: 32, kernel_size: 3, padding: 1),
+            Conv1d(in_channels: 45, out_channels: 128, kernel_size: 3, padding: 1),  // Doubled from 64
             ReLU(),
-            Conv1d(in_channels: 32, out_channels: TimeframeEmbedDim, kernel_size: 3, padding: 1),
+            Conv1d(in_channels: 128, out_channels: TimeframeEmbedDim, kernel_size: 3, padding: 1),  // 128→256
             ReLU(),
             AdaptiveAvgPool1d(1),
             Flatten()
@@ -151,7 +168,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     }
     
     /// <summary>
-    /// Forward pass with cross-timeframe attention.
+    /// Forward pass with cross-timeframe attention and LSTM temporal memory.
     /// Inputs (packed): [PackedTimeframes, SymbolId, PackedFeatures]
     /// </summary>
     public override (Tensor ActionLogits, Tensor Value, Tensor TpSlParams) forward(Tensor[] inputs)
@@ -199,8 +216,15 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
 
         var combined = cat([fusedTf, featEmbed], dim: 1);
         
-        // Actor path: shared body -> actor head
+        // Actor path: shared body -> LSTM -> actor head
         var hidden = _sharedBody.forward(combined);
+        
+        // LSTM temporal processing - treat batch as sequence of length 1
+        // Shape: [B, HiddenDim] -> [B, 1, HiddenDim] for LSTM
+        var lstmInput = hidden.unsqueeze(1);
+        var (lstmOut, _, _) = _temporalLstm.forward(lstmInput);
+        hidden = lstmOut.squeeze(1);  // [B, LstmHiddenDim]
+        hidden = _lstmLayerNorm.forward(hidden);
         
         // Apply cross-symbol attention when processing multiple symbols
         // This allows each symbol to attend to others for portfolio-level decisions
@@ -243,3 +267,4 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
         return attended;
     }
 }
+

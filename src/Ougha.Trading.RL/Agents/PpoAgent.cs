@@ -63,7 +63,7 @@ public class PpoAgent : IAgent
         _clipEpsilon = clipEpsilon;
         _valueCoef = 0.5f;
         _entropyCoef = 0.1f;
-        _minEntropyCoef = 0.01f;
+        _minEntropyCoef = 0.03f;
         _updateEpochs = 4; // Reduced from 10 for faster training
         
         // LR Scheduling
@@ -429,7 +429,7 @@ public class PpoAgent : IAgent
     public void DecayEpsilon()
     {
         if (!(_entropyCoef > _minEntropyCoef)) return;
-        _entropyCoef *= 0.999f;
+        _entropyCoef *= 0.9995f;  // Slower decay for more exploration
         _entropyCoef = Math.Max(_entropyCoef, _minEntropyCoef);
     }
     public float GetEntropyCoef() => _entropyCoef;
