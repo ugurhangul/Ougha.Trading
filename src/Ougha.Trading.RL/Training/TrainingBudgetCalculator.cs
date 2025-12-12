@@ -108,8 +108,6 @@ public static class TrainingBudgetCalculator
     
     #endregion
     
-
-    
     #region Budget Calculation
     
     /// <summary>
@@ -170,20 +168,20 @@ public static class TrainingBudgetCalculator
         var effectiveLearningRate = learningRate ?? CalculateLearningRate(effectiveBatchSize);
 
         int trainFreq, trainBatches;
-        if (hardware.GpuMemoryGb >= 20)
+        switch (hardware.GpuMemoryGb)
         {
-            trainFreq = 4;
-            trainBatches = 4;
-        }
-        else if (hardware.GpuMemoryGb >= 10)
-        {
-            trainFreq = 4;
-            trainBatches = 2;
-        }
-        else
-        {
-            trainFreq = 4;
-            trainBatches = 1;
+            case >= 20:
+                trainFreq = 4;
+                trainBatches = 4;
+                break;
+            case >= 10:
+                trainFreq = 4;
+                trainBatches = 2;
+                break;
+            default:
+                trainFreq = 4;
+                trainBatches = 1;
+                break;
         }
         
         var memorySize = Math.Max(100000, Math.Min(5000000, effectiveEpisodes * effectiveMaxSteps / 10));
