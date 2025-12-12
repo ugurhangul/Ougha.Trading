@@ -7,6 +7,7 @@ using Ougha.Trading.Data.Streamers;
 using Ougha.Trading.RL;
 using Ougha.Trading.RL.Agents;
 using Ougha.Trading.RL.Training;
+using Serilog;
 
 namespace Ougha.Trading.App.Runners;
 
@@ -48,6 +49,17 @@ public static class TrainingRunner
 
     public static async Task RunAsync(string symbolArg, int? episodes, IConfiguration config)
     {
+        // Configure Serilog for file logging (won't be overwritten by Live display)
+        var logPath = Path.Combine(Environment.CurrentDirectory, "logs", "training-.log");
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Debug()
+            .WriteTo.File(logPath, 
+                rollingInterval: RollingInterval.Day,
+                outputTemplate: "{Timestamp:HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}")
+            .CreateLogger();
+        
+        Log.Information("=== Training session started ===");
+        
         var symbols = symbolArg.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
 
         var qdbSection = config.GetSection("QuestDB");
@@ -179,16 +191,20 @@ public static class TrainingRunner
         
         foreach (var sym in symbols) stats.GetOrCreateSymbolStats(sym);
 
-        await AnsiConsole.Live(TrainingDisplay.BuildDisplay(stats, budget))
-            .AutoClear(false)
-            .StartAsync(async ctx =>
-            {
-                var preparedEnv = await envPool.GetNextEnvironmentAsync();
-                if (preparedEnv == null)
+        try
+        {
+            await AnsiConsole.Live(TrainingDisplay.BuildDisplay(stats, budget))
+                .AutoClear(false)
+                .StartAsync(async ctx =>
                 {
-                    AnsiConsole.MarkupLine("[red]Failed to get initial environment from pool[/]");
-                    return;
-                }
+                    try
+                    {
+                        var preparedEnv = await envPool.GetNextEnvironmentAsync();
+                        if (preparedEnv == null)
+                        {
+                            AnsiConsole.MarkupLine("[red]Failed to get initial environment from pool[/]");
+                            return;
+                        }
 
                 var env = preparedEnv.Env;
                 
@@ -213,6 +229,14 @@ public static class TrainingRunner
 
                 for (var ep = 1; ep <= budget.Episodes; ep++)
                 {
+                    // Log progress every 50 episodes
+                    if (ep % 50 == 0 || ep == 1)
+                    {
+                        Log.Information("Episode {Episode}/{Total} ({Percent:F1}%) - Chunk {Chunk}/{TotalChunks}", 
+                            ep, budget.Episodes, (double)ep / budget.Episodes * 100, 
+                            stats.CurrentChunk, envPool.TotalChunks);
+                    }
+                    
                     stats.Episode = ep;
                     stats.EpisodeReward = 0;
                     stats.EpisodeLoss = 0;
@@ -312,6 +336,7 @@ public static class TrainingRunner
                             }
                             catch (Exception ex)
                             {
+                                Log.Error(ex, "[TrainingRunner] Training task error");
                                 AnsiConsole.MarkupLine($"[red]Training error: {Markup.Escape(ex.Message)}[/]");
                             }
                             finally
@@ -462,8 +487,30 @@ public static class TrainingRunner
                     //     break;
                     // }
                 }
-                
-            });
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error(ex, "[TrainingRunner] Inner training error");
+                        throw; // Re-throw to outer handler
+                    }
+                });
+        }
+        catch (Exception ex)
+        {
+            Log.Fatal(ex, "[TrainingRunner] FATAL ERROR in training loop");
+            AnsiConsole.MarkupLine($"[red]Training error: {Markup.Escape(ex.Message)}[/]");
+            
+            // Check if producer failed
+            if (envPool.HasProducerFailed)
+            {
+                Log.Error(envPool.ProducerException, "[TrainingRunner] Producer also failed");
+            }
+        }
+        finally
+        {
+            Log.Information("=== Training session ended ===");
+            await Log.CloseAndFlushAsync();
+        }
 
         var finalModelPath = Path.Combine(modelDir, $"model_{DateTime.UtcNow:yyyyMMdd_HHmmss}.pt");
         agent.Save(finalModelPath);

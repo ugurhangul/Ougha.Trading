@@ -4,6 +4,7 @@ using Ougha.Trading.Core.Models;
 using Ougha.Trading.Data.Services;
 using Ougha.Trading.Features.Indicators;
 using Ougha.Trading.RL.Agents;
+using Serilog;
 
 namespace Ougha.Trading.RL;
 
@@ -538,7 +539,7 @@ public class PortfolioTradingEnvironment
             if (currentPrices.Count > 0)
                 dxyFeatures = _dxyService.BuildDxyFeatures(currentPrices, _executor.CurrentTime);
         }
-        catch { /* Ignore DXY calculation errors */ }
+        catch (Exception ex) { Log.Debug(ex, "DXY calculation error for {Symbol}", symbol); }
         
         // Build news features for economic events
         float[]? newsFeatures = null;
@@ -546,7 +547,7 @@ public class PortfolioTradingEnvironment
         {
             newsFeatures = _newsService.BuildNewsFeatures(_executor.CurrentTime, _config.Symbols);
         }
-        catch { /* Ignore news calculation errors */ }
+        catch (Exception ex) { Log.Debug(ex, "News feature calculation error"); }
         
         // Build correlation features
         float[]? correlationFeatures = null;
@@ -562,7 +563,7 @@ public class PortfolioTradingEnvironment
             if (currentPrices.Count > 0)
                 correlationFeatures = _correlationService.BuildCorrelationFeatures(currentPrices, _config.Symbols);
         }
-        catch { /* Ignore correlation calculation errors */ }
+        catch (Exception ex) { Log.Debug(ex, "Correlation calculation error"); }
         
         // Build portfolio exposure features
         float[]? portfolioExposure = null;
@@ -574,7 +575,7 @@ public class PortfolioTradingEnvironment
             var usedMargin = equity - freeMargin;
             portfolioExposure = _exposureService.BuildExposureFeatures(positions, equity, freeMargin, usedMargin, _config.Symbols.Length * 2);
         }
-        catch { /* Ignore exposure calculation errors */ }
+        catch (Exception ex) { Log.Debug(ex, "Exposure calculation error"); }
 
         return mtfBuilder.BuildAgentInput(
             symbol: symbol,
@@ -680,7 +681,7 @@ public class PortfolioTradingEnvironment
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[PortfolioTradingEnvironment] Failed to load calendar events: {ex.Message}");
+            Log.Warning(ex, "[PortfolioTradingEnvironment] Failed to load calendar events");
         }
     }
 

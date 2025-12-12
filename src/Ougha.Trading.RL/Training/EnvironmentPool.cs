@@ -3,8 +3,10 @@ using Ougha.Trading.Backtesting;
 using Ougha.Trading.Core.Models;
 using Ougha.Trading.Features;
 using Ougha.Trading.Risk;
+using Serilog;
 
 namespace Ougha.Trading.RL.Training;
+
 
 public record PreparedEnvironment(
     PortfolioTradingEnvironment Env,
@@ -18,7 +20,7 @@ public record PreparedEnvironment(
 );
 
 public record EnvironmentPoolConfig(
-    int PoolSize = 3
+    int PoolSize = 5
 );
 
 public class EnvironmentPool : IDisposable
@@ -34,6 +36,14 @@ public class EnvironmentPool : IDisposable
     private Task? _producerTask;
 
     private readonly Lock _lock = new();
+    
+    // Track producer failures for diagnostics
+    private Exception? _producerException;
+    private bool _producerCompleted;
+    
+    public bool HasProducerFailed => _producerException != null;
+    public Exception? ProducerException => _producerException;
+    public bool IsProducerCompleted => _producerCompleted;
 
     public int TotalChunks => _chunkProvider.TotalChunks;
 
@@ -81,8 +91,16 @@ public class EnvironmentPool : IDisposable
                     return preparedEnv;
                 }
             }
+            Log.Debug("[EnvironmentPool] Channel returned false from WaitToReadAsync (no more environments)");
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException)
+        {
+            Log.Debug("[EnvironmentPool] GetNextEnvironmentAsync cancelled");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[EnvironmentPool] Error getting next environment");
+        }
         return null;
     }
 
@@ -93,10 +111,16 @@ public class EnvironmentPool : IDisposable
         try
         {
             var chunk = await _chunkProvider.GetNextChunkAsync();
-            if (chunk == null) return;
+            if (chunk == null)
+            {
+                Log.Warning("[EnvironmentPool] No initial chunk available, producer exiting");
+                return;
+            }
             var chunkIndex = _chunkProvider.CurrentChunkIndex;
             var chunkStart = chunk.StartDate;
             var chunkEnd = chunk.EndDate;
+            
+            Log.Information("[EnvironmentPool] Producer started, first chunk: {ChunkStart:yyyy-MM-dd} to {ChunkEnd:yyyy-MM-dd}", chunkStart, chunkEnd);
 
             while (!ct.IsCancellationRequested)
             {
@@ -119,19 +143,36 @@ public class EnvironmentPool : IDisposable
                 if (producedInChunk >= _episodesPerChunk)
                 {
                     var nextChunk = await _chunkProvider.GetNextChunkAsync();
-                    if (nextChunk == null) break;
+                    if (nextChunk == null)
+                    {
+                        Log.Information("[EnvironmentPool] No more chunks, produced {ChunkIndex} chunks total", chunkIndex);
+                        break;
+                    }
                     chunk = nextChunk;
                     chunkIndex = _chunkProvider.CurrentChunkIndex;
                     chunkStart = chunk.StartDate;
                     chunkEnd = chunk.EndDate;
                     producedInChunk = 0;
+                    Log.Debug("[EnvironmentPool] Moved to chunk {ChunkIndex}: {ChunkStart:yyyy-MM-dd} to {ChunkEnd:yyyy-MM-dd}", chunkIndex, chunkStart, chunkEnd);
                 }
             }
+            
+            Log.Information("[EnvironmentPool] Producer completed normally after {ChunkIndex} chunks", chunkIndex);
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException)
+        {
+            Log.Information("[EnvironmentPool] Producer cancelled");
+        }
+        catch (Exception ex)
+        {
+            _producerException = ex;
+            Log.Error(ex, "[EnvironmentPool] PRODUCER ERROR: {ErrorType}: {ErrorMessage}", ex.GetType().Name, ex.Message);
+        }
         finally
         {
+            _producerCompleted = true;
             _envChannel.Writer.Complete();
+            Log.Debug("[EnvironmentPool] Producer finished, channel completed");
         }
     }
 

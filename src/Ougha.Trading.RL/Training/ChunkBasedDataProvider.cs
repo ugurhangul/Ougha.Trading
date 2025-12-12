@@ -1,6 +1,7 @@
 ﻿using System.Threading.Channels;
 using Ougha.Trading.Core.Models;
 using Ougha.Trading.Data;
+using Serilog;
 
 namespace Ougha.Trading.RL.Training;
 
@@ -229,6 +230,11 @@ public class ChunkBasedDataProvider : IDisposable
         catch (AggregateException ex) when (ex.InnerExceptions.All(e =>
             e is TaskCanceledException or OperationCanceledException or ChannelClosedException))
         {
+            Log.Debug("[ChunkBasedDataProvider] Producer task cancelled during dispose");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[ChunkBasedDataProvider] Error during dispose");
         }
         _cts.Dispose();
     }
