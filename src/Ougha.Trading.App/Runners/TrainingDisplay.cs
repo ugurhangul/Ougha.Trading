@@ -64,8 +64,20 @@ public static class TrainingDisplay
             "", "", "", ""
         );
         
+        var phaseColor = stats.CurrentPhase switch
+        {
+            "Training" => "green",
+            "Stepping" => "yellow",
+            "Buffering" => "magenta",
+            "Fetching Chunk" => "cyan",
+            "Preloading" => "blue",
+            "Acting" => "yellow",
+            "Idle" => "dim",
+            _ => "white"
+        };
+        
         return new Panel(table)
-            .Header("[bold cyan]Multi-Symbol RL Training[/]")
+            .Header($"[bold cyan]Multi-Symbol RL Training[/] [{phaseColor}]⟨{stats.CurrentPhase}⟩[/]")
             .Border(BoxBorder.Double)
             .BorderColor(Color.Cyan1);
     }

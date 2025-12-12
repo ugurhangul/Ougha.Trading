@@ -309,6 +309,7 @@ public class TrainingStats
         }
     }
     public bool GpuAvailable { get; set; }
+    public string CurrentPhase { get; set; } = "Initializing";
     public int EarlyStopPatience { get; set; } = 300;
     public int EarlyStopMinEpisodes { get; set; } = 500;
 }
