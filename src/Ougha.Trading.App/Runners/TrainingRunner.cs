@@ -46,11 +46,10 @@ public class EarlyStopTracker(int patience = 300, int minEpisodes = 500, int win
 
 public static class TrainingRunner
 {
-
     public static async Task RunAsync(string symbolArg, int? episodes, IConfiguration config)
     {
         Log.Information("=== Training session started ===");
-        
+
         var symbols = symbolArg.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
 
         var qdbSection = config.GetSection("QuestDB");
@@ -179,7 +178,7 @@ public static class TrainingRunner
             IsPpoAgent = agent is PpoAgent,
             TotalChunks = envPool.TotalChunks
         };
-        
+
         foreach (var sym in symbols) stats.GetOrCreateSymbolStats(sym);
 
         try
@@ -197,287 +196,286 @@ public static class TrainingRunner
                             return;
                         }
 
-                var env = preparedEnv.Env;
-                
-                // Preload historical candles and economic calendar events
-                await env.PreloadHistoricalCandlesAsync(dbLoader, preparedEnv.EpisodeStart);
-                
-                var lastChunkIndex = preparedEnv.ChunkIndex;
-                stats.CurrentChunk = lastChunkIndex;
-                stats.ChunkStartDate = preparedEnv.ChunkStartDate;
-                stats.ChunkEndDate = preparedEnv.ChunkEndDate;
-                stats.EpisodesPerChunk = preparedEnv.EpisodesPerChunk;
-                stats.EpisodeInChunk = preparedEnv.EpisodeInChunk;
-                stats.EpisodeStartDate = preparedEnv.EpisodeStart;
-                stats.EpisodeEndDate = preparedEnv.EpisodeEnd;
+                        var env = preparedEnv.Env;
 
-                var actionTimer = new System.Diagnostics.Stopwatch();
-                var envTimer = new System.Diagnostics.Stopwatch();
-                var trainTimer = new System.Diagnostics.Stopwatch();
-                var bufferTimer = new System.Diagnostics.Stopwatch();
-                var symbolEarlyStops = new Dictionary<string, EarlyStopTracker>();
-                Task<float>? trainingTask = null;
+                        // Preload historical candles and economic calendar events
+                        await env.PreloadHistoricalCandlesAsync(dbLoader, preparedEnv.EpisodeStart);
 
-                for (var ep = 1; ep <= budget.Episodes; ep++)
-                {
-                    // Log progress every 50 episodes
-                    if (ep % 50 == 0 || ep == 1)
-                    {
-                        Log.Information("Episode {Episode}/{Total} ({Percent:F1}%) - Chunk {Chunk}/{TotalChunks}", 
-                            ep, budget.Episodes, (double)ep / budget.Episodes * 100, 
-                            stats.CurrentChunk, envPool.TotalChunks);
-                    }
-                    
-                    stats.Episode = ep;
-                    stats.EpisodeReward = 0;
-                    stats.EpisodeLoss = 0;
+                        var lastChunkIndex = preparedEnv.ChunkIndex;
+                        stats.CurrentChunk = lastChunkIndex;
+                        stats.ChunkStartDate = preparedEnv.ChunkStartDate;
+                        stats.ChunkEndDate = preparedEnv.ChunkEndDate;
+                        stats.EpisodesPerChunk = preparedEnv.EpisodesPerChunk;
+                        stats.EpisodeInChunk = preparedEnv.EpisodeInChunk;
+                        stats.EpisodeStartDate = preparedEnv.EpisodeStart;
+                        stats.EpisodeEndDate = preparedEnv.EpisodeEnd;
 
-                    if (ep > 1)
-                    {
-                        var nextEnv = await envPool.GetNextEnvironmentAsync();
-                        if (nextEnv != null)
+                        var actionTimer = new System.Diagnostics.Stopwatch();
+                        var envTimer = new System.Diagnostics.Stopwatch();
+                        var trainTimer = new System.Diagnostics.Stopwatch();
+                        var bufferTimer = new System.Diagnostics.Stopwatch();
+                        var symbolEarlyStops = new Dictionary<string, EarlyStopTracker>();
+                        Task<float>? trainingTask = null;
+
+                        for (var ep = 1; ep <= budget.Episodes; ep++)
                         {
-                            env = nextEnv.Env;
-                            
-                            // Preload for new environment
-                            await env.PreloadHistoricalCandlesAsync(dbLoader, nextEnv.EpisodeStart);
-                            
-                            stats.EpisodeInChunk = nextEnv.EpisodeInChunk;
-                            stats.EpisodeStartDate = nextEnv.EpisodeStart;
-                            stats.EpisodeEndDate = nextEnv.EpisodeEnd;
-                            
-                            if (nextEnv.ChunkIndex != lastChunkIndex)
+                            // Log progress every 50 episodes
+                            if (ep % 50 == 0 || ep == 1)
                             {
-                                lastChunkIndex = nextEnv.ChunkIndex;
-                                stats.CurrentChunk = lastChunkIndex;
-                                stats.ChunkStartDate = nextEnv.ChunkStartDate;
-                                stats.ChunkEndDate = nextEnv.ChunkEndDate;
+                                Log.Information("Episode {Episode}/{Total} ({Percent:F1}%) - Chunk {Chunk}/{TotalChunks}",
+                                    ep, budget.Episodes, (double)ep / budget.Episodes * 100,
+                                    stats.CurrentChunk, envPool.TotalChunks);
                             }
-                        }
-                    }
 
-                    await env.ResetAsync();
-                    var stateInputs = env.BuildAgentInputs();
+                            stats.Episode = ep;
+                            stats.EpisodeReward = 0;
+                            stats.EpisodeLoss = 0;
 
-                    var done = false;
-                    double episodeReward = 0;
-                    var step = 0;
+                            if (ep > 1)
+                            {
+                                var nextEnv = await envPool.GetNextEnvironmentAsync();
+                                if (nextEnv != null)
+                                {
+                                    env = nextEnv.Env;
 
-                    var symbolRewards = new Dictionary<string, double>();
-                    foreach (var sym in symbols) symbolRewards[sym] = 0;
+                                    // Preload for new environment
+                                    await env.PreloadHistoricalCandlesAsync(dbLoader, nextEnv.EpisodeStart);
 
-                    // M1-based decision loop: decide once per minute, step S1 internally
-                    while (!done && step < trainMaxSteps)
-                    {
-                        stats.CurrentStep = step;
-                        stats.StartStepTimer();
+                                    stats.EpisodeInChunk = nextEnv.EpisodeInChunk;
+                                    stats.EpisodeStartDate = nextEnv.EpisodeStart;
+                                    stats.EpisodeEndDate = nextEnv.EpisodeEnd;
 
-                        // Get action at M1 decision point
-                        actionTimer.Restart();
-                        var (actions, tpSlMults, logProbs) = agent.ActBatchWithTpSlAndLogProbs(stateInputs, training: true);
-                        foreach (var a in actions) stats.RecordAction(a);
-                        actionTimer.Stop();
-                        stats.ActionTimeMs = actionTimer.Elapsed.TotalMilliseconds;
+                                    if (nextEnv.ChunkIndex != lastChunkIndex)
+                                    {
+                                        lastChunkIndex = nextEnv.ChunkIndex;
+                                        stats.CurrentChunk = lastChunkIndex;
+                                        stats.ChunkStartDate = nextEnv.ChunkStartDate;
+                                        stats.ChunkEndDate = nextEnv.ChunkEndDate;
+                                    }
+                                }
+                            }
 
-                        env.SetTpSlMultipliersBatch(tpSlMults);
+                            await env.ResetAsync();
+                            var stateInputs = env.BuildAgentInputs();
 
-                        if (actions.Length > 0)
-                        {
-                            stats.CurrentAction = GetActionName(actions[0]);
-                            stats.CurrentSymbol = symbols[0];
-                        }
+                            var done = false;
+                            double episodeReward = 0;
+                            var step = 0;
 
-                        // Step until M1 closes (accumulates ~60 S1 steps internally)
-                        envTimer.Restart();
-                        var (nextStates, rewards, dones, stepsTaken) = await env.StepUntilM1CloseAsync(actions);
-                        envTimer.Stop();
-                        stats.EnvStepTimeMs = envTimer.Elapsed.TotalMilliseconds;
+                            var symbolRewards = new Dictionary<string, double>();
+                            foreach (var sym in symbols) symbolRewards[sym] = 0;
 
-                        // Update step counter with actual S1 steps taken
-                        step += stepsTaken;
-                        stats.TotalSteps += stepsTaken;
+                            // M1-based decision loop: decide once per minute, step S1 internally
+                            while (!done && step < trainMaxSteps)
+                            {
+                                stats.CurrentStep = step;
+                                stats.StartStepTimer();
 
-                        var episodeDone = dones.All(d => d);
+                                // Get action at M1 decision point
+                                actionTimer.Restart();
+                                var (actions, tpSlMults, logProbs) = agent.ActBatchWithTpSlAndLogProbs(stateInputs, training: true);
+                                foreach (var a in actions) stats.RecordAction(a);
+                                actionTimer.Stop();
+                                stats.ActionTimeMs = actionTimer.Elapsed.TotalMilliseconds;
 
-                        bufferTimer.Restart();
+                                env.SetTpSlMultipliersBatch(tpSlMults);
 
-                        var doneFlags = new bool[stateInputs.Length];
-                        Array.Fill(doneFlags, episodeDone);
+                                if (actions.Length > 0)
+                                {
+                                    stats.CurrentAction = GetActionName(actions[0]);
+                                    stats.CurrentSymbol = symbols[0];
+                                }
 
-                        // Add experience with accumulated M1 rewards
-                        agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs);
+                                // Step until M1 closes (accumulates ~60 S1 steps internally)
+                                envTimer.Restart();
+                                var (nextStates, rewards, dones, stepsTaken) = await env.StepUntilM1CloseAsync(actions);
+                                envTimer.Stop();
+                                stats.EnvStepTimeMs = envTimer.Elapsed.TotalMilliseconds;
 
-                        for (var i = 0; i < stateInputs.Length; i++)
-                        {
-                            episodeReward += rewards[i];
+                                // Update step counter with actual S1 steps taken
+                                step += stepsTaken;
+                                stats.TotalSteps += stepsTaken;
 
-                            if (i < symbols.Count)
-                                symbolRewards[symbols[i]] += rewards[i];
-                        }
+                                var episodeDone = dones.All(d => d);
 
-                        bufferTimer.Stop();
-                        stats.BufferAddTimeMs = bufferTimer.Elapsed.TotalMilliseconds;
+                                bufferTimer.Restart();
 
-                        if (trainingTask is { IsCompleted: true })
-                        {
-                            try
+                                var doneFlags = new bool[stateInputs.Length];
+                                Array.Fill(doneFlags, episodeDone);
+
+                                // Add experience with accumulated M1 rewards
+                                agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs);
+
+                                for (var i = 0; i < stateInputs.Length; i++)
+                                {
+                                    episodeReward += rewards[i];
+
+                                    if (i < symbols.Count)
+                                        symbolRewards[symbols[i]] += rewards[i];
+                                }
+
+                                bufferTimer.Stop();
+                                stats.BufferAddTimeMs = bufferTimer.Elapsed.TotalMilliseconds;
+
+                                if (trainingTask is { IsCompleted: true })
+                                {
+                                    try
+                                    {
+                                        await trainingTask;
+                                        stats.TrainCalls++;
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Log.Error(ex, "[TrainingRunner] Training task error");
+                                        AnsiConsole.MarkupLine($"[red]Training error: {Markup.Escape(ex.Message)}[/]");
+                                    }
+                                    finally
+                                    {
+                                        trainingTask = null;
+                                    }
+                                }
+
+                                if (trainingTask == null && step % budget.TrainFreq == 0)
+                                {
+                                    var shouldTrain = agent switch
+                                    {
+                                        PpoAgent ppo => ppo.HasPendingRollout(),
+                                        _ => GetBufferSize(agent) >= batchSize
+                                    };
+
+                                    if (shouldTrain)
+                                    {
+                                        trainTimer.Restart();
+
+                                        trainingTask = Task.Run(() =>
+                                        {
+                                            // ReSharper disable once AccessToDisposedClosure
+                                            var loss = agent.TrainMultipleBatches(budget.TrainBatches);
+                                            trainTimer.Stop();
+                                            stats.TrainTimeMs = trainTimer.Elapsed.TotalMilliseconds;
+                                            return loss;
+                                        });
+                                    }
+                                }
+
+                                stats.EndStepTimer(stepsTaken);
+                                stateInputs = nextStates;
+
+                                done = episodeDone;
+
+
+                                stats.EpisodeReward = episodeReward;
+                                stats.Epsilon = GetEpsilon(agent);
+                                stats.Entropy = GetEntropy(agent);
+                                stats.BufferSize = GetBufferSize(agent);
+                                stats.Positions = env.Executor.GetPositions().Count();
+                                stats.Equity = env.Executor.GetBalance();
+
+                                ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
+                            }
+
+
+                            if (trainingTask != null)
                             {
                                 await trainingTask;
                                 stats.TrainCalls++;
-                            }
-                            catch (Exception ex)
-                            {
-                                Log.Error(ex, "[TrainingRunner] Training task error");
-                                AnsiConsole.MarkupLine($"[red]Training error: {Markup.Escape(ex.Message)}[/]");
-                            }
-                            finally
-                            {
                                 trainingTask = null;
                             }
-                        }
 
-                        if (trainingTask == null && step % budget.TrainFreq == 0)
-                        {
-                            var shouldTrain = agent switch
-                            {
-                                PpoAgent ppo => ppo.HasPendingRollout(),
-                                _ => GetBufferSize(agent) >= batchSize
-                            };
-                            
-                            if (shouldTrain)
-                            {
-                                trainTimer.Restart();
+                            agent.SyncInferenceNetwork();
 
-                                trainingTask = Task.Run(() =>
-                                {
-                                    // ReSharper disable once AccessToDisposedClosure
-                                    var loss = agent.TrainMultipleBatches(budget.TrainBatches);
-                                    trainTimer.Stop();
-                                    stats.TrainTimeMs = trainTimer.Elapsed.TotalMilliseconds;
-                                    return loss;
-                                });
+                            stats.EpisodeReward = episodeReward;
+                            stats.AddReward(episodeReward);
+                            stats.IncrementEpisode();
+
+                            if (episodeReward > stats.BestReward)
+                            {
+                                stats.BestReward = episodeReward;
                             }
+
+                            earlyStop.Update(episodeReward, ep);
+
+                            var allResults = env.Executor.GetResults();
+                            var episodeTrades = allResults.TradeLog;
+                            stats.TradesOpened += allResults.TotalTrades;
+                            stats.TradesClosed += episodeTrades.Count;
+                            stats.Wins += episodeTrades.Count(t => t.Profit > 0);
+                            stats.Losses += episodeTrades.Count(t => t.Profit <= 0);
+                            stats.TotalProfit += episodeTrades.Where(t => t.Profit > 0).Sum(t => t.Profit);
+                            stats.TotalLoss += Math.Abs(episodeTrades.Where(t => t.Profit < 0).Sum(t => t.Profit));
+
+                            foreach (var symbol in symbols)
+                            {
+                                var symStats = stats.GetOrCreateSymbolStats(symbol);
+                                symStats.Episodes++;
+
+                                double symbolReward = 0;
+                                if (symbolRewards.TryGetValue(symbol, out var reward))
+                                    symbolReward = reward;
+
+                                symStats.TotalReward += symbolReward;
+
+                                // Track reward trend
+                                symStats.PrevEpisodeReward = symStats.LastEpisodeReward;
+                                symStats.LastEpisodeReward = symbolReward;
+
+                                // Cumulative stats for display
+                                var symbolTrades = allResults.TradeLog.Where(t => t.Symbol == symbol).ToList();
+                                var grossProfit = symbolTrades.Where(t => t.Profit > 0).Sum(t => t.Profit);
+                                var grossLoss = Math.Abs(symbolTrades.Where(t => t.Profit < 0).Sum(t => t.Profit));
+                                var episodeWins = symbolTrades.Count(t => t.Profit > 0);
+                                var episodeLosses = symbolTrades.Count(t => t.Profit <= 0);
+                                var buys = symbolTrades.Count(t => t.Type == TradeType.Buy);
+                                var sells = symbolTrades.Count(t => t.Type == TradeType.Sell);
+
+                                symStats.CumulativeTrades += symbolTrades.Count;
+                                symStats.CumulativeWins += episodeWins;
+                                symStats.CumulativeLosses += episodeLosses;
+                                symStats.CumulativeProfit += grossProfit;
+                                symStats.CumulativeLoss += grossLoss;
+                                symStats.CumulativeBuys += buys;
+                                symStats.CumulativeSells += sells;
+
+                                if (symbolReward > symStats.BestReward)
+                                {
+                                    symStats.BestReward = symbolReward;
+                                    symStats.BestProfitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 999.0 : 0.0;
+                                    symStats.BestWinRate = symbolTrades.Count > 0 ? (double)episodeWins / symbolTrades.Count * 100 : 0;
+                                    symStats.BestTrades = symbolTrades.Count;
+                                }
+
+                                if (!symbolEarlyStops.TryGetValue(symbol, out var symbolEarlyStop))
+                                {
+                                    symbolEarlyStop = new EarlyStopTracker(
+                                        patience: budget.EarlyStopPatience,
+                                        minEpisodes: budget.EarlyStopMinEpisodes);
+                                    symbolEarlyStops[symbol] = symbolEarlyStop;
+                                }
+
+                                symbolEarlyStop.Update(symbolReward, symStats.Episodes);
+                                symStats.NoImprovementCount = symbolEarlyStop.NoImprovementCount;
+                                symStats.EarlyStopped = symbolEarlyStop.ShouldStop;
+                            }
+
+                            agent.DecayEpsilon();
+
+                            stats.Epsilon = GetEpsilon(agent);
+                            stats.Entropy = GetEntropy(agent);
+                            ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
+
+                            if (ep % budget.SaveFrequency == 0)
+                            {
+                                var checkpointPath = Path.Combine(modelDir, $"checkpoint_ep{ep}.pt");
+                                agent.Save(checkpointPath);
+                            }
+
+                            // Early stop disabled - train for full episodes
+                            // if (shouldStop)
+                            // {
+                            //     AnsiConsole.MarkupLine($"[yellow]Early stopping triggered at episode {ep}[/]");
+                            //     break;
+                            // }
                         }
-
-                        stats.EndStepTimer(stepsTaken);
-                        stateInputs = nextStates;
-
-                        done = episodeDone;
-
-
-                        stats.EpisodeReward = episodeReward;
-                        stats.Epsilon = GetEpsilon(agent);
-                        stats.Entropy = GetEntropy(agent);
-                        stats.BufferSize = GetBufferSize(agent);
-                        stats.Positions = env.Executor.GetPositions().Count();
-                        stats.Equity = env.Executor.GetBalance();
-
-                        ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
-                    }
-
-
-
-                    if (trainingTask != null)
-                    {
-                        await trainingTask;
-                        stats.TrainCalls++;
-                        trainingTask = null;
-                    }
-
-                    agent.SyncInferenceNetwork();
-
-                    stats.EpisodeReward = episodeReward;
-                    stats.AddReward(episodeReward);
-                    stats.IncrementEpisode();
-
-                    if (episodeReward > stats.BestReward)
-                    {
-                        stats.BestReward = episodeReward;
-                    }
-
-                    earlyStop.Update(episodeReward, ep);
-
-                    var allResults = env.Executor.GetResults();
-                    var episodeTrades = allResults.TradeLog;
-                    stats.TradesOpened += allResults.TotalTrades;
-                    stats.TradesClosed += episodeTrades.Count;
-                    stats.Wins += episodeTrades.Count(t => t.Profit > 0);
-                    stats.Losses += episodeTrades.Count(t => t.Profit <= 0);
-                    stats.TotalProfit += episodeTrades.Where(t => t.Profit > 0).Sum(t => t.Profit);
-                    stats.TotalLoss += Math.Abs(episodeTrades.Where(t => t.Profit < 0).Sum(t => t.Profit));
-
-                    foreach (var symbol in symbols)
-                    {
-                        var symStats = stats.GetOrCreateSymbolStats(symbol);
-                        symStats.Episodes++;
-
-                        double symbolReward = 0;
-                        if (symbolRewards.TryGetValue(symbol, out var reward))
-                            symbolReward = reward;
-
-                        symStats.TotalReward += symbolReward;
-                        
-                        // Track reward trend
-                        symStats.PrevEpisodeReward = symStats.LastEpisodeReward;
-                        symStats.LastEpisodeReward = symbolReward;
-                        
-                        // Cumulative stats for display
-                        var symbolTrades = allResults.TradeLog.Where(t => t.Symbol == symbol).ToList();
-                        var grossProfit = symbolTrades.Where(t => t.Profit > 0).Sum(t => t.Profit);
-                        var grossLoss = Math.Abs(symbolTrades.Where(t => t.Profit < 0).Sum(t => t.Profit));
-                        var episodeWins = symbolTrades.Count(t => t.Profit > 0);
-                        var episodeLosses = symbolTrades.Count(t => t.Profit <= 0);
-                        var buys = symbolTrades.Count(t => t.Type == TradeType.Buy);
-                        var sells = symbolTrades.Count(t => t.Type == TradeType.Sell);
-                        
-                        symStats.CumulativeTrades += symbolTrades.Count;
-                        symStats.CumulativeWins += episodeWins;
-                        symStats.CumulativeLosses += episodeLosses;
-                        symStats.CumulativeProfit += grossProfit;
-                        symStats.CumulativeLoss += grossLoss;
-                        symStats.CumulativeBuys += buys;
-                        symStats.CumulativeSells += sells;
-
-                        if (symbolReward > symStats.BestReward)
-                        {
-                            symStats.BestReward = symbolReward;
-                            symStats.BestProfitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 999.0 : 0.0;
-                            symStats.BestWinRate = symbolTrades.Count > 0 ? (double)episodeWins / symbolTrades.Count * 100 : 0;
-                            symStats.BestTrades = symbolTrades.Count;
-                        }
-
-                        if (!symbolEarlyStops.TryGetValue(symbol, out var symbolEarlyStop))
-                        {
-                            symbolEarlyStop = new EarlyStopTracker(
-                                patience: budget.EarlyStopPatience,
-                                minEpisodes: budget.EarlyStopMinEpisodes);
-                            symbolEarlyStops[symbol] = symbolEarlyStop;
-                        }
-
-                        symbolEarlyStop.Update(symbolReward, symStats.Episodes);
-                        symStats.NoImprovementCount = symbolEarlyStop.NoImprovementCount;
-                        symStats.EarlyStopped = symbolEarlyStop.ShouldStop;
-                    }
-
-                    agent.DecayEpsilon();
-
-                    stats.Epsilon = GetEpsilon(agent);
-                    stats.Entropy = GetEntropy(agent);
-                    ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
-
-                    if (ep % budget.SaveFrequency == 0)
-                    {
-                        var checkpointPath = Path.Combine(modelDir, $"checkpoint_ep{ep}.pt");
-                        agent.Save(checkpointPath);
-                    }
-
-                    // Early stop disabled - train for full episodes
-                    // if (shouldStop)
-                    // {
-                    //     AnsiConsole.MarkupLine($"[yellow]Early stopping triggered at episode {ep}[/]");
-                    //     break;
-                    // }
-                }
                     }
                     catch (Exception ex)
                     {
@@ -490,7 +488,7 @@ public static class TrainingRunner
         {
             Log.Fatal(ex, "[TrainingRunner] FATAL ERROR in training loop");
             AnsiConsole.MarkupLine($"[red]Training error: {Markup.Escape(ex.Message)}[/]");
-            
+
             // Check if producer failed
             if (envPool.HasProducerFailed)
             {
@@ -563,7 +561,7 @@ public static class TrainingRunner
             _ => $"ACT_{action}"
         };
     }
-    
+
     private static IAgent CreateAgent(IConfiguration config, TrainingBudget budget, int batchSize, int bufferSize, int newsFeatureSize)
     {
         var strategy = config.GetValue<string>("Training:Strategy", "DQN");
@@ -571,13 +569,13 @@ public static class TrainingRunner
         if (strategy.Equals("PPO", StringComparison.OrdinalIgnoreCase))
         {
             // Calculate expected updates for LR scheduling
-            var stepsPerRollout = 4096;  // Increased rollout horizon
+            var stepsPerRollout = 4096; // Increased rollout horizon
             var expectedRollouts = budget.Episodes * budget.MaxSteps / stepsPerRollout;
-            
+
             AnsiConsole.MarkupLine($"[bold cyan]Using PPO Strategy (rollout=4096, batch=256, LR schedule over {expectedRollouts} updates)[/]");
             return new PpoAgent(
-                batchSize: 256,  // Increased for RTX 3090
-                rolloutHorizon: 4096,  // Increased from 2048
+                batchSize: 256, // Increased for RTX 3090
+                rolloutHorizon: 4096, // Increased from 2048
                 gamma: 0.99f,
                 learningRate: 3e-4f,
                 useCuda: budget.Hardware.GpuAvailable,
