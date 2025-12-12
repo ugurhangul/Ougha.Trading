@@ -62,7 +62,7 @@ public class PythonCloudScraper : IDisposable
         
         // Step 2: Parse HTML using HtmlAgilityPack (C#)
         var events = ParseHtmlWithAgilityPack(html, weekStart);
-        Console.WriteLine($"[PythonCloudScraper] Found {events.Count} events");
+        Console.WriteLine($"[PythonCloudScraper] Scraped {events.Count} events");
         return events;
     }
     

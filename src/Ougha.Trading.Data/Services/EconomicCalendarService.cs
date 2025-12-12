@@ -37,7 +37,6 @@ public class EconomicCalendarService
     /// </summary>
     public async Task LoadEventsAsync(DateTime from, DateTime to)
     {
-        Console.WriteLine($"[EconomicCalendarService] Loading events: {from:yyyy-MM-dd} to {to:yyyy-MM-dd}");
         
         // Get Monday of start week
         var weekStart = from.AddDays(-(int)from.DayOfWeek + (int)DayOfWeek.Monday).Date;
@@ -82,10 +81,6 @@ public class EconomicCalendarService
                 await AppendEventsToCurrencyFilesAsync(scrapedEvents, week);
             }
         }
-        else
-        {
-            Console.WriteLine($"[EconomicCalendarService] All {allWeeksInRange.Count} weeks already cached");
-        }
         
         // Load all events from currency files for the requested date range
         var allEvents = await LoadEventsFromCurrencyFilesAsync(from, to);
@@ -94,8 +89,6 @@ public class EconomicCalendarService
         {
             _events = allEvents.OrderBy(e => e.Time).ToList();
         }
-        
-        Console.WriteLine($"[EconomicCalendarService] Total: {_events.Count} events loaded for date range");
     }
     
     private static string GetCurrencyFileName(string currency)
