@@ -22,20 +22,20 @@ abstract class Program
             .CreateLogger();
 
         // Global exception handlers to catch ANY crash
-        AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         {
             var ex = e.ExceptionObject as Exception;
             Log.Fatal(ex, "!!! UNHANDLED EXCEPTION - IsTerminating: {IsTerminating}", e.IsTerminating);
             Log.CloseAndFlush();
         };
 
-        TaskScheduler.UnobservedTaskException += (sender, e) =>
+        TaskScheduler.UnobservedTaskException += (_, e) =>
         {
             Log.Error(e.Exception, "!!! UNOBSERVED TASK EXCEPTION");
             e.SetObserved(); // Prevent app crash
         };
 
-        AppDomain.CurrentDomain.ProcessExit += (sender, e) =>
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
         {
             Log.Information("!!! PROCESS EXIT EVENT");
             Log.CloseAndFlush();

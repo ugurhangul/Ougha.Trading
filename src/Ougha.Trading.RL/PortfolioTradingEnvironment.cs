@@ -409,7 +409,7 @@ public class PortfolioTradingEnvironment
         var symbolAtr = CalculateAtr(symbol);
         
         // Get position direction and price change for shaping rewards
-        var posDirection = pos?.Type == Core.Models.TradeType.Buy ? 1 : (pos?.Type == Core.Models.TradeType.Sell ? -1 : 0);
+        var posDirection = pos?.Type == TradeType.Buy ? 1 : (pos?.Type == TradeType.Sell ? -1 : 0);
         var currentPrice = _executor.GetBid(symbol);
         var lastCandle = _executor.GetLastKnownCandle(symbol);
         var priceChange = lastCandle != null ? currentPrice - lastCandle.Close : 0;

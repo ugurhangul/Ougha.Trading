@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Threading.Channels;
 
 namespace Ougha.Trading.RL.Training;
@@ -26,6 +25,7 @@ public class AsyncRolloutBuffer(int capacity, int maxPendingRollouts = 4)
     private readonly Lock _bufferLock = new();
     
     public int ActiveBufferCount => _activeBuffer.Count;
+
     public int PendingRolloutsCount => _readyRollouts.Reader.Count;
 
     /// <summary>

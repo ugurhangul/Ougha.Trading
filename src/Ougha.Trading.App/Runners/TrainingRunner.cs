@@ -395,7 +395,7 @@ public static class TrainingRunner
                         stats.BestReward = episodeReward;
                     }
 
-                    var shouldStop = earlyStop.Update(episodeReward, ep);
+                    earlyStop.Update(episodeReward, ep);
 
                     var allResults = env.Executor.GetResults();
                     var episodeTrades = allResults.TradeLog;
@@ -427,8 +427,8 @@ public static class TrainingRunner
                         var grossLoss = Math.Abs(symbolTrades.Where(t => t.Profit < 0).Sum(t => t.Profit));
                         var episodeWins = symbolTrades.Count(t => t.Profit > 0);
                         var episodeLosses = symbolTrades.Count(t => t.Profit <= 0);
-                        var buys = symbolTrades.Count(t => t.Type == Core.Models.TradeType.Buy);
-                        var sells = symbolTrades.Count(t => t.Type == Core.Models.TradeType.Sell);
+                        var buys = symbolTrades.Count(t => t.Type == TradeType.Buy);
+                        var sells = symbolTrades.Count(t => t.Type == TradeType.Sell);
                         
                         symStats.CumulativeTrades += symbolTrades.Count;
                         symStats.CumulativeWins += episodeWins;

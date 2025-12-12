@@ -81,7 +81,7 @@ public class PythonCloudScraper : IDisposable
                 Console.WriteLine($"[PythonCloudScraper] Fetching week of {weekStart:yyyy-MM-dd}...");
                 
                 using PyObject response = scraper.get(url, timeout: 30);
-                return response.GetAttr("text").ToString() ?? "";
+                return response.GetAttr("text").ToString(CultureInfo.InvariantCulture);
             }
             catch (Exception ex)
             {
@@ -123,7 +123,7 @@ public class PythonCloudScraper : IDisposable
                 
                 // Extract time
                 var timeCell = row.SelectSingleNode(".//td[contains(@class, 'calendar__time')]");
-                var timeText = timeCell?.InnerText.Trim() ?? "";
+                var timeText = timeCell.InnerText.Trim();
                 var eventTime = ParseEventTime(currentDate, timeText);
                 
                 // Extract event name
@@ -136,8 +136,8 @@ public class PythonCloudScraper : IDisposable
                 
                 // Extract impact from span class
                 var impactCell = row.SelectSingleNode(".//td[contains(@class, 'calendar__impact')]");
-                var impactSpan = impactCell?.SelectSingleNode(".//span");
-                var impactClass = impactSpan?.GetAttributeValue("class", "") ?? "";
+                var impactSpan = impactCell.SelectSingleNode(".//span");
+                var impactClass = impactSpan.GetAttributeValue("class", "");
                 var impact = ParseImpact(impactClass);
                 
                 // Extract actual/forecast/previous
@@ -145,9 +145,9 @@ public class PythonCloudScraper : IDisposable
                 var forecastCell = row.SelectSingleNode(".//td[contains(@class, 'calendar__forecast')]");
                 var previousCell = row.SelectSingleNode(".//td[contains(@class, 'calendar__previous')]");
                 
-                var actual = ParseNumericValue(actualCell?.InnerText);
-                var forecast = ParseNumericValue(forecastCell?.InnerText);
-                var previous = ParseNumericValue(previousCell?.InnerText);
+                var actual = ParseNumericValue(actualCell.InnerText);
+                var forecast = ParseNumericValue(forecastCell.InnerText);
+                var previous = ParseNumericValue(previousCell.InnerText);
                 
                 events.Add(new EconomicEvent(
                     eventTime,

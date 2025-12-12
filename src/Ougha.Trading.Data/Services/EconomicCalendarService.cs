@@ -22,10 +22,7 @@ public class EconomicCalendarService
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true
     };
-    
-    // Track which weeks have been scraped (to avoid re-scraping)
-    private static readonly string ScrapedWeeksFile = Path.Combine(CacheDir, "scraped_weeks.json");
-    
+
     public EconomicCalendarService()
     {
         Directory.CreateDirectory(CacheDir);
@@ -165,16 +162,12 @@ public class EconomicCalendarService
         // Group events by currency
         var eventsByCurrency = events.GroupBy(e => e.Currency).ToList();
         
-        // Get all unique currencies that were scraped this week
-        var currenciesThisWeek = eventsByCurrency.Select(g => g.Key).ToHashSet();
-        
         foreach (var group in eventsByCurrency)
         {
             var currency = group.Key;
             var currencyFile = GetCurrencyFileName(currency);
             
             // Load existing cache file
-            CurrencyCacheFile? existingCache = null;
             var existingEvents = new List<EconomicEventDto>();
             var existingWeeks = new List<DateTime>();
             
@@ -185,11 +178,11 @@ public class EconomicCalendarService
                     var json = await File.ReadAllTextAsync(currencyFile);
                     
                     // Try new format first
-                    existingCache = JsonSerializer.Deserialize<CurrencyCacheFile>(json, JsonOptions);
+                    var existingCache = JsonSerializer.Deserialize<CurrencyCacheFile>(json, JsonOptions);
                     if (existingCache != null)
                     {
-                        existingEvents = existingCache.Events ?? [];
-                        existingWeeks = existingCache.ScrapedWeeks ?? [];
+                        existingEvents = existingCache.Events;
+                        existingWeeks = existingCache.ScrapedWeeks;
                     }
                     else
                     {

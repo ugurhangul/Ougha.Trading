@@ -511,7 +511,7 @@ public class TorchAgent : IAgent
         tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.RiskState, 9, batchSize <= 64 ? riskBuffer : null);
 
         if (inputs[0].NewsFeatures != null)
-            tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.NewsFeatures!, inputs[0].NewsFeatures.Length, batchSize <= 64 ? newsBuffer : null);
+            tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.NewsFeatures!, inputs[0].NewsFeatures!.Length, batchSize <= 64 ? newsBuffer : null);
         else
             tensors[tensorIdx++] = zeros(new long[] { batchSize, _newsFeatureSize }, device: _device);
 

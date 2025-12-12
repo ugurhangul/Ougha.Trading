@@ -23,7 +23,6 @@ public class PpoAgent : IAgent
     private readonly int _batchSize;
     
     private readonly AsyncRolloutBuffer _rolloutBuffer;
-    private readonly int _rolloutHorizon;
     private readonly int _newsFeatureSize;
     private readonly float[] _zeroNews;
     
@@ -38,11 +37,6 @@ public class PpoAgent : IAgent
     private readonly float[]? _packedTfBuffer;
     private readonly float[]? _packedFeatBuffer;
     
-    // Pre-allocated output arrays for inference (avoids GC pressure)
-    private readonly int[] _actionsBuffer = new int[MAX_INFERENCE_BATCH];
-    private readonly float[,] _tpSlBuffer = new float[MAX_INFERENCE_BATCH, 2];
-    private readonly float[] _logProbsBuffer = new float[MAX_INFERENCE_BATCH];
-    
     // Pre-allocated Experience array for buffering
     private readonly Experience[] _experienceBuffer = new Experience[MAX_INFERENCE_BATCH];
  
@@ -52,12 +46,10 @@ public class PpoAgent : IAgent
         float gaeLambda = 0.95f,
         float clipEpsilon = 0.2f,
         float learningRate = 3e-4f,
-        int updateEpochs = 10,
         bool useCuda = false,
         int newsFeatureSize = 17)
     {
         _batchSize = batchSize;
-        _rolloutHorizon = rolloutHorizon;
         _gamma = gamma;
         _gaeLambda = gaeLambda;
         _clipEpsilon = clipEpsilon;
@@ -132,7 +124,7 @@ public class PpoAgent : IAgent
         
         _inferenceNet.eval();
         using (no_grad())
-        using (var scope = NewDisposeScope()) // Dispose all tensors created in this scope
+        using (NewDisposeScope())
         {
             var tensors = PrepareInputTensors(inputs);
             var (logits, _, tpSl) = _inferenceNet.forward(tensors);
@@ -282,7 +274,7 @@ public class PpoAgent : IAgent
         var steps = 0;
         
         // Use DisposeScope for all tensors to prevent heap corruption
-        using (var outerScope = NewDisposeScope())
+        using (NewDisposeScope())
         {
             // Pre-compute all tensors once to avoid repeated creation during epochs
             var allStateTensors = PrepareInputTensors(dataset.States);
@@ -296,7 +288,7 @@ public class PpoAgent : IAgent
                 foreach (var batch in loader)
                 {
                     // Use inner scope for batch tensors to free memory after each batch
-                    using (var batchScope = NewDisposeScope())
+                    using (NewDisposeScope())
                     {
                         var batchIndices = tensor(batch.Indices, dtype: ScalarType.Int64, device: _device);
                         
@@ -364,7 +356,7 @@ public class PpoAgent : IAgent
             for (var i = 0; i < T; i += GAE_CHUNK_SIZE)
             {
                 // Use DisposeScope per chunk to free tensors after each iteration
-                using (var scope = NewDisposeScope())
+                using (NewDisposeScope())
                 {
                     var len = Math.Min(GAE_CHUNK_SIZE, T - i);
                     
@@ -396,7 +388,7 @@ public class PpoAgent : IAgent
 
             if (!rollouts[T - 1].Done && rollouts[T - 1].NextState != null)
             {
-                using (var scope = NewDisposeScope())
+                using (NewDisposeScope())
                 {
                     var tensors = PrepareInputTensors([rollouts[T - 1].NextState!]);
                     var (_, v, _) = _model.forward(tensors);

@@ -73,7 +73,6 @@ public static class TrainingDisplay
     private static Panel BuildStatusPanel(TrainingStats stats)
     {
         var pnlStyle = stats.PnLPercent >= 0 ? "green" : "red";
-        var pnlSign = stats.PnLPercent >= 0 ? "+" : "";
 
         var safeSymbol = stats.CurrentSymbol.Length > 10 ? stats.CurrentSymbol[..10] : stats.CurrentSymbol.PadRight(10);
         var safeAction = stats.CurrentAction.PadRight(6);
