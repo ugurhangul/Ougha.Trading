@@ -37,6 +37,14 @@ public class PpoAgent : IAgent
 
     private readonly float[]? _packedTfBuffer;
     private readonly float[]? _packedFeatBuffer;
+    
+    // Pre-allocated output arrays for inference (avoids GC pressure)
+    private readonly int[] _actionsBuffer = new int[MAX_INFERENCE_BATCH];
+    private readonly float[,] _tpSlBuffer = new float[MAX_INFERENCE_BATCH, 2];
+    private readonly float[] _logProbsBuffer = new float[MAX_INFERENCE_BATCH];
+    
+    // Pre-allocated Experience array for buffering
+    private readonly Experience[] _experienceBuffer = new Experience[MAX_INFERENCE_BATCH];
  
     public PpoAgent(int batchSize = 256,
         int rolloutHorizon = 4096,
@@ -120,6 +128,9 @@ public class PpoAgent : IAgent
 
     public (int[] Actions, float[,] TpSlMultipliers, float[] LogProbs) ActBatchWithTpSlAndLogProbs(AgentInput[] inputs, bool training = true)
     {
+        var count = inputs.Length;
+        var usePreallocated = count <= MAX_INFERENCE_BATCH;
+        
         _inferenceNet.eval();
         using (no_grad())
         {
@@ -131,7 +142,6 @@ public class PpoAgent : IAgent
             logits = clamp(logits, -20.0f, 20.0f);
 
             // Use logits-based Categorical (more numerically stable than probs-based)
-            // This avoids the multinomial NYI issue that occurs with degenerate probabilities
             var dist = distributions.Categorical(logits: logits);
             
             // Use sample() with explicit fallback for edge cases
@@ -142,24 +152,38 @@ public class PpoAgent : IAgent
             }
             catch
             {
-                // Fallback: if multinomial fails, use argmax (greedy action)
                 actionsTensor = logits.argmax(dim: 1);
             }
             var logProbsTensor = dist.log_prob(actionsTensor);
 
-            var actionsData = actionsTensor.data<long>().ToArray();
-            var logProbs = logProbsTensor.data<float>().ToArray();
-            var tpSlData = tpSl.data<float>().ToArray();
-
-            var actions = new int[inputs.Length];
-            for (var i = 0; i < inputs.Length; i++)
-                actions[i] = (int)actionsData[i];
+            // Use pre-allocated buffers when batch size allows (avoids GC allocations)
+            var actions = usePreallocated ? _actionsBuffer : new int[count];
+            var tpSlMults = usePreallocated ? _tpSlBuffer : new float[count, 2];
+            var logProbs = usePreallocated ? _logProbsBuffer : new float[count];
             
-            var tpSlMults = new float[inputs.Length, 2];
-            for (var i = 0; i < inputs.Length; i++)
+            // Direct copy from GPU tensors to pre-allocated arrays
+            var actionsSpan = actionsTensor.data<long>();
+            var logProbsSpan = logProbsTensor.data<float>();
+            var tpSlSpan = tpSl.data<float>();
+            
+            for (var i = 0; i < count; i++)
             {
-                tpSlMults[i, 0] = tpSlData[i * 2];
-                tpSlMults[i, 1] = tpSlData[i * 2 + 1];
+                actions[i] = (int)actionsSpan[i];
+                logProbs[i] = logProbsSpan[i];
+                tpSlMults[i, 0] = tpSlSpan[i * 2];
+                tpSlMults[i, 1] = tpSlSpan[i * 2 + 1];
+            }
+            
+            // Return copies if using pre-allocated (caller may hold references)
+            if (usePreallocated)
+            {
+                var actionsCopy = new int[count];
+                var tpSlCopy = new float[count, 2];
+                var logProbsCopy = new float[count];
+                Array.Copy(actions, actionsCopy, count);
+                Buffer.BlockCopy(tpSlMults, 0, tpSlCopy, 0, count * 2 * sizeof(float));
+                Array.Copy(logProbs, logProbsCopy, count);
+                return (actionsCopy, tpSlCopy, logProbsCopy);
             }
             
             return (actions, tpSlMults, logProbs);
@@ -208,8 +232,13 @@ public class PpoAgent : IAgent
         bool[] dones,
         float[] logProbs)
     {
-        var experiences = new Experience[states.Length];
-        for (var i = 0; i < states.Length; i++)
+        var count = states.Length;
+        var usePreallocated = count <= MAX_INFERENCE_BATCH;
+        
+        // Use pre-allocated buffer when batch size allows
+        var experiences = usePreallocated ? _experienceBuffer : new Experience[count];
+        
+        for (var i = 0; i < count; i++)
         {
             experiences[i] = new Experience
             {
@@ -221,7 +250,16 @@ public class PpoAgent : IAgent
                 Priority = logProbs[i]
             };
         }
-        _rolloutBuffer.AddExperienceBatch(experiences);
+        
+        // Pass a span/slice if using pre-allocated buffer with smaller batch
+        if (usePreallocated && count < MAX_INFERENCE_BATCH)
+        {
+            _rolloutBuffer.AddExperienceBatch(new ArraySegment<Experience>(experiences, 0, count));
+        }
+        else
+        {
+            _rolloutBuffer.AddExperienceBatch(experiences);
+        }
     }
 
     public float Train()
@@ -474,10 +512,14 @@ public class PpoAgent : IAgent
 
     private static void CopyFeatures(float[] dest, int destOffset, float[] source, int len)
     {
+        // Fast path: use Buffer.BlockCopy for bulk copy, then sanitize
+        Buffer.BlockCopy(source, 0, dest, destOffset * sizeof(float), len * sizeof(float));
+        
+        // Sanitize NaN/Inf values in-place
         for (var i = 0; i < len; i++)
         {
-            var val = source[i];
-            dest[destOffset + i] = float.IsFinite(val) ? val : 0f;
+            if (!float.IsFinite(dest[destOffset + i]))
+                dest[destOffset + i] = 0f;
         }
     }
 

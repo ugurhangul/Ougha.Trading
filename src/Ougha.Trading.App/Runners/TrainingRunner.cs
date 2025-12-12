@@ -183,8 +183,6 @@ public static class TrainingRunner
             .AutoClear(false)
             .StartAsync(async ctx =>
             {
-                stats.CurrentPhase = "Fetching Chunk";
-                ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
                 var preparedEnv = await envPool.GetNextEnvironmentAsync();
                 if (preparedEnv == null)
                 {
@@ -195,8 +193,6 @@ public static class TrainingRunner
                 var env = preparedEnv.Env;
                 
                 // Preload historical candles and economic calendar events
-                stats.CurrentPhase = "Preloading";
-                ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
                 await env.PreloadHistoricalCandlesAsync(dbLoader, preparedEnv.EpisodeStart);
                 
                 var lastChunkIndex = preparedEnv.ChunkIndex;
@@ -223,16 +219,12 @@ public static class TrainingRunner
 
                     if (ep > 1)
                     {
-                        stats.CurrentPhase = "Fetching Chunk";
-                        ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
                         var nextEnv = await envPool.GetNextEnvironmentAsync();
                         if (nextEnv != null)
                         {
                             env = nextEnv.Env;
                             
                             // Preload for new environment
-                            stats.CurrentPhase = "Preloading";
-                            ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
                             await env.PreloadHistoricalCandlesAsync(dbLoader, nextEnv.EpisodeStart);
                             
                             stats.EpisodeInChunk = nextEnv.EpisodeInChunk;
@@ -266,8 +258,6 @@ public static class TrainingRunner
                         stats.StartStepTimer();
 
                         // Get action at M1 decision point
-                        stats.CurrentPhase = "Acting";
-                        ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
                         actionTimer.Restart();
                         var (actions, tpSlMults, logProbs) = agent.ActBatchWithTpSlAndLogProbs(stateInputs, training: true);
                         foreach (var a in actions) stats.RecordAction(a);
@@ -283,8 +273,6 @@ public static class TrainingRunner
                         }
 
                         // Step until M1 closes (accumulates ~60 S1 steps internally)
-                        stats.CurrentPhase = "Stepping";
-                        ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
                         envTimer.Restart();
                         var (nextStates, rewards, dones, stepsTaken) = await env.StepUntilM1CloseAsync(actions);
                         envTimer.Stop();
@@ -296,8 +284,6 @@ public static class TrainingRunner
 
                         var episodeDone = dones.All(d => d);
 
-                        stats.CurrentPhase = "Buffering";
-                        ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
                         bufferTimer.Restart();
 
                         var doneFlags = new bool[stateInputs.Length];
@@ -344,8 +330,6 @@ public static class TrainingRunner
                             
                             if (shouldTrain)
                             {
-                                stats.CurrentPhase = "Training";
-                                ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
                                 trainTimer.Restart();
 
                                 trainingTask = Task.Run(() =>
