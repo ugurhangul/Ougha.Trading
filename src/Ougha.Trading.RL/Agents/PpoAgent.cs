@@ -346,8 +346,9 @@ public class PpoAgent : IAgent
                 
                 var tensors = PrepareInputTensors(chunk);
                 var (_, v, _) = _model.forward(tensors);
-                var vData = v.cpu().data<float>().ToArray();
-                Array.Copy(vData, 0, values, i, len);
+                // Squeeze on GPU first, then transfer once
+                var vSqueezeData = v.squeeze().data<float>().ToArray();
+                Array.Copy(vSqueezeData, 0, values, i, len);
             }
 
             if (!rollouts[T - 1].Done && rollouts[T - 1].NextState != null)

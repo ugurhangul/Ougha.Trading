@@ -36,6 +36,50 @@ public class QuestDbDataLoader
         return await conn.QueryAsync<Candle>(sql, new { symbol, start = startParam, end = endParam });
     }
 
+    /// <summary>
+    /// Bulk load candles for multiple symbols in a single query.
+    /// Returns candles grouped by symbol.
+    /// </summary>
+    public async Task<Dictionary<string, List<Candle>>> LoadCandlesBatchAsync(
+        IEnumerable<string> symbols, 
+        string timeframe, 
+        DateTime startDate, 
+        DateTime endDate)
+    {
+        var table = timeframe.ToLower();
+        var symbolList = symbols.ToList();
+        
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+
+        // Build IN clause with quoted symbols (QuestDB doesn't support ANY)
+        var symbolsIn = string.Join(", ", symbolList.Select(s => $"'{s}'"));
+        
+        var sql = $@"
+            SELECT symbol as Symbol, timestamp as Time, open as Open, high as High, low as Low, close as Close, volume as Volume
+            FROM {table}
+            WHERE symbol IN ({symbolsIn}) 
+              AND timestamp BETWEEN @start AND @end
+            ORDER BY symbol, timestamp";
+
+        var startParam = NormalizeDateTime(startDate);
+        var endParam = NormalizeDateTime(endDate);
+
+        var result = new Dictionary<string, List<Candle>>();
+        foreach (var s in symbolList)
+            result[s] = new List<Candle>();
+
+        var rows = await conn.QueryAsync<(string Symbol, DateTime Time, double Open, double High, double Low, double Close, double Volume)>(
+            sql, new { start = startParam, end = endParam });
+
+        foreach (var row in rows)
+        {
+            result[row.Symbol].Add(new Candle(row.Time, row.Open, row.High, row.Low, row.Close, (long)row.Volume));
+        }
+
+        return result;
+    }
+
 
     public async Task<HashSet<DateTime>> GetExistingDaysAsync(string symbol, DateTime start, DateTime end)
     {

@@ -144,7 +144,7 @@ public class EnvironmentPool : IDisposable
         if (episodeData.Count == 0)
             throw new InvalidOperationException("No episode data available from current chunk");
 
-        var candleTimeline = new CandleTimeline(episodeData);
+        var candleTimeline = new CandleTimeline(episodeData, alreadySorted: true);
         var episodeExecutor = new BacktestExecutor(candleTimeline, _symbolInfo, new PortfolioManager());
 
         var env = new PortfolioTradingEnvironment(

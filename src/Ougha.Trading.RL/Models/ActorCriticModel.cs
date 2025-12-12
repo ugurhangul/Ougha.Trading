@@ -156,24 +156,29 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     /// </summary>
     public override (Tensor ActionLogits, Tensor Value, Tensor TpSlParams) forward(Tensor[] inputs)
     {
-        var packedTf = inputs[0];
+        var packedTf = inputs[0];  // [B, 5, W, F]
         var symbolId = inputs[1];
         var packedFeats = inputs[2];
+        
+        var batchSize = packedTf.shape[0];
+        
+        // Single permute: [B, 5, W, F] -> [B, 5, F, W] for Conv1d
+        var permuted = packedTf.permute(0, 1, 3, 2).contiguous();  // [B, 5, F, W]
+        
+        // Process each timeframe with its dedicated encoder
+        var m1 = _cnnM1.forward(permuted.select(1, 0));   // [B, EmbedDim]
+        var m5 = _cnnM5.forward(permuted.select(1, 1));
+        var m15 = _cnnM15.forward(permuted.select(1, 2));
+        var h1 = _cnnH1.forward(permuted.select(1, 3));
+        var h4 = _cnnH4.forward(permuted.select(1, 4));
 
-        var m1 = _cnnM1.forward(packedTf.select(1, 0).transpose(1, 2));
-        var m5 = _cnnM5.forward(packedTf.select(1, 1).transpose(1, 2));
-        var m15 = _cnnM15.forward(packedTf.select(1, 2).transpose(1, 2));
-        var h1 = _cnnH1.forward(packedTf.select(1, 3).transpose(1, 2));
-        var h4 = _cnnH4.forward(packedTf.select(1, 4).transpose(1, 2));
-
-        var tfStack = stack([m1, m5, m15, h1, h4], dim: 1);
-        var tfSeq = tfStack.transpose(0, 1);
+        var tfStack = stack([m1, m5, m15, h1, h4], dim: 1);  // [B, 5, EmbedDim]
+        var tfSeq = tfStack.transpose(0, 1);  // [5, B, EmbedDim] for attention
 
         var (attended, _) = _tfAttention.forward(tfSeq, tfSeq, tfSeq, key_padding_mask: null, need_weights: false, attn_mask: null);
         attended = attended + tfSeq;
 
-        attended = attended.transpose(0, 1);
-        var batchSize = attended.shape[0];
+        attended = attended.transpose(0, 1);  // [B, 5, EmbedDim]
         attended = _tfLayerNorm.forward(attended.reshape(-1, TimeframeEmbedDim));
         attended = attended.reshape(batchSize, 5, TimeframeEmbedDim);
 

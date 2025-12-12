@@ -214,17 +214,15 @@ public class MultiTimeframeCandleAggregator
         var count = candles.Count;
         if (count == 0) return;
 
-        for (var i = 0; i < count - 1; i++)
+        // Only load the last N candles we actually need (skip excess from the start)
+        var startIdx = Math.Max(0, count - _maxCandlesPerTimeframe - 1);
+        
+        for (var i = startIdx; i < count - 1; i++)
         {
             _completedCandles[timeframe].Add(candles[i]);
         }
 
         _currentCandles[timeframe] = candles[count - 1];
-
-        while (_completedCandles[timeframe].Count > _maxCandlesPerTimeframe)
-        {
-            _completedCandles[timeframe].RemoveAt(0);
-        }
     }
 
     /// <summary>

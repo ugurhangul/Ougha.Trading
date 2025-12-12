@@ -170,26 +170,21 @@ public class ChunkBasedDataProvider : IDisposable
         }
     }
 
-    private static readonly string[] MultiTimeframes = ["m1", "m5", "m15", "h1", "h4"];
+
 
     private async Task<DataChunk> LoadChunkAsync(DateTime historyStart, DateTime chunkStart, DateTime chunkEnd)
     {
         var allCandles = new List<(DateTime Time, string Symbol, Candle Candle)>();
         var historyBySymbol = new Dictionary<string, List<Candle>>();
-        var mtfCandles = new Dictionary<string, Dictionary<string, List<Candle>>>();
-
         foreach (var symbol in _symbols)
-        {
             historyBySymbol[symbol] = [];
-            mtfCandles[symbol] = new Dictionary<string, List<Candle>>();
-        }
 
-        foreach (var symbol in _symbols)
+        // Batch load all symbols in single query
+        var allSymbolCandles = await _dataLoader.LoadCandlesBatchAsync(_symbols, _timeframe, historyStart, chunkEnd);
+        
+        foreach (var (symbol, candles) in allSymbolCandles)
         {
-            var candles = await _dataLoader.LoadCandlesAsync(symbol, _timeframe, historyStart, chunkEnd);
-            var candleList = candles.ToList();
-
-            foreach (var candle in candleList)
+            foreach (var candle in candles)
             {
                 if (candle.Time >= chunkStart)
                     allCandles.Add((candle.Time, symbol, candle));
@@ -198,20 +193,7 @@ public class ChunkBasedDataProvider : IDisposable
             }
         }
 
-        var mtfTasks = (from symbol in _symbols
-            from tf in MultiTimeframes
-            let s = symbol
-            let t = tf
-            select Task.Run(async () =>
-            {
-                var candles = await _dataLoader.LoadCandlesAsync(s, t, historyStart, chunkEnd);
-                var list = candles.OrderBy(c => c.Time).ToList();
-                lock (mtfCandles)
-                {
-                    mtfCandles[s][t.ToUpper()] = list;
-                }
-            })).ToList();
-        await Task.WhenAll(mtfTasks);
+
 
         allCandles = allCandles.OrderBy(c => c.Time).ToList();
 

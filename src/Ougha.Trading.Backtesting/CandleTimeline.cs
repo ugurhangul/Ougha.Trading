@@ -8,9 +8,11 @@ public class CandleTimeline
 
     public int Count => _allCandles.Count;
 
-    public CandleTimeline(IEnumerable<(DateTime Time, string Symbol, Candle Candle)> candles)
+    public CandleTimeline(IEnumerable<(DateTime Time, string Symbol, Candle Candle)> candles, bool alreadySorted = false)
     {
-        _allCandles = candles.OrderBy(x => x.Time).ToList();
+        _allCandles = alreadySorted 
+            ? (candles as IReadOnlyList<(DateTime, string, Candle)> ?? candles.ToList())
+            : candles.OrderBy(x => x.Time).ToList();
     }
 
     public (DateTime Time, string Symbol, Candle Candle) GetAtIndex(int index)
