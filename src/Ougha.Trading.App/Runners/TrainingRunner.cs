@@ -49,15 +49,6 @@ public static class TrainingRunner
 
     public static async Task RunAsync(string symbolArg, int? episodes, IConfiguration config)
     {
-        // Configure Serilog for file logging (won't be overwritten by Live display)
-        var logPath = Path.Combine(Environment.CurrentDirectory, "logs", "training-.log");
-        Log.Logger = new LoggerConfiguration()
-            .MinimumLevel.Debug()
-            .WriteTo.File(logPath, 
-                rollingInterval: RollingInterval.Day,
-                outputTemplate: "{Timestamp:HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}")
-            .CreateLogger();
-        
         Log.Information("=== Training session started ===");
         
         var symbols = symbolArg.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();

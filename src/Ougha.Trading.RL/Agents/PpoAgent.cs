@@ -129,20 +129,20 @@ public class PpoAgent : IAgent
     public (int[] Actions, float[,] TpSlMultipliers, float[] LogProbs) ActBatchWithTpSlAndLogProbs(AgentInput[] inputs, bool training = true)
     {
         var count = inputs.Length;
-        var usePreallocated = count <= MAX_INFERENCE_BATCH;
         
         _inferenceNet.eval();
         using (no_grad())
+        using (var scope = NewDisposeScope()) // Dispose all tensors created in this scope
         {
             var tensors = PrepareInputTensors(inputs);
             var (logits, _, tpSl) = _inferenceNet.forward(tensors);
 
             // Sanitize logits to prevent NaN/Inf issues
-            logits = nan_to_num(logits, nan: 0.0, posinf: 10.0, neginf: -10.0);
-            logits = clamp(logits, -20.0f, 20.0f);
+            var sanitizedLogits = nan_to_num(logits, nan: 0.0, posinf: 10.0, neginf: -10.0);
+            var clampedLogits = clamp(sanitizedLogits, -20.0f, 20.0f);
 
             // Use logits-based Categorical (more numerically stable than probs-based)
-            var dist = distributions.Categorical(logits: logits);
+            var dist = distributions.Categorical(logits: clampedLogits);
             
             // Use sample() with explicit fallback for edge cases
             Tensor actionsTensor;
@@ -152,39 +152,29 @@ public class PpoAgent : IAgent
             }
             catch
             {
-                actionsTensor = logits.argmax(dim: 1);
+                actionsTensor = clampedLogits.argmax(dim: 1);
             }
             var logProbsTensor = dist.log_prob(actionsTensor);
 
-            // Use pre-allocated buffers when batch size allows (avoids GC allocations)
-            var actions = usePreallocated ? _actionsBuffer : new int[count];
-            var tpSlMults = usePreallocated ? _tpSlBuffer : new float[count, 2];
-            var logProbs = usePreallocated ? _logProbsBuffer : new float[count];
+            // Copy data to managed arrays before tensors are disposed
+            var actions = new int[count];
+            var tpSlMults = new float[count, 2];
+            var logProbs = new float[count];
             
-            // Direct copy from GPU tensors to pre-allocated arrays
-            var actionsSpan = actionsTensor.data<long>();
-            var logProbsSpan = logProbsTensor.data<float>();
-            var tpSlSpan = tpSl.data<float>();
+            var actionsData = actionsTensor.cpu().data<long>().ToArray();
+            var logProbsData = logProbsTensor.cpu().data<float>().ToArray();
+            var tpSlData = tpSl.cpu().data<float>().ToArray();
             
             for (var i = 0; i < count; i++)
             {
-                actions[i] = (int)actionsSpan[i];
-                logProbs[i] = logProbsSpan[i];
-                tpSlMults[i, 0] = tpSlSpan[i * 2];
-                tpSlMults[i, 1] = tpSlSpan[i * 2 + 1];
+                actions[i] = (int)actionsData[i];
+                logProbs[i] = logProbsData[i];
+                tpSlMults[i, 0] = tpSlData[i * 2];
+                tpSlMults[i, 1] = tpSlData[i * 2 + 1];
             }
             
-            // Return copies if using pre-allocated (caller may hold references)
-            if (usePreallocated)
-            {
-                var actionsCopy = new int[count];
-                var tpSlCopy = new float[count, 2];
-                var logProbsCopy = new float[count];
-                Array.Copy(actions, actionsCopy, count);
-                Buffer.BlockCopy(tpSlMults, 0, tpSlCopy, 0, count * 2 * sizeof(float));
-                Array.Copy(logProbs, logProbsCopy, count);
-                return (actionsCopy, tpSlCopy, logProbsCopy);
-            }
+            // Explicitly dispose tensors
+            foreach (var t in tensors) t.Dispose();
             
             return (actions, tpSlMults, logProbs);
         }
@@ -291,58 +281,66 @@ public class PpoAgent : IAgent
         float totalLoss = 0;
         var steps = 0;
         
-        // Pre-compute all tensors once to avoid repeated creation during epochs
-        // This is a major optimization: instead of 4 epochs × 16 batches = 64 tensor preps,
-        // we do 1 full tensor prep and then slice by index
-        var allStateTensors = PrepareInputTensors(dataset.States);
-        var allActions = tensor(dataset.Actions, dtype: ScalarType.Int64, device: _device);
-        var allLogProbs = tensor(dataset.LogProbs, dtype: ScalarType.Float32, device: _device);
-        var allReturns = tensor(dataset.Returns, dtype: ScalarType.Float32, device: _device);
-        var allAdvantages = tensor(dataset.Advantages, dtype: ScalarType.Float32, device: _device);
-
-        for (var epoch = 0; epoch < _updateEpochs; epoch++)
+        // Use DisposeScope for all tensors to prevent heap corruption
+        using (var outerScope = NewDisposeScope())
         {
-            foreach (var batch in loader)
+            // Pre-compute all tensors once to avoid repeated creation during epochs
+            var allStateTensors = PrepareInputTensors(dataset.States);
+            var allActions = tensor(dataset.Actions, dtype: ScalarType.Int64, device: _device);
+            var allLogProbs = tensor(dataset.LogProbs, dtype: ScalarType.Float32, device: _device);
+            var allReturns = tensor(dataset.Returns, dtype: ScalarType.Float32, device: _device);
+            var allAdvantages = tensor(dataset.Advantages, dtype: ScalarType.Float32, device: _device);
+
+            for (var epoch = 0; epoch < _updateEpochs; epoch++)
             {
-                // Use pre-cached indices to slice from pre-computed tensors
-                var batchIndices = tensor(batch.Indices, dtype: ScalarType.Int64, device: _device);
-                
-                var stateTensors = new Tensor[allStateTensors.Length];
-                for (var t = 0; t < allStateTensors.Length; t++)
-                    stateTensors[t] = allStateTensors[t].index_select(0, batchIndices);
-                
-                var actions = allActions.index_select(0, batchIndices);
-                var oldLogProbs = allLogProbs.index_select(0, batchIndices);
-                var returnsTensor = allReturns.index_select(0, batchIndices);
-                var advs = allAdvantages.index_select(0, batchIndices);
+                foreach (var batch in loader)
+                {
+                    // Use inner scope for batch tensors to free memory after each batch
+                    using (var batchScope = NewDisposeScope())
+                    {
+                        var batchIndices = tensor(batch.Indices, dtype: ScalarType.Int64, device: _device);
+                        
+                        var stateTensors = new Tensor[allStateTensors.Length];
+                        for (var t = 0; t < allStateTensors.Length; t++)
+                            stateTensors[t] = allStateTensors[t].index_select(0, batchIndices);
+                        
+                        var actions = allActions.index_select(0, batchIndices);
+                        var oldLogProbs = allLogProbs.index_select(0, batchIndices);
+                        var returnsTensor = allReturns.index_select(0, batchIndices);
+                        var advs = allAdvantages.index_select(0, batchIndices);
 
-                advs = (advs - advs.mean()) / (advs.std() + 1e-8f);
-                
-                var (logits, values, _) = _model.forward(stateTensors);
+                        var normalizedAdvs = (advs - advs.mean()) / (advs.std() + 1e-8f);
+                        
+                        var (logits, values, _) = _model.forward(stateTensors);
 
-                var probs = nn.functional.softmax(logits, dim: 1);
-                var dist = distributions.Categorical(probs);
-                var newLogProbs = dist.log_prob(actions);
-                var entropy = dist.entropy().mean();
-                
-                var ratio = (newLogProbs - oldLogProbs).exp();
-                var surr1 = ratio * advs;
-                var surr2 = clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * advs;
-                var actorLoss = -min(surr1, surr2).mean();
+                        var probs = nn.functional.softmax(logits, dim: 1);
+                        var dist = distributions.Categorical(probs);
+                        var newLogProbs = dist.log_prob(actions);
+                        var entropy = dist.entropy().mean();
+                        
+                        var ratio = (newLogProbs - oldLogProbs).exp();
+                        var surr1 = ratio * normalizedAdvs;
+                        var surr2 = clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * normalizedAdvs;
+                        var actorLoss = -min(surr1, surr2).mean();
 
-                var valueLoss = nn.functional.mse_loss(values.squeeze(), returnsTensor);
-                
-                var loss = actorLoss + _valueCoef * valueLoss - _entropyCoef * entropy;
-                
-                _optimizer.zero_grad();
-                loss.backward();
-                nn.utils.clip_grad_norm_(_model.parameters(), 0.5f);
-                _optimizer.step();
-                
-                totalLoss += loss.item<float>();
-                steps++;
+                        var valueLoss = nn.functional.mse_loss(values.squeeze(), returnsTensor);
+                        
+                        var loss = actorLoss + _valueCoef * valueLoss - _entropyCoef * entropy;
+                        
+                        _optimizer.zero_grad();
+                        loss.backward();
+                        nn.utils.clip_grad_norm_(_model.parameters(), 0.5f);
+                        _optimizer.step();
+                        
+                        totalLoss += loss.item<float>();
+                        steps++;
+                    } // batchScope disposes all batch tensors
+                }
             }
-        }
+            
+            // Explicitly dispose input tensors
+            foreach (var t in allStateTensors) t.Dispose();
+        } // outerScope disposes any remaining tensors
 
         SyncInferenceNetwork();
         return steps > 0 ? totalLoss / steps : 0;
@@ -365,35 +363,46 @@ public class PpoAgent : IAgent
             
             for (var i = 0; i < T; i += GAE_CHUNK_SIZE)
             {
-                var len = Math.Min(GAE_CHUNK_SIZE, T - i);
-                
-                // Use Array.Copy instead of LINQ Skip/Take to avoid allocations
-                Array.Copy(states, i, chunkBuffer, 0, len);
-                
-                // Create view of correct length (avoid processing garbage in buffer)
-                AgentInput[] chunk;
-                if (len == GAE_CHUNK_SIZE)
+                // Use DisposeScope per chunk to free tensors after each iteration
+                using (var scope = NewDisposeScope())
                 {
-                    chunk = chunkBuffer;
+                    var len = Math.Min(GAE_CHUNK_SIZE, T - i);
+                    
+                    // Use Array.Copy instead of LINQ Skip/Take to avoid allocations
+                    Array.Copy(states, i, chunkBuffer, 0, len);
+                    
+                    // Create view of correct length (avoid processing garbage in buffer)
+                    AgentInput[] chunk;
+                    if (len == GAE_CHUNK_SIZE)
+                    {
+                        chunk = chunkBuffer;
+                    }
+                    else
+                    {
+                        chunk = new AgentInput[len];
+                        Array.Copy(chunkBuffer, chunk, len);
+                    }
+                    
+                    var tensors = PrepareInputTensors(chunk);
+                    var (_, v, _) = _model.forward(tensors);
+                    // Squeeze on GPU first, then transfer once
+                    var vSqueezeData = v.squeeze().cpu().data<float>().ToArray();
+                    Array.Copy(vSqueezeData, 0, values, i, len);
+                    
+                    // Explicitly dispose input tensors
+                    foreach (var t in tensors) t.Dispose();
                 }
-                else
-                {
-                    chunk = new AgentInput[len];
-                    Array.Copy(chunkBuffer, chunk, len);
-                }
-                
-                var tensors = PrepareInputTensors(chunk);
-                var (_, v, _) = _model.forward(tensors);
-                // Squeeze on GPU first, then transfer once
-                var vSqueezeData = v.squeeze().data<float>().ToArray();
-                Array.Copy(vSqueezeData, 0, values, i, len);
             }
 
             if (!rollouts[T - 1].Done && rollouts[T - 1].NextState != null)
             {
-                var tensors = PrepareInputTensors([rollouts[T - 1].NextState!]);
-                var (_, v, _) = _model.forward(tensors);
-                values[T] = v.item<float>();
+                using (var scope = NewDisposeScope())
+                {
+                    var tensors = PrepareInputTensors([rollouts[T - 1].NextState!]);
+                    var (_, v, _) = _model.forward(tensors);
+                    values[T] = v.item<float>();
+                    foreach (var t in tensors) t.Dispose();
+                }
             }
             else
             {
