@@ -126,15 +126,25 @@ public class PpoAgent : IAgent
             var tensors = PrepareInputTensors(inputs);
             var (logits, _, tpSl) = _inferenceNet.forward(tensors);
 
-            logits = nan_to_num(logits);
+            // Sanitize logits to prevent NaN/Inf issues
+            logits = nan_to_num(logits, nan: 0.0, posinf: 10.0, neginf: -10.0);
+            logits = clamp(logits, -20.0f, 20.0f);
 
-            var probs = nn.functional.softmax(logits, dim: 1);
-
-            probs = clamp(probs, 1e-8f, 1.0f);
-            probs = probs / probs.sum(1, keepdim: true);
-
-            var dist = distributions.Categorical(probs);
-            var actionsTensor = dist.sample();
+            // Use logits-based Categorical (more numerically stable than probs-based)
+            // This avoids the multinomial NYI issue that occurs with degenerate probabilities
+            var dist = distributions.Categorical(logits: logits);
+            
+            // Use sample() with explicit fallback for edge cases
+            Tensor actionsTensor;
+            try
+            {
+                actionsTensor = dist.sample();
+            }
+            catch
+            {
+                // Fallback: if multinomial fails, use argmax (greedy action)
+                actionsTensor = logits.argmax(dim: 1);
+            }
             var logProbsTensor = dist.log_prob(actionsTensor);
 
             var actionsData = actionsTensor.data<long>().ToArray();

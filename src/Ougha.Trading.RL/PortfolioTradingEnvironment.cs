@@ -38,6 +38,12 @@ public class PortfolioTradingEnvironment
     
     // Economic calendar service for news/event features
     private readonly EconomicCalendarService _newsService;
+    
+    // Cross-symbol correlation service
+    private readonly CorrelationService _correlationService;
+    
+    // Portfolio exposure service
+    private readonly PortfolioExposureService _exposureService;
 
     private int _currentTick;
     private double _peakEquity;
@@ -101,6 +107,12 @@ public class PortfolioTradingEnvironment
         
         // Initialize economic calendar service
         _newsService = new EconomicCalendarService();
+        
+        // Initialize correlation service
+        _correlationService = new CorrelationService();
+        
+        // Initialize portfolio exposure service
+        _exposureService = new PortfolioExposureService();
     }
 
     /// <summary>
@@ -518,6 +530,34 @@ public class PortfolioTradingEnvironment
             newsFeatures = _newsService.BuildNewsFeatures(_executor.CurrentTime, _config.Symbols);
         }
         catch { /* Ignore news calculation errors */ }
+        
+        // Build correlation features
+        float[]? correlationFeatures = null;
+        try
+        {
+            var currentPrices = new Dictionary<string, double>();
+            foreach (var sym in _config.Symbols)
+            {
+                var price = _executor.GetBid(sym);
+                if (price > 0)
+                    currentPrices[sym] = price;
+            }
+            if (currentPrices.Count > 0)
+                correlationFeatures = _correlationService.BuildCorrelationFeatures(currentPrices, _config.Symbols);
+        }
+        catch { /* Ignore correlation calculation errors */ }
+        
+        // Build portfolio exposure features
+        float[]? portfolioExposure = null;
+        try
+        {
+            var positions = _executor.GetPositions().ToList();
+            var equity = _executor.GetEquity();
+            var freeMargin = _executor.GetFreeMargin();
+            var usedMargin = equity - freeMargin;
+            portfolioExposure = _exposureService.BuildExposureFeatures(positions, equity, freeMargin, usedMargin, _config.Symbols.Length * 2);
+        }
+        catch { /* Ignore exposure calculation errors */ }
 
         return mtfBuilder.BuildAgentInput(
             symbol: symbol,
@@ -525,8 +565,8 @@ public class PortfolioTradingEnvironment
             riskState: riskState,
             closedTimeframes: closedTfs,
             newsFeatures: newsFeatures,
-            correlationFeatures: null,
-            portfolioExposure: null,
+            correlationFeatures: correlationFeatures,
+            portfolioExposure: portfolioExposure,
             dxyFeatures: dxyFeatures
         );
     }
@@ -561,6 +601,12 @@ public class PortfolioTradingEnvironment
         
         // Reset news service
         _newsService.Reset();
+        
+        // Reset correlation service
+        _correlationService.Reset();
+        
+        // Reset exposure service
+        _exposureService.Reset();
 
         return Task.FromResult(new float[StateSize]);
     }

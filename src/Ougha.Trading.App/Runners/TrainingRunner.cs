@@ -233,7 +233,6 @@ public static class TrainingRunner
                             
                             if (nextEnv.ChunkIndex != lastChunkIndex)
                             {
-                                AnsiConsole.MarkupLine($"[cyan]Switched to chunk {nextEnv.ChunkIndex}/{envPool.TotalChunks}[/]");
                                 lastChunkIndex = nextEnv.ChunkIndex;
                                 stats.CurrentChunk = lastChunkIndex;
                                 stats.ChunkStartDate = nextEnv.ChunkStartDate;
@@ -361,9 +360,11 @@ public static class TrainingRunner
                     }
 
 
+
                     if (trainingTask != null)
                     {
                         await trainingTask;
+                        stats.TrainCalls++;
                         trainingTask = null;
                     }
 
@@ -399,18 +400,33 @@ public static class TrainingRunner
                             symbolReward = reward;
 
                         symStats.TotalReward += symbolReward;
+                        
+                        // Track reward trend
+                        symStats.PrevEpisodeReward = symStats.LastEpisodeReward;
+                        symStats.LastEpisodeReward = symbolReward;
+                        
+                        // Cumulative stats for display
+                        var symbolTrades = allResults.TradeLog.Where(t => t.Symbol == symbol).ToList();
+                        var grossProfit = symbolTrades.Where(t => t.Profit > 0).Sum(t => t.Profit);
+                        var grossLoss = Math.Abs(symbolTrades.Where(t => t.Profit < 0).Sum(t => t.Profit));
+                        var episodeWins = symbolTrades.Count(t => t.Profit > 0);
+                        var episodeLosses = symbolTrades.Count(t => t.Profit <= 0);
+                        var buys = symbolTrades.Count(t => t.Type == Core.Models.TradeType.Buy);
+                        var sells = symbolTrades.Count(t => t.Type == Core.Models.TradeType.Sell);
+                        
+                        symStats.CumulativeTrades += symbolTrades.Count;
+                        symStats.CumulativeWins += episodeWins;
+                        symStats.CumulativeLosses += episodeLosses;
+                        symStats.CumulativeProfit += grossProfit;
+                        symStats.CumulativeLoss += grossLoss;
+                        symStats.CumulativeBuys += buys;
+                        symStats.CumulativeSells += sells;
 
                         if (symbolReward > symStats.BestReward)
                         {
                             symStats.BestReward = symbolReward;
-
-                            var symbol1 = symbol;
-                            var symbolTrades = allResults.TradeLog.Where(t => t.Symbol == symbol1).ToList();
-                            var grossProfit = symbolTrades.Where(t => t.Profit > 0).Sum(t => t.Profit);
-                            var grossLoss = Math.Abs(symbolTrades.Where(t => t.Profit < 0).Sum(t => t.Profit));
                             symStats.BestProfitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 999.0 : 0.0;
-                            var wins = symbolTrades.Count(t => t.Profit > 0);
-                            symStats.BestWinRate = symbolTrades.Count > 0 ? (double)wins / symbolTrades.Count * 100 : 0;
+                            symStats.BestWinRate = symbolTrades.Count > 0 ? (double)episodeWins / symbolTrades.Count * 100 : 0;
                             symStats.BestTrades = symbolTrades.Count;
                         }
 
@@ -439,11 +455,12 @@ public static class TrainingRunner
                         agent.Save(checkpointPath);
                     }
 
-                    if (shouldStop)
-                    {
-                        AnsiConsole.MarkupLine($"[yellow]Early stopping triggered at episode {ep}[/]");
-                        break;
-                    }
+                    // Early stop disabled - train for full episodes
+                    // if (shouldStop)
+                    // {
+                    //     AnsiConsole.MarkupLine($"[yellow]Early stopping triggered at episode {ep}[/]");
+                    //     break;
+                    // }
                 }
                 
             });
