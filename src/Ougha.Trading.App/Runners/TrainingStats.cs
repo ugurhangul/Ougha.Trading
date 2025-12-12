@@ -130,10 +130,10 @@ public class TrainingStats
 
     public void StartStepTimer() => _stepTimer.Restart();
 
-    public void EndStepTimer()
+    public void EndStepTimer(int stepsTaken = 1)
     {
         _stepTimer.Stop();
-        Interlocked.Increment(ref _stepCount);
+        Interlocked.Add(ref _stepCount, stepsTaken);
         lock (_lock)
         {
             _totalStepTime += _stepTimer.Elapsed.TotalSeconds;

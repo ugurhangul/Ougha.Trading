@@ -220,8 +220,6 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     /// </summary>
     private Tensor ApplyCrossSymbolAttention(Tensor hidden)
     {
-        var batchSize = hidden.shape[0];
-        
         // Reshape to sequence format: [1, BatchSize, HiddenDim] for attention
         // This treats the batch as a sequence where each symbol is a token
         var symbolSeq = hidden.unsqueeze(0);  // [1, B, H]

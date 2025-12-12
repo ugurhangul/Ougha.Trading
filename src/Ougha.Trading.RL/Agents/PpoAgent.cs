@@ -22,36 +22,22 @@ public class PpoAgent : IAgent
     private readonly int _updateEpochs;
     private readonly int _batchSize;
     
-    private List<Experience> _rolloutBuffer = [];
-    private readonly Lock _bufferLock = new();
+    private readonly AsyncRolloutBuffer _rolloutBuffer;
     private readonly int _rolloutHorizon;
+    private readonly int _newsFeatureSize;
+    private readonly float[] _zeroNews;
     
     private float _lastLogProb;
 
     private const int MAX_INFERENCE_BATCH = 64;
     private const int WINDOW_SIZE = 20;
     private const int NUM_FEATURES = 45;
+    private const int GAE_CHUNK_SIZE = 1024; // 4x larger for fewer forward passes
     private readonly long[] _symbolBuffer = new long[MAX_INFERENCE_BATCH];
 
     private readonly float[]? _packedTfBuffer;
     private readonly float[]? _packedFeatBuffer;
-    
-    // LR Scheduling
-    private readonly float _baseLr;
-    private int _updateCount;
-    private int _totalExpectedUpdates;
-    
-    // KL Adaptive Clipping
-    private const float TargetKl = 0.015f;
-    private const float ClipMin = 0.1f;
-    private const float ClipMax = 0.3f;
-    
-    // NaN tracking
-    private int _nanCount;
-    
-    // Metrics
-    private PpoMetrics _lastMetrics = new();
-    
+ 
     public PpoAgent(int batchSize = 256,
         int rolloutHorizon = 4096,
         float gamma = 0.99f,
@@ -60,7 +46,7 @@ public class PpoAgent : IAgent
         float learningRate = 3e-4f,
         int updateEpochs = 10,
         bool useCuda = false,
-        int totalExpectedUpdates = 10000)
+        int newsFeatureSize = 17)
     {
         _batchSize = batchSize;
         _rolloutHorizon = rolloutHorizon;
@@ -70,11 +56,9 @@ public class PpoAgent : IAgent
         _valueCoef = 0.5f;
         _entropyCoef = 0.1f;
         _minEntropyCoef = 0.01f;
-        _updateEpochs = updateEpochs;
+        _updateEpochs = 4; // Reduced from 10 for faster training
         
         // LR Scheduling
-        _baseLr = learningRate;
-        _totalExpectedUpdates = totalExpectedUpdates;
 
         var cudaAvailable = cuda.is_available();
         _device = useCuda && cudaAvailable ? CUDA : CPU;
@@ -89,8 +73,16 @@ public class PpoAgent : IAgent
         
         _optimizer = optim.Adam(_model.parameters(), lr: learningRate);
 
+        _rolloutBuffer = new AsyncRolloutBuffer(rolloutHorizon);
+
+        _newsFeatureSize = newsFeatureSize;
+        _zeroNews = new float[newsFeatureSize];
+        
+        // totalFeatures = 5 + 10 + 5 + 9 + newsFeatureSize + 20 + 12
+        var totalFeatures = 5 + 10 + 5 + 9 + _newsFeatureSize + 20 + 12;
+        
         _packedTfBuffer = new float[MAX_INFERENCE_BATCH * 5 * WINDOW_SIZE * NUM_FEATURES];
-        _packedFeatBuffer = new float[MAX_INFERENCE_BATCH * 77];
+        _packedFeatBuffer = new float[MAX_INFERENCE_BATCH * totalFeatures];
     }
 
     public void SyncInferenceNetwork()
@@ -177,18 +169,15 @@ public class PpoAgent : IAgent
 
     private void AddExperienceWithLogProb(AgentInput state, int action, float reward, AgentInput? nextState, bool done, float logProb)
     {
-        lock (_bufferLock)
+        _rolloutBuffer.AddExperience(new Experience
         {
-            _rolloutBuffer.Add(new Experience
-            {
-                State = state,
-                Action = action,
-                Reward = reward,
-                NextState = nextState,
-                Done = done,
-                Priority = logProb
-            });
-        }
+            State = state,
+            Action = action,
+            Reward = reward,
+            NextState = nextState,
+            Done = done,
+            Priority = logProb
+        });
     }
 
     public void AddExperienceBatch(
@@ -209,45 +198,41 @@ public class PpoAgent : IAgent
         bool[] dones,
         float[] logProbs)
     {
-        lock (_bufferLock)
+        var experiences = new Experience[states.Length];
+        for (var i = 0; i < states.Length; i++)
         {
-            for (var i = 0; i < states.Length; i++)
+            experiences[i] = new Experience
             {
-                _rolloutBuffer.Add(new Experience
-                {
-                    State = states[i],
-                    Action = actions[i],
-                    Reward = rewards[i],
-                    NextState = nextStates[i],
-                    Done = dones[i],
-                    Priority = logProbs[i]
-                });
-            }
+                State = states[i],
+                Action = actions[i],
+                Reward = rewards[i],
+                NextState = nextStates[i],
+                Done = dones[i],
+                Priority = logProbs[i]
+            };
         }
+        _rolloutBuffer.AddExperienceBatch(experiences);
     }
 
     public float Train()
     {
-        List<Experience> bufferToTrain;
-
-        lock(_bufferLock)
-        {
-            if (_rolloutBuffer.Count < _rolloutHorizon)
-                return 0f;
-                
-            bufferToTrain = _rolloutBuffer;
-            _rolloutBuffer = new List<Experience>();
-        }
+        // Check if a rollout is ready (non-blocking)
+        var rollout = _rolloutBuffer.TryGetRollout();
+        if (rollout == null)
+            return 0f;
             
-        return UpdatePpo(bufferToTrain);
+        return UpdatePpo(rollout);
     }
     
     public float TrainStep() => Train();
     public float TrainMultipleBatches(int batches) => Train();
 
-    private float UpdatePpo(List<Experience> rollouts)
+    private float UpdatePpo(Experience[] rollouts)
     {
-        var states = rollouts.Select(e => e.State).ToArray();
+        var T = rollouts.Length;
+        var states = new AgentInput[T];
+        for (var i = 0; i < T; i++)
+            states[i] = rollouts[i].State;
 
         var (advantages, returns) = ComputeGae(rollouts, states);
 
@@ -257,16 +242,31 @@ public class PpoAgent : IAgent
         _model.train();
         float totalLoss = 0;
         var steps = 0;
+        
+        // Pre-compute all tensors once to avoid repeated creation during epochs
+        // This is a major optimization: instead of 4 epochs × 16 batches = 64 tensor preps,
+        // we do 1 full tensor prep and then slice by index
+        var allStateTensors = PrepareInputTensors(dataset.States);
+        var allActions = tensor(dataset.Actions, dtype: ScalarType.Int64, device: _device);
+        var allLogProbs = tensor(dataset.LogProbs, dtype: ScalarType.Float32, device: _device);
+        var allReturns = tensor(dataset.Returns, dtype: ScalarType.Float32, device: _device);
+        var allAdvantages = tensor(dataset.Advantages, dtype: ScalarType.Float32, device: _device);
 
         for (var epoch = 0; epoch < _updateEpochs; epoch++)
         {
             foreach (var batch in loader)
             {
-                var stateTensors = PrepareInputTensors(batch.States);
-                var actions = tensor(batch.Actions, dtype: ScalarType.Int64, device: _device);
-                var oldLogProbs = tensor(batch.LogProbs, dtype: ScalarType.Float32, device: _device);
-                var returnsTensor = tensor(batch.Returns, dtype: ScalarType.Float32, device: _device);
-                var advs = tensor(batch.Advantages, dtype: ScalarType.Float32, device: _device);
+                // Use pre-cached indices to slice from pre-computed tensors
+                var batchIndices = tensor(batch.Indices, dtype: ScalarType.Int64, device: _device);
+                
+                var stateTensors = new Tensor[allStateTensors.Length];
+                for (var t = 0; t < allStateTensors.Length; t++)
+                    stateTensors[t] = allStateTensors[t].index_select(0, batchIndices);
+                
+                var actions = allActions.index_select(0, batchIndices);
+                var oldLogProbs = allLogProbs.index_select(0, batchIndices);
+                var returnsTensor = allReturns.index_select(0, batchIndices);
+                var advs = allAdvantages.index_select(0, batchIndices);
 
                 advs = (advs - advs.mean()) / (advs.std() + 1e-8f);
                 
@@ -300,22 +300,40 @@ public class PpoAgent : IAgent
         return steps > 0 ? totalLoss / steps : 0;
     }
 
-    private (float[] Advantages, float[] Returns) ComputeGae(List<Experience> rollouts, AgentInput[] states)
+    private (float[] Advantages, float[] Returns) ComputeGae(Experience[] rollouts, AgentInput[] states)
     {
-        var T = rollouts.Count;
+        var T = rollouts.Length;
         var advantages = new float[T];
         var returns = new float[T];
 
         var values = new float[T + 1];
-        var chunkSize = 256;
         
         using (no_grad())
         {
             _model.eval();
-            for (var i = 0; i < T; i += chunkSize)
+            
+            // Pre-allocate chunk array to avoid repeated allocations
+            var chunkBuffer = new AgentInput[GAE_CHUNK_SIZE];
+            
+            for (var i = 0; i < T; i += GAE_CHUNK_SIZE)
             {
-                var len = Math.Min(chunkSize, T - i);
-                var chunk = states.Skip(i).Take(len).ToArray();
+                var len = Math.Min(GAE_CHUNK_SIZE, T - i);
+                
+                // Use Array.Copy instead of LINQ Skip/Take to avoid allocations
+                Array.Copy(states, i, chunkBuffer, 0, len);
+                
+                // Create view of correct length (avoid processing garbage in buffer)
+                AgentInput[] chunk;
+                if (len == GAE_CHUNK_SIZE)
+                {
+                    chunk = chunkBuffer;
+                }
+                else
+                {
+                    chunk = new AgentInput[len];
+                    Array.Copy(chunkBuffer, chunk, len);
+                }
+                
                 var tensors = PrepareInputTensors(chunk);
                 var (_, v, _) = _model.forward(tensors);
                 var vData = v.cpu().data<float>().ToArray();
@@ -350,12 +368,14 @@ public class PpoAgent : IAgent
 
     public void Save(string path) => _model.save(path);
     public void Load(string path) => _model.load(path);
+    
+    public bool HasPendingRollout() => _rolloutBuffer.HasReadyRollout();
+    public int GetPendingRolloutsCount() => _rolloutBuffer.PendingRolloutsCount;
+    public int GetActiveBufferCount() => _rolloutBuffer.ActiveBufferCount;
+    
     public void ResetOnlineLearning()
     {
-        lock (_bufferLock)
-        {
-            _rolloutBuffer.Clear();
-        }
+        _rolloutBuffer.Reset();
     }
     public void DecayEpsilon()
     {
@@ -415,7 +435,7 @@ public class PpoAgent : IAgent
         tensors[1] = tensor(symBuffer, new long[] { batchSize, 1 }, 
             dtype: ScalarType.Int64, device: _device);
 
-        const int totalFeatures = 5 + 10 + 5 + 9 + 16 + 20 + 12;
+        var totalFeatures = 5 + 10 + 5 + 9 + _newsFeatureSize + 20 + 12;
         var featTotalLen = batchSize * totalFeatures;
         var featPackedBuffer = usePreallocated && _packedFeatBuffer != null 
             ? _packedFeatBuffer 
@@ -430,7 +450,7 @@ public class PpoAgent : IAgent
             CopyFeatures(featPackedBuffer, offset, inp.ConfluenceFeatures, 10); offset += 10;
             CopyFeatures(featPackedBuffer, offset, inp.PortfolioFeatures, 5); offset += 5;
             CopyFeatures(featPackedBuffer, offset, inp.RiskState, 9); offset += 9;
-            CopyFeatures(featPackedBuffer, offset, inp.NewsFeatures ?? ZeroNews, 16); offset += 16;
+            CopyFeatures(featPackedBuffer, offset, inp.NewsFeatures ?? _zeroNews, _newsFeatureSize); offset += _newsFeatureSize;
             CopyFeatures(featPackedBuffer, offset, inp.CorrelationFeatures ?? ZeroCorrelation, 20); offset += 20;
             CopyFeatures(featPackedBuffer, offset, inp.PortfolioExposure ?? ZeroExposure, 12);
         }
@@ -450,7 +470,6 @@ public class PpoAgent : IAgent
         }
     }
 
-    private static readonly float[] ZeroNews = new float[16];
     private static readonly float[] ZeroCorrelation = new float[20];
     private static readonly float[] ZeroExposure = new float[12];
 
@@ -471,9 +490,9 @@ internal class PpoDataset
     public readonly float[] Advantages;
     public readonly float[] Returns;
     
-    public PpoDataset(List<Experience> rollouts, float[] advantages, float[] returns)
+    public PpoDataset(Experience[] rollouts, float[] advantages, float[] returns)
     {
-        var n = rollouts.Count;
+        var n = rollouts.Length;
         States = new AgentInput[n];
         Actions = new int[n];
         LogProbs = new float[n];
@@ -515,6 +534,7 @@ internal class DataLoader(PpoDataset ds, int batch, bool shuffle)
 
              var batch1 = new PpoBatch
              {
+                 Indices = batchIndices,
                  States = new AgentInput[len],
                  Actions = new int[len],
                  LogProbs = new float[len],
@@ -538,6 +558,7 @@ internal class DataLoader(PpoDataset ds, int batch, bool shuffle)
 }
 
 internal struct PpoBatch {
+    public int[] Indices;
     public AgentInput[] States;
     public int[] Actions;
     public float[] LogProbs;

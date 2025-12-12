@@ -108,7 +108,8 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
                 (double)info.trade_tick_size,
                 (string)info.currency_base,
                 (string)info.currency_profit,
-                (int)info.digits
+                (int)info.digits,
+                (double)info.volume_min
             );
         }
     }

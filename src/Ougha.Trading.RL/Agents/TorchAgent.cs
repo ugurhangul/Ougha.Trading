@@ -45,7 +45,7 @@ public class TorchAgent : IAgent
     private readonly float[] _trainConfluenceBuffer = new float[64 * 10];
     private readonly float[] _trainPortfolioBuffer = new float[64 * 5];
     private readonly float[] _trainRiskBuffer = new float[64 * 9];
-    private readonly float[] _trainNewsBuffer = new float[64 * 16];
+    private float[] _trainNewsBuffer;
     private readonly float[] _trainCorrelationBuffer = new float[64 * 20];
     private readonly float[] _trainExposureBuffer = new float[64 * 12];
 
@@ -54,9 +54,11 @@ public class TorchAgent : IAgent
     private readonly float[] _inferenceConfluenceBuffer = new float[64 * 10];
     private readonly float[] _inferencePortfolioBuffer = new float[64 * 5];
     private readonly float[] _inferenceRiskBuffer = new float[64 * 9];
-    private readonly float[] _inferenceNewsBuffer = new float[64 * 16];
+    private float[] _inferenceNewsBuffer;
     private readonly float[] _inferenceCorrelationBuffer = new float[64 * 20];
     private readonly float[] _inferenceExposureBuffer = new float[64 * 12];
+    
+    private readonly int _newsFeatureSize;
     
     public TorchAgent(
         int batchSize = 64,
@@ -66,7 +68,8 @@ public class TorchAgent : IAgent
         float epsilonDecay = 0.995f,
         int targetUpdateFreq = 1000,
         int bufferSize = 100000,
-        bool useCuda = false)
+        bool useCuda = false,
+        int newsFeatureSize = 17)
     {
         _batchSize = batchSize;
         _gamma = gamma;
@@ -104,6 +107,10 @@ public class TorchAgent : IAgent
 
         _trainTfBatchBuffers = CreateTfBuffers();
         _inferenceTfBatchBuffers = CreateTfBuffers();
+        
+        _newsFeatureSize = newsFeatureSize;
+        _trainNewsBuffer = new float[64 * newsFeatureSize];
+        _inferenceNewsBuffer = new float[64 * newsFeatureSize];
     }
 
     private Dictionary<string, float[]> CreateTfBuffers()
@@ -504,9 +511,9 @@ public class TorchAgent : IAgent
         tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.RiskState, 9, batchSize <= 64 ? riskBuffer : null);
 
         if (inputs[0].NewsFeatures != null)
-            tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.NewsFeatures!, 16, batchSize <= 64 ? newsBuffer : null);
+            tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.NewsFeatures!, inputs[0].NewsFeatures.Length, batchSize <= 64 ? newsBuffer : null);
         else
-            tensors[tensorIdx++] = zeros(new long[] { batchSize, 16 }, device: _device);
+            tensors[tensorIdx++] = zeros(new long[] { batchSize, _newsFeatureSize }, device: _device);
 
         if (inputs[0].CorrelationFeatures != null)
             tensors[tensorIdx++] = BatchFloatArrayOptimized(inputs, i => i.CorrelationFeatures!, 20, batchSize <= 64 ? correlationBuffer : null);

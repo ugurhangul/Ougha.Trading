@@ -1,3 +1,5 @@
+using Ougha.Trading.Data.Services;
+
 namespace Ougha.Trading.RL;
 
 /// <summary>
@@ -11,6 +13,12 @@ public record PortfolioEnvironmentConfig(
     double MaxLossPercent = 50.0,
     int ActionMemoryWindow = 1050)
 {
+    /// <summary>
+    /// Dynamic news feature size based on symbol count.
+    /// Formula: (symbols * 4) + 1
+    /// </summary>
+    public int NewsFeatureSize => EconomicCalendarService.GetNewsFeatureSize(Symbols.Length);
+    
     /// <summary>
     /// Creates a portfolio config from a comma-separated symbol string.
     /// </summary>

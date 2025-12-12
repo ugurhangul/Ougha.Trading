@@ -8,8 +8,6 @@ namespace Ougha.Trading.Data.Services;
 /// </summary>
 public class SymbolInfoService
 {
-
-
     private readonly ISymbolInfoProvider? _provider;
     private readonly Dictionary<string, SymbolInfo> _cache = new();
 
@@ -20,7 +18,6 @@ public class SymbolInfoService
     {
         _provider = provider;
     }
-
 
     /// <summary>
     /// Get symbol info from the provider if available, otherwise infer from the symbol name.
@@ -36,7 +33,6 @@ public class SymbolInfoService
         if (_cache.TryGetValue(symbol, out var cached))
             return cached;
 
-
         try
         {
             var info = _provider.GetSymbolInfo(symbol);
@@ -50,5 +46,4 @@ public class SymbolInfoService
             throw;
         }
     }
-
 }

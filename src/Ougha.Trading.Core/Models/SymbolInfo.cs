@@ -8,4 +8,5 @@ public record SymbolInfo(
     double TickSize,
     string BaseCurrency,
     string ProfitCurrency,
-    int Digits);
+    int Digits,
+    double MinLotSize = 0.01);

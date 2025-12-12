@@ -285,7 +285,7 @@ public class OnnxAgent : IAgent
 
         AddFloatTensorIfExists(inputs, "input_risk_state", input.RiskState, 9);
 
-        AddFloatTensorIfExists(inputs, "input_news", input.NewsFeatures, 16);
+        AddFloatTensorIfExists(inputs, "input_news", input.NewsFeatures, input.NewsFeatures?.Length ?? NEWS_FEATURE_DIM);
 
         AddFloatTensorIfExists(inputs, "input_correlation", input.CorrelationFeatures, CORRELATION_FEATURE_DIM);
 

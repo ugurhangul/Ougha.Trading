@@ -96,7 +96,8 @@ public static class BacktestRunner
                 epsilon: 0.5f, epsilonMin: 0.05f,
                 epsilonDecay: 0.999f,
                 bufferSize: 10000,
-                useCuda: useCuda
+                useCuda: useCuda,
+                newsFeatureSize: portfolioConfig.NewsFeatureSize
             );
             agent.ResetOnlineLearning();
             AnsiConsole.MarkupLine("[green]TorchAgent ready for online learning (state reset)![/]");

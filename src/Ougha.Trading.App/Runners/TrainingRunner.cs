@@ -45,6 +45,7 @@ public class EarlyStopTracker(int patience = 300, int minEpisodes = 500, int win
 
 public static class TrainingRunner
 {
+
     public static async Task RunAsync(string symbolArg, int? episodes, IConfiguration config)
     {
         var symbols = symbolArg.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
@@ -121,6 +122,12 @@ public static class TrainingRunner
         var mt5Executor = new Mt5Executor(config);
         var symbolService = new SymbolInfoService(mt5Executor);
 
+        // Pre-fetch all economic calendar events for the entire training period
+        AnsiConsole.MarkupLine("[grey]Pre-fetching economic calendar events...[/]");
+        var calendarService = new EconomicCalendarService();
+        await calendarService.LoadEventsAsync(startDate, endDate);
+        AnsiConsole.MarkupLine("[grey]Economic calendar events loaded.[/]");
+
         var symbolInfo = new Dictionary<string, SymbolInfo>();
         foreach (var sym in symbols)
         {
@@ -148,7 +155,7 @@ public static class TrainingRunner
         envPool.StartPrefetching();
         AnsiConsole.MarkupLine($"[grey]Environment pool started with {envPoolConfig.PoolSize} prefetch slots[/]");
 
-        using var agent = CreateAgent(config, budget, batchSize, bufferSize);
+        using var agent = CreateAgent(config, budget, batchSize, bufferSize, envConfig.NewsFeatureSize);
 
         var earlyStop = new EarlyStopTracker(
             patience: budget.EarlyStopPatience,
@@ -169,7 +176,7 @@ public static class TrainingRunner
             IsPpoAgent = agent is PpoAgent,
             TotalChunks = envPool.TotalChunks
         };
-
+        
         foreach (var sym in symbols) stats.GetOrCreateSymbolStats(sym);
 
         await AnsiConsole.Live(TrainingDisplay.BuildDisplay(stats, budget))
@@ -245,13 +252,13 @@ public static class TrainingRunner
                     var symbolRewards = new Dictionary<string, double>();
                     foreach (var sym in symbols) symbolRewards[sym] = 0;
 
+                    // M1-based decision loop: decide once per minute, step S1 internally
                     while (!done && step < trainMaxSteps)
                     {
-                        step++;
                         stats.CurrentStep = step;
-                        stats.TotalSteps++;
                         stats.StartStepTimer();
 
+                        // Get action at M1 decision point
                         actionTimer.Restart();
                         var (actions, tpSlMults, logProbs) = agent.ActBatchWithTpSlAndLogProbs(stateInputs, training: true);
                         foreach (var a in actions) stats.RecordAction(a);
@@ -266,11 +273,15 @@ public static class TrainingRunner
                             stats.CurrentSymbol = symbols[0];
                         }
 
+                        // Step until M1 closes (accumulates ~60 S1 steps internally)
                         envTimer.Restart();
-                        var (nextStates, rewards, dones) = await env.StepTrainingAsync(actions);
+                        var (nextStates, rewards, dones, stepsTaken) = await env.StepUntilM1CloseAsync(actions);
                         envTimer.Stop();
                         stats.EnvStepTimeMs = envTimer.Elapsed.TotalMilliseconds;
 
+                        // Update step counter with actual S1 steps taken
+                        step += stepsTaken;
+                        stats.TotalSteps += stepsTaken;
 
                         var episodeDone = dones.All(d => d);
 
@@ -279,6 +290,7 @@ public static class TrainingRunner
                         var doneFlags = new bool[stateInputs.Length];
                         Array.Fill(doneFlags, episodeDone);
 
+                        // Add experience with accumulated M1 rewards
                         agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs);
 
                         for (var i = 0; i < stateInputs.Length; i++)
@@ -311,8 +323,13 @@ public static class TrainingRunner
 
                         if (trainingTask == null && step % budget.TrainFreq == 0)
                         {
-                            var bufferCount = GetBufferSize(agent);
-                            if (bufferCount >= batchSize)
+                            var shouldTrain = agent switch
+                            {
+                                PpoAgent ppo => ppo.HasPendingRollout(),
+                                _ => GetBufferSize(agent) >= batchSize
+                            };
+                            
+                            if (shouldTrain)
                             {
                                 trainTimer.Restart();
 
@@ -327,7 +344,7 @@ public static class TrainingRunner
                             }
                         }
 
-                        stats.EndStepTimer();
+                        stats.EndStepTimer(stepsTaken);
                         stateInputs = nextStates;
 
                         done = episodeDone;
@@ -473,13 +490,9 @@ public static class TrainingRunner
             var countProp = buffer.GetType().GetProperty("Count");
             return (int)(countProp?.GetValue(buffer) ?? 0);
         }
-        else if (agent is PpoAgent)
+        else if (agent is PpoAgent ppo)
         {
-            var field = typeof(PpoAgent).GetField("_rolloutBuffer", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var buffer = field?.GetValue(agent);
-            if (buffer == null) return 0;
-            var list = buffer as System.Collections.IList;
-            return list?.Count ?? 0;
+            return ppo.GetActiveBufferCount();
         }
 
         return 0;
@@ -496,7 +509,7 @@ public static class TrainingRunner
         };
     }
     
-    private static IAgent CreateAgent(IConfiguration config, TrainingBudget budget, int batchSize, int bufferSize)
+    private static IAgent CreateAgent(IConfiguration config, TrainingBudget budget, int batchSize, int bufferSize, int newsFeatureSize)
     {
         var strategy = config.GetValue<string>("Training:Strategy", "DQN");
 
@@ -513,7 +526,7 @@ public static class TrainingRunner
                 gamma: 0.99f,
                 learningRate: 3e-4f,
                 useCuda: budget.Hardware.GpuAvailable,
-                totalExpectedUpdates: Math.Max(1000, expectedRollouts)
+                newsFeatureSize: newsFeatureSize
             );
         }
         else
@@ -526,7 +539,8 @@ public static class TrainingRunner
                 epsilonMin: 0.01f,
                 epsilonDecay: (float)budget.EpsilonDecay,
                 bufferSize: bufferSize,
-                useCuda: budget.Hardware.GpuAvailable
+                useCuda: budget.Hardware.GpuAvailable,
+                newsFeatureSize: newsFeatureSize
             );
         }
     }

@@ -10,29 +10,71 @@ namespace Ougha.Trading.RL.Training;
 /// Flow:
 /// 1. Buffer A collects experiences while Buffer B trains
 /// 2. When A is full, swap roles
-/// 3. This overlaps rollout collection with gradient updates
+/// 3. This overlaps a rollout collection with gradient updates
 /// </summary>
-public class AsyncRolloutBuffer
+public class AsyncRolloutBuffer(int capacity, int maxPendingRollouts = 4)
 {
-    private readonly int _capacity;
-    private readonly Channel<Experience[]> _readyRollouts;
+    private readonly Channel<Experience[]> _readyRollouts = Channel.CreateBounded<Experience[]>(
+        new BoundedChannelOptions(maxPendingRollouts)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+            SingleReader = true,
+            SingleWriter = false
+        });
     
     private List<Experience> _activeBuffer = [];
     private readonly Lock _bufferLock = new();
     
     public int ActiveBufferCount => _activeBuffer.Count;
     public int PendingRolloutsCount => _readyRollouts.Reader.Count;
-    
-    public AsyncRolloutBuffer(int capacity, int maxPendingRollouts = 2)
+
+    /// <summary>
+    /// Add an experience to the active buffer (synchronous, non-blocking).
+    /// When buffer reaches capacity, it's sent to the training channel.
+    /// </summary>
+    public void AddExperience(Experience experience)
     {
-        _capacity = capacity;
-        _readyRollouts = Channel.CreateBounded<Experience[]>(
-            new BoundedChannelOptions(maxPendingRollouts)
+        Experience[]? rollout = null;
+        
+        lock (_bufferLock)
+        {
+            _activeBuffer.Add(experience);
+            
+            if (_activeBuffer.Count >= capacity)
             {
-                FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = true,
-                SingleWriter = true
-            });
+                rollout = [.. _activeBuffer];
+                _activeBuffer = [];
+            }
+        }
+        
+        if (rollout != null)
+        {
+            _readyRollouts.Writer.TryWrite(rollout);
+        }
+    }
+    
+    /// <summary>
+    /// Add a batch of experiences (synchronous, non-blocking)
+    /// </summary>
+    public void AddExperienceBatch(IEnumerable<Experience> experiences)
+    {
+        Experience[]? rollout = null;
+        
+        lock (_bufferLock)
+        {
+            _activeBuffer.AddRange(experiences);
+            
+            if (_activeBuffer.Count >= capacity)
+            {
+                rollout = [.. _activeBuffer];
+                _activeBuffer = [];
+            }
+        }
+        
+        if (rollout != null)
+        {
+            _readyRollouts.Writer.TryWrite(rollout);
+        }
     }
     
     /// <summary>
@@ -41,22 +83,20 @@ public class AsyncRolloutBuffer
     /// </summary>
     public async ValueTask AddExperienceAsync(Experience experience)
     {
-        bool rolloutReady;
         Experience[]? rollout = null;
         
         lock (_bufferLock)
         {
             _activeBuffer.Add(experience);
-            rolloutReady = _activeBuffer.Count >= _capacity;
             
-            if (rolloutReady)
+            if (_activeBuffer.Count >= capacity)
             {
                 rollout = [.. _activeBuffer];
                 _activeBuffer = [];
             }
         }
         
-        if (rolloutReady && rollout != null)
+        if (rollout != null)
         {
             await _readyRollouts.Writer.WriteAsync(rollout);
         }
@@ -67,22 +107,20 @@ public class AsyncRolloutBuffer
     /// </summary>
     public async ValueTask AddExperienceBatchAsync(IEnumerable<Experience> experiences)
     {
-        bool rolloutReady;
         Experience[]? rollout = null;
         
         lock (_bufferLock)
         {
             _activeBuffer.AddRange(experiences);
-            rolloutReady = _activeBuffer.Count >= _capacity;
             
-            if (rolloutReady)
+            if (_activeBuffer.Count >= capacity)
             {
                 rollout = [.. _activeBuffer];
                 _activeBuffer = [];
             }
         }
         
-        if (rolloutReady && rollout != null)
+        if (rollout != null)
         {
             await _readyRollouts.Writer.WriteAsync(rollout);
         }

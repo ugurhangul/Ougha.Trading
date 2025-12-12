@@ -80,9 +80,9 @@ public class BacktestExecutor : IOrderExecutor
     }
 
     /// <summary>
-    /// Advance to next candle (synchronous, for non-streaming mode only).
+    /// Advance to the next candle (synchronous, for non-streaming mode only).
     /// </summary>
-    public bool Advance()
+    private bool Advance()
     {
         if (_isStreaming)
             throw new InvalidOperationException("Use AdvanceAsync() in streaming mode");
@@ -175,11 +175,14 @@ public class BacktestExecutor : IOrderExecutor
         var slippage = CalculateSlippage(symbol);
         price += type == TradeType.Buy ? slippage : -slippage;
 
+        // Use symbol's minimum lot size from SymbolInfo
+        var minLot = _symbolInfo.TryGetValue(symbol, out var symInfo) ? symInfo.MinLotSize : 0.01;
+        
         var position = new Position
         {
             Symbol = symbol,
             Type = type,
-            Volume = 0.01,
+            Volume = Math.Max(minLot, volume),
             OpenPrice = price,
             CurrentPrice = price,
             BestPrice = price,

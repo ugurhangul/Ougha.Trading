@@ -1,5 +1,3 @@
-using Ougha.Trading.Core.Models;
-
 namespace Ougha.Trading.Data.Services;
 
 /// <summary>
@@ -37,7 +35,7 @@ public class DxyIndexService
     /// <summary>
     /// Calculate synthetic DXY value from available forex pairs
     /// </summary>
-    public float CalculateSyntheticDxy(Dictionary<string, double> currentPrices)
+    private static float CalculateSyntheticDxy(Dictionary<string, double> currentPrices)
     {
         // Base DXY constant
         var dxy = 50.14348;
@@ -167,18 +165,21 @@ public class DxyIndexService
         if (_dxyHistory.Count < 5)
             return 0f;
         
-        var short_sma = _dxyHistory.TakeLast(5).Average();
-        var long_sma = _dxyHistory.TakeLast(Math.Min(20, _dxyHistory.Count)).Average();
+        var shortSma = _dxyHistory.TakeLast(5).Average();
+        var longSma = _dxyHistory.TakeLast(Math.Min(20, _dxyHistory.Count)).Average();
         
-        var diff = (short_sma - long_sma) / long_sma * 100f;
-        
-        if (diff > 0.1f) return 1f;      // Uptrend
-        if (diff < -0.1f) return -1f;    // Downtrend
-        return 0f;                        // Range
+        var diff = (shortSma - longSma) / longSma * 100f;
+
+        return diff switch
+        {
+            > 0.1f => 1f,
+            < -0.1f => -1f,
+            _ => 0f
+        };
     }
     
     /// <summary>
-    /// Reset service state (call at start of new episode)
+    /// Reset service state (call at start of new episodes)
     /// </summary>
     public void Reset()
     {

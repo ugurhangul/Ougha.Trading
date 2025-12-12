@@ -130,6 +130,57 @@ public class PortfolioTradingEnvironment
         return (nextStates, rewards, dones);
     }
 
+    /// <summary>
+    /// Step until M1 candle closes, accumulating rewards.
+    /// This is the optimized training method that makes decisions at M1 granularity
+    /// while maintaining S1 precision for SL/TP triggers.
+    /// </summary>
+    /// <param name="actions">Actions to hold throughout the M1 period</param>
+    /// <param name="maxSteps">Maximum S1 steps to take (safety limit)</param>
+    /// <returns>Accumulated rewards, done flags, next states, and number of S1 steps taken</returns>
+    public async Task<(AgentInput[] NextStates, float[] AccumulatedRewards, bool[] Dones, int StepsTaken)> 
+        StepUntilM1CloseAsync(int[] actions, int maxSteps = 120)
+    {
+        var symbolCount = _config.Symbols.Length;
+        var accumulatedRewards = new float[symbolCount];
+        var stepsTaken = 0;
+        
+        // Fast path: already done
+        if (_isDone)
+        {
+            var emptyRewards = symbolCount <= 8 ? EmptyRewards : new float[symbolCount];
+            var trueDones = symbolCount <= 8 ? DoneFlagsTrue : Enumerable.Repeat(true, symbolCount).ToArray();
+            return (_cachedAgentInputs ?? BuildAgentInputs(), emptyRewards, trueDones, 0);
+        }
+        
+        bool m1Closed;
+        bool episodeDone;
+        
+        do
+        {
+            // Step environment with same action
+            var (rewards, dones, m1CandleClosed) = await StepFastAsync(actions);
+            stepsTaken++;
+            
+            // Accumulate rewards across all S1 steps
+            for (var i = 0; i < symbolCount; i++)
+                accumulatedRewards[i] += rewards[i];
+            
+            m1Closed = m1CandleClosed;
+            episodeDone = dones.All(d => d) || _isDone;
+            
+        } while (!m1Closed && !episodeDone && stepsTaken < maxSteps);
+        
+        // Build next states (only at M1 boundaries)
+        var nextStates = BuildAgentInputs();
+        _cachedAgentInputs = nextStates;
+        
+        var finalDones = new bool[symbolCount];
+        if (_isDone) Array.Fill(finalDones, true);
+        
+        return (nextStates, accumulatedRewards, finalDones, stepsTaken);
+    }
+
 
     private AgentInput[]? _cachedAgentInputs;
     private static readonly float[] EmptyRewards = new float[8];
@@ -314,7 +365,7 @@ public class PortfolioTradingEnvironment
                 volume = Math.Max(0.01, Math.Min(volume, 100.0));
                 volume = Math.Round(volume, 2);
 
-                var result = await _executor.ExecuteAsync(symbol, entryType.Value, volume,
+                var result = await _executor.ExecuteAsync(symbol, entryType.Value, 0.1,
                     sl, tp, "RL Portfolio Agent", RiskLevel.Moderate);
 
                 if (result.Success)

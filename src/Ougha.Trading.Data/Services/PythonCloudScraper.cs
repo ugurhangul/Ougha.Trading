@@ -1,10 +1,12 @@
+using System.Globalization;
+using HtmlAgilityPack;
 using Python.Runtime;
 
 namespace Ougha.Trading.Data.Services;
 
 /// <summary>
-/// Scrapes Forex Factory using Python's cloudscraper library via Python.NET.
-/// This reliably bypasses Cloudflare protection.
+/// Scrapes Forex Factory using Python's cloudscraper library for HTTP (bypasses Cloudflare)
+/// and HtmlAgilityPack for HTML parsing.
 /// </summary>
 public class PythonCloudScraper : IDisposable
 {
@@ -14,13 +16,11 @@ public class PythonCloudScraper : IDisposable
     
     public PythonCloudScraper()
     {
-        if (!PythonEngine.IsInitialized)
-        {
-            Runtime.PythonDLL = PythonDll;
-            PythonEngine.Initialize();
-            PythonEngine.BeginAllowThreads();
-            _ownsGil = true;
-        }
+        if (PythonEngine.IsInitialized) return;
+        Runtime.PythonDLL = PythonDll;
+        PythonEngine.Initialize();
+        PythonEngine.BeginAllowThreads();
+        _ownsGil = true;
     }
     
     /// <summary>
@@ -28,179 +28,126 @@ public class PythonCloudScraper : IDisposable
     /// </summary>
     public Task<List<EconomicEvent>> ScrapeWeekAsync(DateTime weekStart)
     {
-        return Task.Run(() => ScrapeWeekSync(weekStart));
+        // Python.NET requires all operations on a consistent thread to avoid GIL corruption
+        var tcs = new TaskCompletionSource<List<EconomicEvent>>();
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var result = ScrapeWeekSync(weekStart);
+                tcs.SetResult(result);
+            }
+            catch (Exception ex)
+            {
+                tcs.SetException(ex);
+            }
+        })
+        {
+            IsBackground = true
+        };
+        thread.Start();
+        return tcs.Task;
     }
     
     private List<EconomicEvent> ScrapeWeekSync(DateTime weekStart)
     {
+        // Step 1: Fetch HTML using Python cloudscraper (bypasses Cloudflare)
+        var html = FetchHtmlWithPython(weekStart);
+        
+        if (string.IsNullOrEmpty(html))
+        {
+            Console.WriteLine("[PythonCloudScraper] Failed to fetch HTML");
+            return [];
+        }
+        
+        // Step 2: Parse HTML using HtmlAgilityPack (C#)
+        var events = ParseHtmlWithAgilityPack(html, weekStart);
+        Console.WriteLine($"[PythonCloudScraper] Found {events.Count} events");
+        return events;
+    }
+    
+    private string FetchHtmlWithPython(DateTime weekStart)
+    {
         using (Py.GIL())
         {
             try
             {
                 dynamic cloudscraper = Py.Import("cloudscraper");
-                dynamic bs4 = Py.Import("bs4");
-                dynamic scraper = cloudscraper.create_scraper();
+                var scraper = cloudscraper.create_scraper();
+                
+                var monthName = weekStart.ToString("MMM", CultureInfo.InvariantCulture).ToLower();
+                var url = $"https://www.forexfactory.com/calendar?week={monthName}{weekStart.Day}.{weekStart.Year}";
                 
                 Console.WriteLine($"[PythonCloudScraper] Fetching week of {weekStart:yyyy-MM-dd}...");
-                var events = ScrapeWeekSync(scraper, bs4, weekStart);
-                Console.WriteLine($"[PythonCloudScraper] Found {events.Count} events");
-                return events;
+                
+                using PyObject response = scraper.get(url, timeout: 30);
+                return response.GetAttr("text").ToString() ?? "";
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[PythonCloudScraper] Error: {ex.Message}");
-                return [];
+                Console.WriteLine($"[PythonCloudScraper] Fetch error: {ex.Message}");
+                return "";
             }
         }
     }
     
-    public Task<List<EconomicEvent>> ScrapeForexFactoryAsync(DateTime from, DateTime to)
-    {
-        // Run all Python operations synchronously in a background task
-        return Task.Run(() => ScrapeForexFactorySync(from, to));
-    }
-    
-    private List<EconomicEvent> ScrapeForexFactorySync(DateTime from, DateTime to)
+    private static List<EconomicEvent> ParseHtmlWithAgilityPack(string html, DateTime weekStart)
     {
         var events = new List<EconomicEvent>();
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
         
-        using (Py.GIL())
-        {
-            try
-            {
-                // Import cloudscraper and BeautifulSoup
-                dynamic cloudscraper = Py.Import("cloudscraper");
-                dynamic bs4 = Py.Import("bs4");
-                
-                dynamic scraper = cloudscraper.create_scraper();
-                
-                // Calculate week range
-                var weekStart = from.AddDays(-(int)from.DayOfWeek + (int)DayOfWeek.Monday);
-                if (weekStart > from) weekStart = weekStart.AddDays(-7);
-                
-                var totalWeeks = (int)Math.Ceiling((to - weekStart).TotalDays / 7) + 1;
-                var currentWeek = 0;
-                
-                while (weekStart <= to)
-                {
-                    currentWeek++;
-                    Console.WriteLine($"[PythonCloudScraper] ({currentWeek}/{totalWeeks}) Fetching week of {weekStart:yyyy-MM-dd}...");
-                    
-                    try
-                    {
-                        var weekEvents = ScrapeWeekSync(scraper, bs4, weekStart);
-                        foreach (var evt in weekEvents)
-                        {
-                            if (evt.Time >= from && evt.Time <= to)
-                                events.Add(evt);
-                        }
-                        Console.WriteLine($"[PythonCloudScraper] Found {weekEvents.Count} events");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[PythonCloudScraper] Error on week {weekStart:yyyy-MM-dd}: {ex.Message}");
-                    }
-                    
-                    weekStart = weekStart.AddDays(7);
-                    
-                    // Rate limiting - brief sleep
-                    Thread.Sleep(300);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[PythonCloudScraper] Error: {ex.Message}");
-                Console.WriteLine($"[PythonCloudScraper] Make sure cloudscraper and beautifulsoup4 are installed:");
-                Console.WriteLine($"  pip install cloudscraper beautifulsoup4");
-            }
-        }
+        var rows = doc.DocumentNode.SelectNodes("//tr").Where(c=>c.Attributes.Any(x=>x.Name == "data-event-id"));
+
+        var currentDate = weekStart;
         
-        return events.OrderBy(e => e.Time).ToList();
-    }
-    
-    private static List<EconomicEvent> ScrapeWeekSync(dynamic scraper, dynamic bs4, DateTime weekStart)
-    {
-        var events = new List<EconomicEvent>();
-        
-        var monthName = weekStart.ToString("MMM", System.Globalization.CultureInfo.InvariantCulture).ToLower();
-        var url = $"https://www.forexfactory.com/calendar?week={monthName}{weekStart.Day}.{weekStart.Year}";
-        
-        dynamic response = scraper.get(url, timeout: 30);
-        var html = (string)response.text;
-        
-        dynamic soup = bs4.BeautifulSoup(html, "html.parser");
-        dynamic rows = soup.find_all("tr", class_: "calendar__row");
-        
-        DateTime currentDate = weekStart;
-        
-        foreach (dynamic row in rows)
+        foreach (var row in rows)
         {
             try
             {
                 // Check for date header row
-                dynamic? dateCell = row.find("td", class_: "calendar__date");
-                if (dateCell != null)
+                var dateCell = row.SelectSingleNode(".//td[contains(@class, 'calendar__date')]");
                 {
-                    var dateText = ((string?)dateCell.text)?.Trim();
+                    var dateText = dateCell.InnerText.Trim();
                     if (!string.IsNullOrEmpty(dateText) && TryParseDate(dateText, weekStart.Year, out var parsedDate))
                     {
                         currentDate = parsedDate;
-                        continue;
                     }
                 }
-                
+
                 // Extract currency
-                dynamic? currencyCell = row.find("td", class_: "calendar__currency");
-                if (currencyCell == null) continue;
-                var currency = ((string?)currencyCell.text)?.Trim() ?? "";
-                if (string.IsNullOrEmpty(currency)) continue;
+                var currencyCell = row.SelectSingleNode(".//td[contains(@class, 'calendar__currency')]");
+
+                var currency = currencyCell.InnerText.Trim();
+
                 
                 // Extract time
-                dynamic? timeCell = row.find("td", class_: "calendar__time");
-                var timeText = timeCell != null ? ((string?)timeCell.text)?.Trim() ?? "" : "";
+                var timeCell = row.SelectSingleNode(".//td[contains(@class, 'calendar__time')]");
+                var timeText = timeCell?.InnerText.Trim() ?? "";
                 var eventTime = ParseEventTime(currentDate, timeText);
                 
                 // Extract event name
-                dynamic? eventCell = row.find("td", class_: "calendar__event");
-                dynamic? eventSpan = eventCell?.find("span");
-                if (eventSpan == null) continue;
-                var eventName = ((string?)eventSpan.text)?.Trim() ?? "";
-                if (string.IsNullOrEmpty(eventName)) continue;
+                var eventCell = row.SelectSingleNode(".//td[contains(@class, 'calendar__event')]");
+
+                var eventSpan = eventCell.SelectSingleNode(".//span");
+
+                var eventName = eventSpan.InnerText.Trim();
+
                 
-                // Extract impact from title attribute using raw HTML (Python.NET attr access is unreliable)
-                dynamic? impactCell = row.find("td", class_: "calendar__impact").find("span");
-                string impactTitle = "";
-                if (impactCell != null)
-                {
-                    try
-                    {
-                        // Get raw HTML and extract title with regex
-                        // Use Python's str() to convert PyObject to string
-                        dynamic builtins = Py.Import("builtins");
-                        string cellHtml = (string)builtins.str(impactCell);
-                        var titleMatch = System.Text.RegularExpressions.Regex.Match(
-                            cellHtml, @"class=""([^""]+)""",
-                            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                        if (titleMatch.Success)
-                        {
-                            impactTitle = titleMatch.Groups[1].Value.ToLower();
-                        }
-                    }
-                    catch
-                    {
-                        
-                    }
-                }
-                var impact = ParseImpact(impactTitle);
+                // Extract impact from span class
+                var impactCell = row.SelectSingleNode(".//td[contains(@class, 'calendar__impact')]");
+                var impactSpan = impactCell?.SelectSingleNode(".//span");
+                var impactClass = impactSpan?.GetAttributeValue("class", "") ?? "";
+                var impact = ParseImpact(impactClass);
                 
-   // Extract actual/forecast/previous
-                dynamic? actualCell = row.find("td", class_: "calendar__actual");
-                dynamic? forecastCell = row.find("td", class_: "calendar__forecast");
-                dynamic? previousCell = row.find("td", class_: "calendar__previous");
+                // Extract actual/forecast/previous
+                var actualCell = row.SelectSingleNode(".//td[contains(@class, 'calendar__actual')]");
+                var forecastCell = row.SelectSingleNode(".//td[contains(@class, 'calendar__forecast')]");
+                var previousCell = row.SelectSingleNode(".//td[contains(@class, 'calendar__previous')]");
                 
-                var actual = ParseNumericValue(actualCell?.text?.ToString());
-                var forecast = ParseNumericValue(forecastCell?.text?.ToString());
-                var previous = ParseNumericValue(previousCell?.text?.ToString());
+                var actual = ParseNumericValue(actualCell?.InnerText);
+                var forecast = ParseNumericValue(forecastCell?.InnerText);
+                var previous = ParseNumericValue(previousCell?.InnerText);
                 
                 events.Add(new EconomicEvent(
                     eventTime,
@@ -220,7 +167,7 @@ public class PythonCloudScraper : IDisposable
         
         return events;
     }
-    
+
     private static bool TryParseDate(string dateText, int year, out DateTime result)
     {
         result = DateTime.UtcNow.Date;
@@ -233,8 +180,8 @@ public class PythonCloudScraper : IDisposable
         return DateTime.TryParseExact(
             $"{monthDay} {year}",
             "MMM d yyyy",
-            System.Globalization.CultureInfo.InvariantCulture,
-            System.Globalization.DateTimeStyles.None,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.None,
             out result);
     }
     
@@ -243,24 +190,19 @@ public class PythonCloudScraper : IDisposable
         if (string.IsNullOrEmpty(timeText) || timeText.Contains("Day"))
             return date;
         
-        if (DateTime.TryParseExact(
+        return DateTime.TryParseExact(
             timeText,
-            new[] { "h:mmtt", "htt" },
-            System.Globalization.CultureInfo.InvariantCulture,
-            System.Globalization.DateTimeStyles.None,
-            out var time))
-        {
-            return date.Add(time.TimeOfDay);
-        }
-        
-        return date;
+            ["h:mmtt", "htt"],
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.None,
+            out var time) ? date.Add(time.TimeOfDay) : date;
     }
     
-    private static EventImpact ParseImpact(string impactTitle)
+    private static EventImpact ParseImpact(string impactClass)
     {
-        if (impactTitle.Contains("red"))
+        if (impactClass.Contains("red") || impactClass.Contains("high"))
             return EventImpact.High;
-        return impactTitle.Contains("ora") ? EventImpact.Medium : EventImpact.Low;
+        return impactClass.Contains("ora") || impactClass.Contains("medium") ? EventImpact.Medium : EventImpact.Low;
     }
     
     private static double? ParseNumericValue(string? text)
@@ -269,8 +211,8 @@ public class PythonCloudScraper : IDisposable
         
         text = System.Text.RegularExpressions.Regex.Replace(text.Trim(), @"[%KMB]", "");
         
-        if (double.TryParse(text, System.Globalization.NumberStyles.Any, 
-            System.Globalization.CultureInfo.InvariantCulture, out var result))
+        if (double.TryParse(text, NumberStyles.Any, 
+            CultureInfo.InvariantCulture, out var result))
             return result;
         
         return null;
