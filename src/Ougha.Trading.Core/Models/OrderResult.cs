@@ -6,9 +6,3 @@ public record OrderResult(
     double ExecutedPrice,
     double ExecutedVolume,
     string ErrorMessage = "");
-
-public record CloseResult(
-    bool Success,
-    double Profit,
-    double ClosePrice,
-    string ErrorMessage = "");

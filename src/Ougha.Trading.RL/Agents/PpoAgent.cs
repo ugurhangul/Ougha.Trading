@@ -54,8 +54,8 @@ public class PpoAgent : IAgent
         _gaeLambda = gaeLambda;
         _clipEpsilon = clipEpsilon;
         _valueCoef = 0.5f;
-        _entropyCoef = 0.1f;
-        _minEntropyCoef = 0.03f;
+        _entropyCoef = 0.15f;  // Higher starting entropy for more exploration
+        _minEntropyCoef = 0.05f;  // Higher floor to prevent policy collapse
         _updateEpochs = 4; // Reduced from 10 for faster training
         
         // LR Scheduling
@@ -430,8 +430,62 @@ public class PpoAgent : IAgent
     public void DecayEpsilon()
     {
         if (!(_entropyCoef > _minEntropyCoef)) return;
-        _entropyCoef *= 0.9995f;  // Slower decay for more exploration
+        _entropyCoef *= 0.9998f;  // Even slower decay - was 0.9995
         _entropyCoef = Math.Max(_entropyCoef, _minEntropyCoef);
+    }
+    
+    /// <summary>
+    /// Reset entropy coefficient to boost exploration when policy is collapsing.
+    /// </summary>
+    public void ResetEntropy(float? newValue = null)
+    {
+        _entropyCoef = newValue ?? 0.15f;  // Reset to high value
+        // Note: Console output removed - it corrupts the Spectre.Console Live display
+    }
+    
+    /// <summary>
+    /// Check action distribution and reset entropy if too skewed.
+    /// Call this periodically (e.g., every 100 episodes) with action counts.
+    /// </summary>
+    /// <param name="actionCounts">Array of action counts [Hold, Buy1, Buy2, Buy3, Sell1, Sell2, Sell3, Close]</param>
+    /// <param name="skewThreshold">Max allowed percentage for any single action (0.0-1.0)</param>
+    /// <returns>True if entropy was reset</returns>
+    public bool CheckAndResetEntropy(int[] actionCounts, float skewThreshold = 0.70f)
+    {
+        if (actionCounts == null || actionCounts.Length == 0) return false;
+        
+        var total = actionCounts.Sum();
+        if (total == 0) return false;
+        
+        // Check if any action dominates
+        var maxPct = (float)actionCounts.Max() / total;
+        
+        // Also check Buy vs Sell imbalance
+        var buyCount = actionCounts.Skip(1).Take(3).Sum();  // Actions 1-3
+        var sellCount = actionCounts.Skip(4).Take(3).Sum(); // Actions 4-6
+        var tradeCount = buyCount + sellCount;
+        
+        // If one action > threshold OR extreme buy/sell imbalance, reset entropy
+        var needsReset = maxPct > skewThreshold;
+        if (tradeCount > 100)
+        {
+            var buyPct = (float)buyCount / tradeCount;
+            var sellPct = (float)sellCount / tradeCount;
+            // If buy or sell is < 15% of trades, that's too imbalanced
+            if (buyPct < 0.15f || sellPct < 0.15f)
+                needsReset = true;
+        }
+        
+        if (needsReset)
+        {
+            // Reset entropy but not too high to avoid instability
+            var newEntropy = Math.Max(_entropyCoef * 2f, 0.08f);
+            newEntropy = Math.Min(newEntropy, 0.15f);
+            ResetEntropy(newEntropy);
+            return true;
+        }
+        
+        return false;
     }
     public float GetEntropyCoef() => _entropyCoef;
 
@@ -536,100 +590,3 @@ public class PpoAgent : IAgent
     }
 }
 
-internal class PpoDataset
-{
-    public readonly AgentInput[] States;
-    public readonly int[] Actions;
-    public readonly float[] LogProbs;
-    public readonly float[] Advantages;
-    public readonly float[] Returns;
-    
-    public PpoDataset(Experience[] rollouts, float[] advantages, float[] returns)
-    {
-        var n = rollouts.Length;
-        States = new AgentInput[n];
-        Actions = new int[n];
-        LogProbs = new float[n];
-        Advantages = advantages;
-        Returns = returns;
-        
-        for(var i=0; i<n; i++)
-        {
-            States[i] = rollouts[i].State;
-            Actions[i] = rollouts[i].Action;
-            LogProbs[i] = rollouts[i].Priority;
-        }
-    }
-}
-
-internal class DataLoader(PpoDataset ds, int batch, bool shuffle)
-{
-    private readonly Random _rng = new();
-
-    public IEnumerator<PpoBatch> GetEnumerator()
-    {
-        var n = ds.States.Length;
-        var indices = Enumerable.Range(0, n).ToArray();
-        
-        if (shuffle)
-        {
-            for (var i = n - 1; i > 0; i--)
-            {
-                var k = _rng.Next(i + 1);
-                (indices[i], indices[k]) = (indices[k], indices[i]);
-            }
-        }
-        
-        for(var i=0; i<n; i+=batch)
-        {
-             var len = Math.Min(batch, n-i);
-             var batchIndices = new int[len];
-             Array.Copy(indices, i, batchIndices, 0, len);
-
-             var batch1 = new PpoBatch
-             {
-                 Indices = batchIndices,
-                 States = new AgentInput[len],
-                 Actions = new int[len],
-                 LogProbs = new float[len],
-                 Advantages = new float[len],
-                 Returns = new float[len]
-             };
-             
-             for(var j=0; j<len; j++)
-             {
-                 var idx = batchIndices[j];
-                 batch1.States[j] = ds.States[idx];
-                 batch1.Actions[j] = ds.Actions[idx];
-                 batch1.LogProbs[j] = ds.LogProbs[idx];
-                 batch1.Advantages[j] = ds.Advantages[idx];
-                 batch1.Returns[j] = ds.Returns[idx];
-             }
-             
-             yield return batch1;
-        }
-    }
-}
-
-internal struct PpoBatch {
-    public int[] Indices;
-    public AgentInput[] States;
-    public int[] Actions;
-    public float[] LogProbs;
-    public float[] Advantages;
-    public float[] Returns;
-    public float[] OldValues;
-}
-
-/// <summary>
-/// Training metrics from a PPO update
-/// </summary>
-public struct PpoMetrics
-{
-    public float PolicyLoss { get; init; }
-    public float ValueLoss { get; init; }
-    public float Entropy { get; init; }
-    public float KlDivergence { get; init; }
-    public float ClipFraction { get; init; }
-    public float ClipEpsilon { get; init; }
-}

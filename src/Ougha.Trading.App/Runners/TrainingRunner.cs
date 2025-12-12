@@ -11,39 +11,6 @@ using Serilog;
 
 namespace Ougha.Trading.App.Runners;
 
-public class EarlyStopTracker(int patience = 300, int minEpisodes = 500, int window = 50)
-{
-    private readonly Queue<double> _rewardHistory = new();
-    private double _bestMovingAverage = double.MinValue;
-
-    public bool ShouldStop => NoImprovementCount >= patience;
-    public int NoImprovementCount { get; private set; }
-
-    public bool Update(double reward, int episode)
-    {
-        _rewardHistory.Enqueue(reward);
-        if (_rewardHistory.Count > window)
-            _rewardHistory.Dequeue();
-
-        if (episode < minEpisodes)
-            return false;
-
-        var movingAvg = _rewardHistory.Average();
-
-        if (movingAvg > _bestMovingAverage)
-        {
-            _bestMovingAverage = movingAvg;
-            NoImprovementCount = 0;
-        }
-        else
-        {
-            NoImprovementCount++;
-        }
-
-        return ShouldStop;
-    }
-}
-
 public static class TrainingRunner
 {
     public static async Task RunAsync(string symbolArg, int? episodes, IConfiguration config)
@@ -213,7 +180,7 @@ public static class TrainingRunner
 
                         for (var ep = 1; ep <= budget.Episodes; ep++)
                         {
-                            // Log progress every 50 episodes
+                            // Log progress every 50 episodes (writes to file, not console)
                             if (ep % 50 == 0 || ep == 1)
                             {
                                 Log.Information("Episode {Episode}/{Total} ({Percent:F1}%) - Chunk {Chunk}/{TotalChunks}",
@@ -321,7 +288,7 @@ public static class TrainingRunner
                                     catch (Exception ex)
                                     {
                                         Log.Error(ex, "[TrainingRunner] Training task error");
-                                        AnsiConsole.MarkupLine($"[red]Training error: {Markup.Escape(ex.Message)}[/]");
+                                        stats.LastError = ex.Message;
                                     }
                                     finally
                                     {
@@ -452,6 +419,18 @@ public static class TrainingRunner
                             }
 
                             agent.DecayEpsilon();
+                            
+                            // Check for entropy reset every 100 episodes if PPO
+                            if (ep % 100 == 0 && agent is PpoAgent ppoAgent)
+                            {
+                                var actionCountsArr = stats.GetActionCountsAsArray();
+                                if (ppoAgent.CheckAndResetEntropy(actionCountsArr, skewThreshold: 0.70f))
+                                {
+                                    Log.Information("[TrainingRunner] Entropy reset triggered at episode {Episode}", ep);
+                                    stats.EntropyResetCount++;
+                                    stats.ResetActionCounts();  // Reset counts after check
+                                }
+                            }
 
                             stats.Epsilon = GetEpsilon(agent);
                             stats.Entropy = GetEntropy(agent);

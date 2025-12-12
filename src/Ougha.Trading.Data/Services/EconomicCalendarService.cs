@@ -444,25 +444,3 @@ internal record EconomicEventDto(
     double? Actual
 );
 
-/// <summary>
-/// Represents a single economic calendar event
-/// </summary>
-public record EconomicEvent(
-    DateTime Time,
-    string Currency,
-    string EventName,
-    EventImpact Impact,
-    double? Forecast,
-    double? Previous,
-    double? Actual
-);
-
-/// <summary>
-/// Impact level of economic event
-/// </summary>
-public enum EventImpact
-{
-    Low = 1,
-    Medium = 2,
-    High = 3
-}

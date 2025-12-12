@@ -14,15 +14,28 @@ public static class TrainingDisplay
     
     public static IRenderable BuildDisplay(TrainingStats stats, TrainingBudget budget)
     {
+        // Use Grid instead of Columns to prevent duplication when terminal is narrow
+        var headerGrid = new Grid();
+        headerGrid.AddColumn(new GridColumn().NoWrap());
+        headerGrid.AddColumn(new GridColumn().NoWrap());
+        headerGrid.AddRow(BuildHeaderPanel(stats), BuildBudgetPanel(budget));
+        
+        var statusGrid = new Grid();
+        statusGrid.AddColumn(new GridColumn().NoWrap());
+        statusGrid.AddColumn(new GridColumn().NoWrap());
+        statusGrid.AddColumn(new GridColumn().NoWrap());
+        statusGrid.AddColumn(new GridColumn().NoWrap());
+        statusGrid.AddRow(
+            BuildStatusPanel(stats), 
+            BuildRewardPanel(stats),
+            BuildPerformancePanel(stats), 
+            BuildTradeStatsPanel(stats)
+        );
+        
         var rows = new List<IRenderable>
         {
-            new Columns(BuildHeaderPanel(stats), BuildBudgetPanel(budget)),
-            new Columns(
-                BuildStatusPanel(stats), 
-                BuildRewardPanel(stats),
-                BuildPerformancePanel(stats), 
-                BuildTradeStatsPanel(stats)
-            ),
+            headerGrid,
+            statusGrid,
             BuildSymbolPerformanceTable(stats),
             BuildProgressBar(stats)
         };

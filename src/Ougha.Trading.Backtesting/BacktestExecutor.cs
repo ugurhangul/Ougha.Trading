@@ -4,8 +4,6 @@ using Ougha.Trading.Risk;
 
 namespace Ougha.Trading.Backtesting;
 
-public record PendingCloseInfo(string Symbol, double Profit, int HoldingTicks);
-
 public class BacktestExecutor : IOrderExecutor
 {
     private readonly CandleTimeline? _candleTimeline;
