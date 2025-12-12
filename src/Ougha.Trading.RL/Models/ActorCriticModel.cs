@@ -6,7 +6,8 @@ namespace Ougha.Trading.RL.Models;
 
 /// <summary>
 /// Actor-Critic Network for PPO.
-/// Improved architecture: MLP+LayerNorm body, cross-timeframe attention.
+/// Improved architecture: MLP+LayerNorm body, cross-timeframe attention,
+/// separate value body for better value estimation, cross-symbol attention.
 /// </summary>
 public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Tensor Value, Tensor TpSlParams)>
 {
@@ -23,6 +24,13 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     private readonly LayerNorm _featureLayerNorm;
 
     private readonly Sequential _sharedBody;
+    
+    // Separate value body for better value estimation (reduces actor-critic interference)
+    private readonly Sequential _valueBody;
+    
+    // Cross-symbol attention for learning dynamic correlations between trading pairs
+    private readonly MultiheadAttention _symbolAttention;
+    private readonly LayerNorm _symbolLayerNorm;
 
     private readonly Sequential _actorHead;
     private readonly Sequential _criticHead;
@@ -31,6 +39,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     private const int TimeframeEmbedDim = 64;
     private const int FeatureDim = 120;
     private const int HiddenDim = 512;
+    private const int ValueHiddenDim = 256;
 
     public ActorCriticModel(string name, int numActions = 3, float dropout = 0.1f) : base(name)
     {
@@ -47,6 +56,8 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
         _featureLayerNorm = LayerNorm([128]);
 
         long inputDim = 5 * TimeframeEmbedDim + 128;
+        
+        // Shared body for feature extraction
         _sharedBody = Sequential(
             Linear(inputDim, HiddenDim),
             LayerNorm([HiddenDim]),
@@ -57,6 +68,21 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
             ReLU(),
             Dropout(dropout)
         );
+        
+        // Separate value body - processes fused features independently for value estimation
+        _valueBody = Sequential(
+            Linear(inputDim, ValueHiddenDim),
+            LayerNorm([ValueHiddenDim]),
+            ReLU(),
+            Dropout(dropout),
+            Linear(ValueHiddenDim, ValueHiddenDim),
+            LayerNorm([ValueHiddenDim]),
+            ReLU()
+        );
+        
+        // Cross-symbol attention: allows symbols to attend to each other
+        _symbolAttention = MultiheadAttention(HiddenDim, 8, dropout: 0.1, bias: true);
+        _symbolLayerNorm = LayerNorm([HiddenDim]);
 
         _actorHead = Sequential(
             Linear(HiddenDim, 256),
@@ -66,12 +92,12 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
             Linear(256, numActions)
         );
 
+        // Critic head now takes from separate value body
         _criticHead = Sequential(
-            Linear(HiddenDim, 256),
-            LayerNorm([256]),
+            Linear(ValueHiddenDim, 128),
+            LayerNorm([128]),
             ReLU(),
-            Dropout(dropout),
-            Linear(256, 1)
+            Linear(128, 1)
         );
 
         _tpSlHead = Sequential(
@@ -167,13 +193,50 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
         featEmbed = functional.relu(featEmbed);
 
         var combined = cat([fusedTf, featEmbed], dim: 1);
+        
+        // Actor path: shared body -> actor head
         var hidden = _sharedBody.forward(combined);
-
+        
+        // Apply cross-symbol attention when processing multiple symbols
+        // This allows each symbol to attend to others for portfolio-level decisions
+        if (batchSize > 1)
+        {
+            hidden = ApplyCrossSymbolAttention(hidden);
+        }
+        
         var actionLogits = _actorHead.forward(hidden);
-        var value = _criticHead.forward(hidden);
         var tpSl = _tpSlHead.forward(hidden);
+        
+        // Critic path: separate value body -> critic head (reduces gradient interference)
+        var valueHidden = _valueBody.forward(combined);
+        var value = _criticHead.forward(valueHidden);
         
         return (actionLogits, value, tpSl);
     }
+    
+    /// <summary>
+    /// Apply cross-symbol attention to learn dynamic correlations between symbols.
+    /// Each symbol's hidden state attends to all other symbols in the batch.
+    /// </summary>
+    private Tensor ApplyCrossSymbolAttention(Tensor hidden)
+    {
+        var batchSize = hidden.shape[0];
+        
+        // Reshape to sequence format: [1, BatchSize, HiddenDim] for attention
+        // This treats the batch as a sequence where each symbol is a token
+        var symbolSeq = hidden.unsqueeze(0);  // [1, B, H]
+        
+        // Self-attention across symbols
+        var (attended, _) = _symbolAttention.forward(
+            symbolSeq, symbolSeq, symbolSeq, 
+            key_padding_mask: null, 
+            need_weights: false, 
+            attn_mask: null);
+        
+        // Residual connection + layer norm
+        attended = attended + symbolSeq;
+        attended = _symbolLayerNorm.forward(attended.squeeze(0));  // Back to [B, H]
+        
+        return attended;
+    }
 }
-

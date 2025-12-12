@@ -27,5 +27,11 @@ public record AgentInput
     public float[]? CorrelationFeatures { get; init; }
 
     public float[]? PortfolioExposure { get; init; }
+    
+    /// <summary>
+    /// DXY (US Dollar Index) features (8D).
+    /// [dxyValue, change1H, change4H, change1D, rsi14, smaDeviation, volatility, trendDirection]
+    /// </summary>
+    public float[]? DxyFeatures { get; init; }
 
 }

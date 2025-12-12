@@ -364,7 +364,131 @@ public class QuestDbDataLoader
 
         return await conn.QuerySingleOrDefaultAsync<TickStats>(sql, new { symbol });
     }
+    
+    // ========== Economic Calendar Events ==========
+    
+    /// <summary>
+    /// Create the economic_events table if it doesn't exist.
+    /// Call this once during app startup.
+    /// </summary>
+    public async Task EnsureEconomicEventsTableAsync()
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+        
+        var sql = @"
+            CREATE TABLE IF NOT EXISTS economic_events (
+                timestamp TIMESTAMP,
+                currency SYMBOL,
+                event_name STRING,
+                impact INT,
+                forecast DOUBLE,
+                previous DOUBLE,
+                actual DOUBLE
+            ) TIMESTAMP(timestamp) PARTITION BY MONTH;";
+        
+        await conn.ExecuteAsync(sql);
+    }
+    
+    /// <summary>
+    /// Save economic events to QuestDB
+    /// </summary>
+    public async Task SaveEconomicEventsAsync(IEnumerable<Services.EconomicEvent> events)
+    {
+        var eventList = events.ToList();
+        if (eventList.Count == 0) return;
+        
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+        
+        const int batchSize = 500;
+        for (var i = 0; i < eventList.Count; i += batchSize)
+        {
+            var batch = eventList.Skip(i).Take(batchSize).ToList();
+            var sb = new System.Text.StringBuilder();
+            sb.Append("INSERT INTO economic_events (timestamp, currency, event_name, impact, forecast, previous, actual) VALUES ");
+            
+            var parameters = new DynamicParameters();
+            for (var j = 0; j < batch.Count; j++)
+            {
+                var e = batch[j];
+                if (j > 0) sb.Append(",");
+                sb.Append($"(@ts{j}, @currency{j}, @name{j}, @impact{j}, @forecast{j}, @previous{j}, @actual{j})");
+                
+                parameters.Add($"ts{j}", e.Time);
+                parameters.Add($"currency{j}", e.Currency);
+                parameters.Add($"name{j}", e.EventName);
+                parameters.Add($"impact{j}", (int)e.Impact);
+                parameters.Add($"forecast{j}", e.Forecast);
+                parameters.Add($"previous{j}", e.Previous);
+                parameters.Add($"actual{j}", e.Actual);
+            }
+            sb.Append(';');
+            
+            await conn.ExecuteAsync(sb.ToString(), parameters);
+        }
+    }
+    
+    /// <summary>
+    /// Load economic events from QuestDB
+    /// </summary>
+    public async Task<List<Services.EconomicEvent>> LoadEconomicEventsAsync(DateTime from, DateTime to)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+        
+        var sql = @"
+            SELECT timestamp as Time, currency, event_name, impact, forecast, previous, actual
+            FROM economic_events
+            WHERE timestamp >= @from AND timestamp <= @to
+            ORDER BY timestamp";
+        
+        var fromParam = NormalizeDateTime(from);
+        var toParam = NormalizeDateTime(to);
+        
+        var rows = await conn.QueryAsync<EconomicEventRow>(sql, new { from = fromParam, to = toParam });
+        
+        return rows.Select(r => new Services.EconomicEvent(
+            r.Time,
+            r.Currency,
+            r.Event_Name,
+            (Services.EventImpact)r.Impact,
+            r.Forecast,
+            r.Previous,
+            r.Actual
+        )).ToList();
+    }
+    
+    /// <summary>
+    /// Check if events exist for a date range
+    /// </summary>
+    public async Task<bool> HasEconomicEventsAsync(DateTime from, DateTime to)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+        
+        var sql = @"
+            SELECT 1 FROM economic_events
+            WHERE timestamp >= @from AND timestamp <= @to
+            LIMIT 1";
+        
+        var fromParam = NormalizeDateTime(from);
+        var toParam = NormalizeDateTime(to);
+        
+        var result = await conn.ExecuteScalarAsync<int?>(sql, new { from = fromParam, to = toParam });
+        return result.HasValue;
+    }
 }
+
+internal record EconomicEventRow(
+    DateTime Time,
+    string Currency,
+    string Event_Name,
+    int Impact,
+    double? Forecast,
+    double? Previous,
+    double? Actual
+);
 
 public record TickStats(
     long TotalTicks,

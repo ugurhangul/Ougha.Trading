@@ -241,7 +241,8 @@ public class MultiTimeframeStateBuilder
         IEnumerable<string>? closedTimeframes = null,
         float[]? newsFeatures = null,
         float[]? correlationFeatures = null,
-        float[]? portfolioExposure = null)
+        float[]? portfolioExposure = null,
+        float[]? dxyFeatures = null)
     {
         return new AgentInput
         {
@@ -253,7 +254,8 @@ public class MultiTimeframeStateBuilder
             RiskState = riskState,
             NewsFeatures = newsFeatures,
             CorrelationFeatures = correlationFeatures,
-            PortfolioExposure = portfolioExposure
+            PortfolioExposure = portfolioExposure,
+            DxyFeatures = dxyFeatures
         };
     }
 

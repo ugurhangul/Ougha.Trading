@@ -1,6 +1,7 @@
 using Ougha.Trading.Backtesting;
 using Ougha.Trading.Core.Abstractions;
 using Ougha.Trading.Core.Models;
+using Ougha.Trading.Data.Services;
 using Ougha.Trading.Features.Indicators;
 using Ougha.Trading.RL.Agents;
 
@@ -31,6 +32,12 @@ public class PortfolioTradingEnvironment
     private readonly Dictionary<string, int> _lastActionBySymbol;
 
     private readonly Dictionary<string, (float TpMult, float SlMult)> _lastTpSlMultipliers;
+    
+    // DXY Index service for USD strength features
+    private readonly DxyIndexService _dxyService;
+    
+    // Economic calendar service for news/event features
+    private readonly EconomicCalendarService _newsService;
 
     private int _currentTick;
     private double _peakEquity;
@@ -88,6 +95,12 @@ public class PortfolioTradingEnvironment
 
         _reusableRewards = new float[config.Symbols.Length];
         _reusableDones = new bool[config.Symbols.Length];
+        
+        // Initialize DXY service
+        _dxyService = new DxyIndexService();
+        
+        // Initialize economic calendar service
+        _newsService = new EconomicCalendarService();
     }
 
     /// <summary>
@@ -430,15 +443,40 @@ public class PortfolioTradingEnvironment
         }
 
         var closedTfs = _lastClosedTimeframes.GetValueOrDefault(symbol) ?? new List<string>();
+        
+        // Build DXY features from current prices
+        float[]? dxyFeatures = null;
+        try
+        {
+            var currentPrices = new Dictionary<string, double>();
+            foreach (var sym in _config.Symbols)
+            {
+                var price = _executor.GetBid(sym);
+                if (price > 0)
+                    currentPrices[sym] = price;
+            }
+            if (currentPrices.Count > 0)
+                dxyFeatures = _dxyService.BuildDxyFeatures(currentPrices, _executor.CurrentTime);
+        }
+        catch { /* Ignore DXY calculation errors */ }
+        
+        // Build news features for economic events
+        float[]? newsFeatures = null;
+        try
+        {
+            newsFeatures = _newsService.BuildNewsFeatures(_executor.CurrentTime, _config.Symbols);
+        }
+        catch { /* Ignore news calculation errors */ }
 
         return mtfBuilder.BuildAgentInput(
             symbol: symbol,
             portfolioFeatures: portfolioFeatures,
             riskState: riskState,
             closedTimeframes: closedTfs,
-            newsFeatures: null,
+            newsFeatures: newsFeatures,
             correlationFeatures: null,
-            portfolioExposure: null
+            portfolioExposure: null,
+            dxyFeatures: dxyFeatures
         );
     }
 
@@ -466,6 +504,12 @@ public class PortfolioTradingEnvironment
             _lastExecutedAction.Remove(symbol);
             _lastExecutedTick.Remove(symbol);
         }
+        
+        // Reset DXY service
+        _dxyService.Reset();
+        
+        // Reset news service
+        _newsService.Reset();
 
         return Task.FromResult(new float[StateSize]);
     }
@@ -511,6 +555,19 @@ public class PortfolioTradingEnvironment
         }
 
         _currentTick = 0;
+        
+        // Preload economic calendar events for the training period
+        // This fetches real data from Forex Factory
+        try
+        {
+            var eventStart = episodeStartTime.AddDays(-1);  // Include day before
+            var eventEnd = episodeStartTime.AddDays(7);      // Load a week ahead
+            await _newsService.LoadEventsAsync(eventStart, eventEnd);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[PortfolioTradingEnvironment] Failed to load calendar events: {ex.Message}");
+        }
     }
 
     /// <summary>

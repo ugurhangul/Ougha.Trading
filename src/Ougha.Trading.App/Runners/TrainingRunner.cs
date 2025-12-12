@@ -184,6 +184,10 @@ public static class TrainingRunner
                 }
 
                 var env = preparedEnv.Env;
+                
+                // Preload historical candles and economic calendar events
+                await env.PreloadHistoricalCandlesAsync(dbLoader, preparedEnv.EpisodeStart);
+                
                 var lastChunkIndex = preparedEnv.ChunkIndex;
                 stats.CurrentChunk = lastChunkIndex;
                 stats.ChunkStartDate = preparedEnv.ChunkStartDate;
@@ -212,6 +216,10 @@ public static class TrainingRunner
                         if (nextEnv != null)
                         {
                             env = nextEnv.Env;
+                            
+                            // Preload for new environment
+                            await env.PreloadHistoricalCandlesAsync(dbLoader, nextEnv.EpisodeStart);
+                            
                             stats.EpisodeInChunk = nextEnv.EpisodeInChunk;
                             stats.EpisodeStartDate = nextEnv.EpisodeStart;
                             stats.EpisodeEndDate = nextEnv.EpisodeEnd;
@@ -494,13 +502,18 @@ public static class TrainingRunner
 
         if (strategy.Equals("PPO", StringComparison.OrdinalIgnoreCase))
         {
-            AnsiConsole.MarkupLine("[bold cyan]Using PPO Strategy[/]");
+            // Calculate expected updates for LR scheduling
+            var stepsPerRollout = 4096;  // Increased rollout horizon
+            var expectedRollouts = budget.Episodes * budget.MaxSteps / stepsPerRollout;
+            
+            AnsiConsole.MarkupLine($"[bold cyan]Using PPO Strategy (rollout=4096, batch=256, LR schedule over {expectedRollouts} updates)[/]");
             return new PpoAgent(
-                batchSize: batchSize,
-                rolloutHorizon: 2048,
+                batchSize: 256,  // Increased for RTX 3090
+                rolloutHorizon: 4096,  // Increased from 2048
                 gamma: 0.99f,
                 learningRate: 3e-4f,
-                useCuda: budget.Hardware.GpuAvailable
+                useCuda: budget.Hardware.GpuAvailable,
+                totalExpectedUpdates: Math.Max(1000, expectedRollouts)
             );
         }
         else

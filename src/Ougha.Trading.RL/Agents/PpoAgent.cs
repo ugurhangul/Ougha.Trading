@@ -36,14 +36,31 @@ public class PpoAgent : IAgent
     private readonly float[]? _packedTfBuffer;
     private readonly float[]? _packedFeatBuffer;
     
-    public PpoAgent(int batchSize = 64,
-        int rolloutHorizon = 2048,
+    // LR Scheduling
+    private readonly float _baseLr;
+    private int _updateCount;
+    private int _totalExpectedUpdates;
+    
+    // KL Adaptive Clipping
+    private const float TargetKl = 0.015f;
+    private const float ClipMin = 0.1f;
+    private const float ClipMax = 0.3f;
+    
+    // NaN tracking
+    private int _nanCount;
+    
+    // Metrics
+    private PpoMetrics _lastMetrics = new();
+    
+    public PpoAgent(int batchSize = 256,
+        int rolloutHorizon = 4096,
         float gamma = 0.99f,
         float gaeLambda = 0.95f,
         float clipEpsilon = 0.2f,
         float learningRate = 3e-4f,
         int updateEpochs = 10,
-        bool useCuda = false)
+        bool useCuda = false,
+        int totalExpectedUpdates = 10000)
     {
         _batchSize = batchSize;
         _rolloutHorizon = rolloutHorizon;
@@ -54,6 +71,10 @@ public class PpoAgent : IAgent
         _entropyCoef = 0.1f;
         _minEntropyCoef = 0.01f;
         _updateEpochs = updateEpochs;
+        
+        // LR Scheduling
+        _baseLr = learningRate;
+        _totalExpectedUpdates = totalExpectedUpdates;
 
         var cudaAvailable = cuda.is_available();
         _device = useCuda && cudaAvailable ? CUDA : CPU;
@@ -522,4 +543,18 @@ internal struct PpoBatch {
     public float[] LogProbs;
     public float[] Advantages;
     public float[] Returns;
+    public float[] OldValues;
+}
+
+/// <summary>
+/// Training metrics from a PPO update
+/// </summary>
+public struct PpoMetrics
+{
+    public float PolicyLoss { get; init; }
+    public float ValueLoss { get; init; }
+    public float Entropy { get; init; }
+    public float KlDivergence { get; init; }
+    public float ClipFraction { get; init; }
+    public float ClipEpsilon { get; init; }
 }
