@@ -148,12 +148,7 @@ public class TrainingStats
     {
         { 0, 0 },
         { 1, 0 },
-        { 2, 0 },
-        { 3, 0 },
-        { 4, 0 },
-        { 5, 0 },
-        { 6, 0 },
-        { 7, 0 }
+        { 2, 0 }
     };
 
     public Dictionary<int, int> ActionCounts
@@ -173,20 +168,6 @@ public class TrainingStats
                 _actionCounts[action]++;
             else
                 _actionCounts[action] = 1;
-        }
-    }
-
-    public void RecordActions(int[] actions)
-    {
-        lock (_lock)
-        {
-            foreach (var action in actions)
-            {
-                if (_actionCounts.ContainsKey(action))
-                    _actionCounts[action]++;
-                else
-                    _actionCounts[action] = 1;
-            }
         }
     }
 
@@ -246,34 +227,105 @@ public class TrainingStats
     public TimeSpan AverageHoldingTime => _tradesClosed > 0
         ? TimeSpan.FromSeconds(_totalHoldingTimeSeconds / _tradesClosed)
         : TimeSpan.Zero;
-
-    public void IncrementEpisode() => Interlocked.Increment(ref _completedEpisodes);
-    public void IncrementTotalSteps(int count = 1) => Interlocked.Add(ref _totalSteps, count);
-    public void IncrementTrainCalls() => Interlocked.Increment(ref _trainCalls);
-
-    public void AddTradeStats(int opened, int closed, int wins, int losses, double profit, double loss, double holdingTimeSeconds = 0)
+    
+    // Rolling window aggregates - computed from all symbol rolling windows
+    public int RollingTrades
     {
-        Interlocked.Add(ref _tradesOpened, opened);
-        Interlocked.Add(ref _tradesClosed, closed);
-        Interlocked.Add(ref _wins, wins);
-        Interlocked.Add(ref _losses, losses);
-        lock (_lock)
+        get
         {
-            _totalProfit += profit;
-            _totalLoss += loss;
-            _totalHoldingTimeSeconds += holdingTimeSeconds;
+            lock (_lock)
+                return _symbolPerformance.Values.Sum(s => s.RollingTradeCount);
+        }
+    }
+    
+    public double RollingWinRate
+    {
+        get
+        {
+            lock (_lock)
+            {
+                var allTrades = _symbolPerformance.Values.Sum(s => s.RollingTradeCount);
+                if (allTrades == 0) return 0;
+                // Compute weighted average
+                var totalWins = _symbolPerformance.Values.Sum(s => 
+                    s.RollingTradeCount > 0 ? s.RollingWinRate * s.RollingTradeCount / 100.0 : 0);
+                return totalWins / allTrades * 100;
+            }
+        }
+    }
+    
+    public double RollingProfitFactor
+    {
+        get
+        {
+            lock (_lock)
+            {
+                // Sum up all rolling profits/losses across symbols
+                double totalProfit = 0, totalLoss = 0;
+                foreach (var s in _symbolPerformance.Values)
+                {
+                    if (s.RollingTradeCount == 0) continue;
+                    // Access the underlying trades through the public PF if possible
+                    // We'll estimate from PF and trade count
+                    var pf = s.RollingProfitFactor;
+                    // Assume normalized: if PF = profit/loss, and we sum proportionally
+                    if (pf >= 999) totalProfit += s.RollingTradeCount; // All wins
+                    else if (pf > 0)
+                    {
+                        // Approximate contribution
+                        totalProfit += pf * s.RollingTradeCount;
+                        totalLoss += s.RollingTradeCount;
+                    }
+                }
+                return totalLoss > 0 ? totalProfit / totalLoss : (totalProfit > 0 ? 999.0 : 0);
+            }
+        }
+    }
+    
+    public double RollingNetPnL
+    {
+        get
+        {
+            lock (_lock)
+            {
+                // Sum net PnL from all symbol rolling windows (need to add this to SymbolStats)
+                return _symbolPerformance.Values.Sum(s => s.RollingNetPnL);
+            }
         }
     }
 
-    public void UpdateBestReward(double reward)
+    public double RollingAvgProfitPerTrade
     {
-        double current;
-        do
+        get
         {
-            current = _bestReward;
-            if (reward <= current) return;
-        } while (Math.Abs(Interlocked.CompareExchange(ref _bestReward, reward, current) - current) > 0.1);
+            lock (_lock)
+            {
+                var totalTrades = _symbolPerformance.Values.Sum(s => s.RollingTradeCount);
+                if (totalTrades == 0) return 0;
+                var totalNetPnL = _symbolPerformance.Values.Sum(s => s.RollingNetPnL);
+                return totalNetPnL / totalTrades;
+            }
+        }
     }
+    
+    public TimeSpan RollingAvgHoldingTime
+    {
+        get
+        {
+            lock (_lock)
+            {
+                var totalTrades = _symbolPerformance.Values.Sum(s => s.RollingTradeCount);
+                if (totalTrades == 0) return TimeSpan.Zero;
+                // Weighted average of holding times
+                var totalSeconds = _symbolPerformance.Values
+                    .Where(s => s.RollingTradeCount > 0)
+                    .Sum(s => s.RollingAvgHoldingTime.TotalSeconds * s.RollingTradeCount);
+                return TimeSpan.FromSeconds(totalSeconds / totalTrades);
+            }
+        }
+    }
+    
+    public void IncrementEpisode() => Interlocked.Increment(ref _completedEpisodes);
 
     private readonly Dictionary<string, SymbolStats> _symbolPerformance = new();
 
@@ -299,7 +351,6 @@ public class TrainingStats
         }
     }
     public bool GpuAvailable { get; set; }
-    public string CurrentPhase { get; set; } = "Initializing";
     public int EarlyStopPatience { get; set; } = 300;
     public int EarlyStopMinEpisodes { get; set; } = 500;
     

@@ -34,4 +34,10 @@ public record AgentInput
     /// </summary>
     public float[]? DxyFeatures { get; init; }
 
+    /// <summary>
+    /// Time-of-day features (4D) using cyclical encoding.
+    /// [sinHour, cosHour, sinDayOfWeek, cosDayOfWeek]
+    /// </summary>
+    public float[]? TimeFeatures { get; init; }
+
 }

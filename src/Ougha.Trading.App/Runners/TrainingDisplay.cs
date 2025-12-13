@@ -25,24 +25,19 @@ public static class TrainingDisplay
         statusGrid.AddColumn(new GridColumn().NoWrap());
         statusGrid.AddColumn(new GridColumn().NoWrap());
         statusGrid.AddColumn(new GridColumn().NoWrap());
+        statusGrid.AddColumn(new GridColumn().NoWrap());  // 5th column for rolling stats
         statusGrid.AddRow(
             BuildStatusPanel(stats), 
             BuildRewardPanel(stats),
             BuildPerformancePanel(stats), 
-            BuildTradeStatsPanel(stats)
+            BuildTradeStatsPanel(stats),
+            BuildRollingStatsPanel(stats)  // New rolling window panel
         );
-        
-        // Config row - reward and model settings
-        var configGrid = new Grid();
-        configGrid.AddColumn(new GridColumn().NoWrap());
-        configGrid.AddColumn(new GridColumn().NoWrap());
-        configGrid.AddRow(BuildRewardConfigPanel(), BuildModelConfigPanel());
         
         var rows = new List<IRenderable>
         {
             headerGrid,
             statusGrid,
-            configGrid,
             BuildSymbolPerformanceTable(stats),
             BuildProgressBar(stats)
         };
@@ -215,6 +210,45 @@ public static class TrainingDisplay
             .Expand();
     }
 
+    private static Panel BuildRollingStatsPanel(TrainingStats stats)
+    {
+        var rollingTrades = stats.RollingTrades;
+        var rollingWr = stats.RollingWinRate;
+        var rollingPf = stats.RollingProfitFactor;
+        var rollingAvgProfit = stats.RollingAvgProfitPerTrade;
+        var rollingAvgHold = stats.RollingAvgHoldingTime;
+        
+        var wrStyle = rollingWr > 50 ? "green" : rollingWr > 40 ? "yellow" : "red";
+        var pfStyle = rollingPf > 1.5 ? "green" : rollingPf > 1 ? "yellow" : "red";
+        var avgProfitStyle = rollingAvgProfit > 0 ? "green" : rollingAvgProfit < 0 ? "red" : "dim";
+        
+        // Show "-" if not enough trades yet
+        var hasData = rollingTrades >= 10;
+        
+        var avgHoldStr = rollingAvgHold.TotalHours >= 1
+            ? $"{rollingAvgHold.TotalHours:F1}h"
+            : rollingAvgHold.TotalMinutes >= 1
+                ? $"{rollingAvgHold.TotalMinutes:F1}m"
+                : $"{rollingAvgHold.TotalSeconds:F0}s";
+        
+        var table = new Table().Border(TableBorder.None).HideHeaders().Expand();
+        table.AddColumn(new TableColumn("L").Width(8));
+        table.AddColumn(new TableColumn("V").Width(14).NoWrap());
+        
+        table.AddRow("[dim]Window:[/]", $"[cyan]Last {rollingTrades}/100[/]");
+        table.AddRow("[dim]WinRate:[/]", hasData ? $"[{wrStyle}]{rollingWr,12:F1}%[/]" : "[dim]          -[/]");
+        table.AddRow("[dim]PF:[/]", hasData ? $"[{pfStyle}]{rollingPf,12:F2}[/]" : "[dim]          -[/]");
+        table.AddRow("[dim]AvgTrade:[/]", hasData ? $"[{avgProfitStyle}]${rollingAvgProfit,11:N2}[/]" : "[dim]          -[/]");
+        table.AddRow("[dim]AvgHold:[/]", hasData ? $"[cyan]{avgHoldStr,12}[/]" : "[dim]          -[/]");
+        table.AddRow("[dim]Excl:[/]", "[dim]Exploration[/]");
+        
+        return new Panel(table)
+            .Header("[bold aqua]Rolling[/]")
+            .Border(BoxBorder.Rounded)
+            .BorderColor(Color.Aqua)
+            .Expand();
+    }
+
     private static Panel BuildBudgetPanel(TrainingBudget budget)
     {
         var table = new Table().Border(TableBorder.None).HideHeaders();
@@ -258,6 +292,7 @@ public static class TrainingDisplay
         table.AddColumn(new TableColumn("PF").RightAligned().Width(5));
         table.AddColumn(new TableColumn("Win%").RightAligned().Width(5));
         table.AddColumn(new TableColumn("Trades").RightAligned().Width(6));
+        table.AddColumn(new TableColumn("R.PF").RightAligned().Width(5));  // Rolling PF (last 100 trades)
         table.AddColumn(new TableColumn("MaxDD").RightAligned().Width(6));
         table.AddColumn(new TableColumn("MinH").RightAligned().Width(5));
         table.AddColumn(new TableColumn("MaxH").RightAligned().Width(5));
@@ -306,6 +341,10 @@ public static class TrainingDisplay
             var mddStyle = s.CumulativeMaxDrawdown > 20 ? "red" : s.CumulativeMaxDrawdown > 10 ? "yellow" : "green";
             var mddStr = s.CumulativeMaxDrawdown > 0 ? $"{s.CumulativeMaxDrawdown:F1}%" : "-";
 
+            // Rolling PF - color based on value
+            var rollingPfStyle = s.RollingProfitFactor > 1.5 ? "green" : s.RollingProfitFactor > 1 ? "yellow" : "red";
+            var rollingPfStr = s.RollingTradeCount >= 10 ? $"{s.RollingProfitFactor:F2}" : "-";
+            
             table.AddRow(
                 Markup.Escape(symbol),
                 $"{s.Episodes}",
@@ -313,6 +352,7 @@ public static class TrainingDisplay
                 $"[{pfStyle}]{s.CumulativeProfitFactor:F2}[/]",
                 $"[{wrStyle}]{s.CumulativeWinRate:F0}%[/]",
                 $"{s.CumulativeTrades}",
+                $"[{rollingPfStyle}]{rollingPfStr}[/]",  // Rolling PF
                 $"[{mddStyle}]{mddStr}[/]",
                 $"[dim]{minHoldStr}[/]",
                 $"[dim]{maxHoldStr}[/]",
@@ -325,7 +365,7 @@ public static class TrainingDisplay
 
         while (rowCount < MaxSymbolRows)
         {
-            table.AddRow("", "", "", "", "", "", "", "", "", "", "", "");
+            table.AddRow("", "", "", "", "", "", "", "", "", "", "", "", "");  // 13 columns now
             rowCount++;
         }
 
@@ -345,70 +385,6 @@ public static class TrainingDisplay
         var progressColor = progress > 75 ? "green" : progress > 50 ? "cyan" : progress > 25 ? "yellow" : "red";
         
         return new Markup($"  [bold]Progress:[/] [{progressColor}]{bar}[/] [bold]{progress:F1}%[/]");
-    }
-
-    private static Panel BuildRewardConfigPanel()
-    {
-        var table = new Table().Border(TableBorder.None).HideHeaders().Expand();
-        table.AddColumn(new TableColumn("L").Width(12));
-        table.AddColumn(new TableColumn("V").Width(12).NoWrap());
-        table.AddColumn(new TableColumn("L2").Width(12));
-        table.AddColumn(new TableColumn("V2").Width(12).NoWrap());
-        
-        table.AddRow(
-            "[dim]Loss Penalty:[/]", "[yellow]4.5[/] (1.5x)",
-            "[dim]Shaping:[/]", "[cyan]8%[/]"
-        );
-        table.AddRow(
-            "[dim]Opp. Cost:[/]", "[green]ON[/] (0.5 ATR)",
-            "[dim]Flat Penalty:[/]", "[dim]Off[/]"
-        );
-        table.AddRow(
-            "[dim]MinHold:[/]", "[yellow]120[/] (2m)",
-            "[dim]MaxHold:[/]", "[yellow]14400[/] (4h)"
-        );
-        table.AddRow(
-            "[dim]QuickProfit:[/]", "[yellow]600[/] (10m)",
-            "[dim]UnrealScale:[/]", "[cyan]50[/]"
-        );
-        
-        return new Panel(table)
-            .Header("[bold orange3]Reward Config[/]")
-            .Border(BoxBorder.Rounded)
-            .BorderColor(Color.Orange3)
-            .Expand();
-    }
-
-    private static Panel BuildModelConfigPanel()
-    {
-        var table = new Table().Border(TableBorder.None).HideHeaders().Expand();
-        table.AddColumn(new TableColumn("L").Width(12));
-        table.AddColumn(new TableColumn("V").Width(12).NoWrap());
-        table.AddColumn(new TableColumn("L2").Width(12));
-        table.AddColumn(new TableColumn("V2").Width(14).NoWrap());
-        
-        table.AddRow(
-            "[dim]TF Embed:[/]", "[cyan]768[/]",
-            "[dim]Hidden:[/]", "[cyan]4096×5[/]"
-        );
-        table.AddRow(
-            "[dim]Value Net:[/]", "[cyan]2048×4[/]",
-            "[dim]LSTM:[/]", "[cyan]2048×3[/]"
-        );
-        table.AddRow(
-            "[dim]Entropy:[/]", "[yellow]0.12→0.02[/]",
-            "[dim]Decay:[/]", "[yellow]0.9999[/]"
-        );
-        table.AddRow(
-            "[dim]Epochs:[/]", "[yellow]8[/]",
-            "[dim]VRAM Est:[/]", "[green]~12GB[/]"
-        );
-        
-        return new Panel(table)
-            .Header("[bold teal]Model Config[/]")
-            .Border(BoxBorder.Rounded)
-            .BorderColor(Color.Teal)
-            .Expand();
     }
 
     public static string GenerateResultReport(TrainingStats stats, TrainingBudget budget, string modelDir)

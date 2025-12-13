@@ -84,6 +84,36 @@ public class PrioritizedReplayBuffer(
         }
     }
 
+    /// <summary>
+    /// Add a batch of experiences with TP/SL multipliers for training the TP/SL head.
+    /// </summary>
+    public void AddBatchWithTpSl(
+        AgentInput[] states,
+        int[] actions,
+        float[] rewards,
+        AgentInput?[] nextStates,
+        bool[] dones,
+        float[] tpMultipliers,
+        float[] slMultipliers)
+    {
+        var batchSize = states.Length;
+        for (var i = 0; i < batchSize; i++)
+        {
+            var experience = new Experience
+            {
+                State = states[i],
+                Action = actions[i],
+                Reward = rewards[i],
+                NextState = nextStates[i],
+                Done = dones[i],
+                Priority = MaxPriority,
+                TpMultiplier = tpMultipliers[i],
+                SlMultiplier = slMultipliers[i]
+            };
+            StoreExperience(experience);
+        }
+    }
+
     private void ProcessNStepBuffer(bool episodeDone)
     {
         while (_nStepBuffer.Count > 0 && (_nStepBuffer.Count >= nSteps || episodeDone))

@@ -28,7 +28,7 @@ public class PortfolioTradingEnvironment
     private readonly Dictionary<string, int> _lastExecutedAction;
     private readonly Dictionary<string, int> _lastExecutedTick;
     private readonly int _actionMemoryWindow;
-    private const int MIN_HOLDING_TICKS = 50;
+    private const int MIN_HOLDING_TICKS = 30;  // 30 seconds - minimal enforcement, let agent explore freely
 
     private readonly Dictionary<string, int> _lastActionBySymbol;
 
@@ -239,6 +239,9 @@ public class PortfolioTradingEnvironment
 
                 // Get ATR for volatility-normalized rewards
                 var symbolAtr = CalculateAtr(closeInfo.Symbol);
+                
+                // Get symbol info for point-based normalization
+                var symbolInfo = _executor.GetSymbolInfo(closeInfo.Symbol);
 
                 var closeReward = _rewardCalculator.Calculate(
                     tradeClosed: true,
@@ -249,7 +252,8 @@ public class PortfolioTradingEnvironment
                     peakUnrealizedPnl: _peakUnrealizedPnls.GetValueOrDefault(closeInfo.Symbol),
                     initialBalance: _initialBalance,
                     maxDrawdownPct: maxDrawdownPct,
-                    symbolAtr: symbolAtr);
+                    symbolAtr: symbolAtr,
+                    symbolInfo: symbolInfo);
 
                 _reusableRewards[symbolIndex] += closeReward;
                 _positionOpenTicks[closeInfo.Symbol] = 0;
@@ -290,6 +294,21 @@ public class PortfolioTradingEnvironment
         var currentEquity = _executor.GetEquity();
         if (currentEquity > _peakEquity) _peakEquity = currentEquity;
 
+        // Hard SL enforcement: force close positions with excessive unrealized loss
+        // This protects against gaps where price skips over the SL level
+        foreach (var symbol in _config.Symbols)
+        {
+            var pos = _executor.GetPosition(symbol);
+            if (pos != null && pos.UnrealizedPnlPercent < -2.0)  // >2% loss
+            {
+                var symbolIndex = Array.IndexOf(_config.Symbols, symbol);
+                await _executor.ClosePositionAsync(symbol);
+                _positionOpenTicks[symbol] = 0;
+                _peakUnrealizedPnls[symbol] = 0;
+                Log.Debug("[HardSL] Force closed {Symbol} at {Loss:F2}% loss", symbol, pos.UnrealizedPnlPercent);
+            }
+        }
+
         var globalDone = !moreData;
         if (currentEquity < _initialBalance * (1 - _config.MaxLossPercent / 100.0))
             globalDone = true;
@@ -305,6 +324,7 @@ public class PortfolioTradingEnvironment
         if (ActionDecoder.IsHold(action)) return (0, false);
 
         var entryType = ActionDecoder.Decode(action);
+        var isCloseAction = ActionDecoder.IsClose(action);
 
         var tradeClosed = false;
         double tradeProfit = 0;
@@ -322,7 +342,27 @@ public class PortfolioTradingEnvironment
 
         var currentHoldingTicks = hasPosition ? _currentTick - _positionOpenTicks.GetValueOrDefault(symbol) : 0;
 
-        if (hasPosition && entryType.HasValue && pos!.Type != entryType.Value)
+        // Handle explicit CLOSE action - just close position, don't open new one
+        if (isCloseAction && hasPosition)
+        {
+            if (currentHoldingTicks >= MIN_HOLDING_TICKS)
+            {
+                var closeResult = await _executor.ClosePositionAsync(symbol);
+                if (closeResult.Success)
+                {
+                    tradeClosed = true;
+                    tradeProfit = closeResult.Profit;
+                    holdingTicks = currentHoldingTicks;
+                    _positionOpenTicks[symbol] = 0;
+                    hasPosition = false;
+                    _lastExecutedAction[symbol] = action;
+                    _lastExecutedTick[symbol] = _currentTick;
+                }
+            }
+            // After close action, skip to reward calculation (don't open new position)
+        }
+        // Close existing position if opening opposite direction
+        else if (hasPosition && entryType.HasValue && pos!.Type != entryType.Value)
         {
             if (currentHoldingTicks >= MIN_HOLDING_TICKS)
             {
@@ -382,7 +422,7 @@ public class PortfolioTradingEnvironment
                 volume = Math.Max(0.01, Math.Min(volume, 100.0));
                 volume = Math.Round(volume, 2);
 
-                var result = await _executor.ExecuteAsync(symbol, entryType.Value, 0.1,
+                var result = await _executor.ExecuteAsync(symbol, entryType.Value, volume,
                     sl, tp, "RL Portfolio Agent", RiskLevel.Moderate);
 
                 if (result.Success)
@@ -408,6 +448,9 @@ public class PortfolioTradingEnvironment
         // Get ATR for volatility-normalized rewards
         var symbolAtr = CalculateAtr(symbol);
         
+        // Get symbol info for point-based normalization
+        var symbolInfo = _executor.GetSymbolInfo(symbol);
+        
         // Get position direction and price change for shaping rewards
         var posDirection = pos?.Type == TradeType.Buy ? 1 : (pos?.Type == TradeType.Sell ? -1 : 0);
         var currentPrice = _executor.GetBid(symbol);
@@ -421,7 +464,9 @@ public class PortfolioTradingEnvironment
             currentEquity: _executor.GetEquity(),
             positionDirection: posDirection,
             priceChange: priceChange,
-            symbolAtr: symbolAtr);
+            symbolAtr: symbolAtr,
+            symbolInfo: symbolInfo,
+            currentPrice: currentPrice);  // Pass actual price for opportunity cost
 
         return (reward, tradeClosed);
     }
@@ -487,7 +532,7 @@ public class PortfolioTradingEnvironment
             }
         }
 
-        mtfBuilder.CopyM1ToMissingTimeframes();
+        mtfBuilder.ZeroPadMissingTimeframes();
 
         var pos = _executor.GetPosition(symbol);
         var hasPosition = pos != null;
@@ -577,6 +622,9 @@ public class PortfolioTradingEnvironment
         }
         catch (Exception ex) { Log.Debug(ex, "Exposure calculation error"); }
 
+        // Build time-of-day features for session awareness
+        var timeFeatures = MultiTimeframeStateBuilder.BuildTimeFeatures(_executor.CurrentTime);
+
         return mtfBuilder.BuildAgentInput(
             symbol: symbol,
             portfolioFeatures: portfolioFeatures,
@@ -585,7 +633,8 @@ public class PortfolioTradingEnvironment
             newsFeatures: newsFeatures,
             correlationFeatures: correlationFeatures,
             portfolioExposure: portfolioExposure,
-            dxyFeatures: dxyFeatures
+            dxyFeatures: dxyFeatures,
+            timeFeatures: timeFeatures
         );
     }
 

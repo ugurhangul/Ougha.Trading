@@ -84,9 +84,35 @@ public class MultiTimeframeStateBuilder
     }
 
     /// <summary>
-    /// Copy M1 features to higher timeframes as fallback when they're unavailable.
-    /// This ensures the model gets non-zero features even without proper MTF data.
+    /// Initialize higher timeframes with zeros if they have no data.
+    /// This is preferred over copying M1 data which creates false patterns.
+    /// The model learns that missing timeframes have zero features.
     /// </summary>
+    public void ZeroPadMissingTimeframes()
+    {
+        if (_lastCandleTimes["M1"] == DateTime.MinValue)
+            return;
+
+        var m1Time = _lastCandleTimes["M1"];
+
+        foreach (var tf in Timeframes.Skip(1))
+        {
+            if (_lastCandleTimes[tf] == DateTime.MinValue)
+            {
+                // Keep the buffer as zeros (already initialized)
+                // Just mark as "initialized" at M1 time so confluence features work
+                _lastCandleTimes[tf] = m1Time;
+            }
+        }
+        _confluenceDirty = true;
+    }
+    
+    /// <summary>
+    /// DEPRECATED: Use ZeroPadMissingTimeframes instead.
+    /// Copy M1 features to higher timeframes as fallback when they're unavailable.
+    /// This is kept for backward compatibility but creates false patterns.
+    /// </summary>
+    [Obsolete("Use ZeroPadMissingTimeframes instead - copying M1 creates false patterns")]
     public void CopyM1ToMissingTimeframes()
     {
         if (_lastCandleTimes["M1"] == DateTime.MinValue)
@@ -242,7 +268,8 @@ public class MultiTimeframeStateBuilder
         float[]? newsFeatures = null,
         float[]? correlationFeatures = null,
         float[]? portfolioExposure = null,
-        float[]? dxyFeatures = null)
+        float[]? dxyFeatures = null,
+        float[]? timeFeatures = null)
     {
         return new AgentInput
         {
@@ -255,7 +282,28 @@ public class MultiTimeframeStateBuilder
             NewsFeatures = newsFeatures,
             CorrelationFeatures = correlationFeatures,
             PortfolioExposure = portfolioExposure,
-            DxyFeatures = dxyFeatures
+            DxyFeatures = dxyFeatures,
+            TimeFeatures = timeFeatures
+        };
+    }
+
+    /// <summary>
+    /// Build time-of-day features using cyclical encoding.
+    /// Captures hour of day and day of week patterns for session-aware trading.
+    /// </summary>
+    /// <param name="time">Current UTC time</param>
+    /// <returns>4D array: [sinHour, cosHour, sinDayOfWeek, cosDayOfWeek]</returns>
+    public static float[] BuildTimeFeatures(DateTime time)
+    {
+        var hour = time.Hour + time.Minute / 60.0;
+        var dayOfWeek = (int)time.DayOfWeek;
+        
+        return new float[]
+        {
+            (float)Math.Sin(2 * Math.PI * hour / 24.0),
+            (float)Math.Cos(2 * Math.PI * hour / 24.0),
+            (float)Math.Sin(2 * Math.PI * dayOfWeek / 7.0),
+            (float)Math.Cos(2 * Math.PI * dayOfWeek / 7.0)
         };
     }
 

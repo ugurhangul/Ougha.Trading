@@ -1,3 +1,5 @@
+using Ougha.Trading.Core.Models;
+
 namespace Ougha.Trading.RL;
 
 /// <summary>
@@ -100,6 +102,8 @@ public class RewardCalculator
     /// <param name="priceChange">Price change since last tick</param>
     /// <param name="symbolAtr">ATR for volatility normalization (optional)</param>
     /// <param name="slDistance">Stop loss distance for R:R calculation (optional)</param>
+    /// <param name="symbolInfo">Symbol info for point-based normalization (optional)</param>
+    /// <param name="currentPrice">Current symbol price for opportunity cost calculation</param>
     public float Calculate(
         bool tradeClosed,
         double tradeProfit,
@@ -113,7 +117,9 @@ public class RewardCalculator
         int positionDirection = 0, 
         double priceChange = 0,
         double symbolAtr = 0,
-        double slDistance = 0)
+        double slDistance = 0,
+        SymbolInfo? symbolInfo = null,
+        double currentPrice = 0)
     {
         var reward = 0f;
 
@@ -134,7 +140,7 @@ public class RewardCalculator
         {
             reward += CalculateOpenPositionReward(
                 unrealizedPnl, peakUnrealizedPnl, initialBalance, 
-                currentEquity, positionDirection, priceChange, holdingTicks);
+                currentEquity, positionDirection, priceChange, holdingTicks, symbolAtr);
             reward -= mddPenalty;
         }
         else
@@ -142,7 +148,9 @@ public class RewardCalculator
             // Opportunity cost model: only penalize if good setup was missed
             if (_config.UseOpportunityCostModel && symbolAtr > 0)
             {
-                reward -= CalculateOpportunityCostPenalty(currentEquity > 0 ? currentEquity : initialBalance, symbolAtr);
+                var symbolPoint = symbolInfo?.Point ?? 0.00001;
+                // Use actual price, not equity, for opportunity cost tracking
+                reward -= CalculateOpportunityCostPenalty(currentPrice > 0 ? currentPrice : 1.0, symbolAtr, symbolPoint);
             }
             else
             {
@@ -225,6 +233,8 @@ public class RewardCalculator
 
     /// <summary>
     /// Calculate reward component for an open position (shaping signal).
+    /// Designed to let agent EXPLORE holding - longer profitable holds = more cumulative reward.
+    /// Price changes are normalized by ATR for fair multi-symbol comparison.
     /// </summary>
     private float CalculateOpenPositionReward(
         double unrealizedPnl,
@@ -233,28 +243,51 @@ public class RewardCalculator
         double currentEquity,
         int positionDirection,
         double priceChange,
-        int holdingTicks)
+        int holdingTicks,
+        double symbolAtr)
     {
         var reward = 0f;
         
-        // Small holding time penalty (prevents infinitely holding)
-        reward -= _config.HoldingTimePenalty;
-        
-        // Progressive holding penalty for very long trades
+        // No holding penalties - let the agent explore freely
+        // Only very extreme holding (>MaxHoldingTicks) gets tiny penalty
         if (holdingTicks > _config.MaxHoldingTicks)
         {
             var excessTicks = holdingTicks - _config.MaxHoldingTicks;
-            reward -= _config.HoldingTimePenalty * (excessTicks / 100f);
+            reward -= 0.00001f * (excessTicks / 1000f);  // Negligible penalty
+        }
+        
+        // EXPLORATION INCENTIVE: Cumulative bonus for holding profitable positions
+        // The longer you hold in profit, the more reward you accumulate
+        // This teaches the agent that holding CAN be rewarding
+        // NOTE: unrealizedPnl is already a decimal percentage (0.01 = 1%)
+        if (unrealizedPnl > 0)
+        {
+            // Time-based growing bonus: reward increases with holding time
+            var holdingMinutes = holdingTicks / 60f;
+            var timeBonus = (float)Math.Log(1 + holdingMinutes) * 0.01f;  // Logarithmic growth - diminishing but continuous
+            reward += _config.HoldingBonus * (1.0f + timeBonus);
+            
+            // Extra bonus when profit is growing (momentum)
+            // unrealizedPnl is decimal (0.01 = 1%), convert to percentage
+            var profitPct = (float)unrealizedPnl * 100f;
+            if (profitPct > 0.5f)  // >0.5% profit
+            {
+                reward += 0.005f * Math.Min(profitPct, 5f);  // Cap at 5% for stability
+            }
         }
 
-        // Unrealized PnL shaping (increased to 15% for stronger hold incentive)
-        var unrealizedReward = (float)(unrealizedPnl / initialBalance) * 100f * _config.UnrealizedPnlScale;
-        reward += unrealizedReward * 0.15f;
+        // Unrealized PnL shaping - strong signal that being in profit is good
+        // NOTE: unrealizedPnl is already a decimal percentage (0.01 = 1%)
+        var unrealizedReward = (float)unrealizedPnl * 100f * _config.UnrealizedPnlScale;
+        reward += unrealizedReward * 0.25f;  // Increased to 25% for stronger hold incentive
 
         // Direction quality: reward when price moves in position direction
+        // Normalize by ATR so EURUSD micro-moves are equivalent to BTCUSD larger moves
         if (positionDirection != 0 && priceChange != 0)
         {
-            var directionReward = (float)(priceChange * positionDirection) * _config.PositionQualityScale;
+            var effectiveAtr = symbolAtr > 0 ? symbolAtr : _config.DefaultAtr;
+            var normalizedPriceChange = priceChange / effectiveAtr;  // Now in ATR units
+            var directionReward = (float)(normalizedPriceChange * positionDirection) * _config.PositionQualityScale;
             reward += Math.Clamp(directionReward, -0.1f, 0.1f);  // Bounded
         }
 
@@ -266,17 +299,19 @@ public class RewardCalculator
         }
 
         // PnL delta: reward for improvement since last step
+        // pnlDelta is already a percentage from UnrealizedPnlPercent
         var pnlDelta = unrealizedPnl - _previousUnrealizedPnl;
         if (pnlDelta > 0)
         {
-            reward += (float)(pnlDelta / initialBalance) * _config.PnlDeltaScale;
+            reward += (float)(pnlDelta * 100f) * _config.PnlDeltaScale;
         }
         else if (pnlDelta < 0)
         {
-            reward += (float)(pnlDelta / initialBalance) * _config.PnlDeltaScale * 0.5f;  // Asymmetric
+            reward += (float)(pnlDelta * 100f) * _config.PnlDeltaScale * 0.5f;  // Asymmetric
         }
 
         // Drawdown from peak penalty
+        // NOTE: peakUnrealizedPnl and unrealizedPnl are decimal percentages
         var dd = Math.Max(0, peakUnrealizedPnl - unrealizedPnl);
         if (dd > _config.DrawdownThreshold)
         {
@@ -311,8 +346,9 @@ public class RewardCalculator
     /// <summary>
     /// Calculate opportunity cost penalty based on missed price movement.
     /// Only penalizes when the agent missed a significant move while flat.
+    /// Uses ATR for volatility normalization and Point for price-scale normalization.
     /// </summary>
-    private float CalculateOpportunityCostPenalty(double currentPrice, double atr)
+    private float CalculateOpportunityCostPenalty(double currentPrice, double atr, double symbolPoint)
     {
         if (_flatStartPrice <= 0)
         {
@@ -323,12 +359,14 @@ public class RewardCalculator
         
         _flatTicks++;
         var priceMove = Math.Abs(currentPrice - _flatStartPrice);
+        
+        // Normalize price move by ATR (volatility-relative)
         var atrThreshold = atr * _config.OpportunityThresholdAtr;
         
         // If price moved significantly, agent missed an opportunity
         if (priceMove > atrThreshold)
         {
-            // Progressive penalty based on how much was missed
+            // Use ATR-normalized missed opportunity (independent of symbol price scale)
             var missedAtrMultiple = (float)(priceMove / atr);
             var penalty = _config.MissedOpportunityPenalty * Math.Min(missedAtrMultiple, 3f);
             

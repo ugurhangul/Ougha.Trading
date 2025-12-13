@@ -16,7 +16,7 @@ public class AsyncRolloutBuffer(int capacity, int maxPendingRollouts = 4)
     private readonly Channel<Experience[]> _readyRollouts = Channel.CreateBounded<Experience[]>(
         new BoundedChannelOptions(maxPendingRollouts)
         {
-            FullMode = BoundedChannelFullMode.DropOldest,
+            FullMode = BoundedChannelFullMode.DropOldest,  // TryWrite requires non-blocking; use larger buffer instead
             SingleReader = true,
             SingleWriter = false
         });

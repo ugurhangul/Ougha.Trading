@@ -1,5 +1,3 @@
-using Ougha.Trading.RL;
-
 namespace Ougha.Trading.RL.Agents;
 
 internal class DataLoader(PpoDataset ds, int batch, bool shuffle)
@@ -20,9 +18,9 @@ internal class DataLoader(PpoDataset ds, int batch, bool shuffle)
             }
         }
         
-        for(var i=0; i<n; i+=batch)
+        for (var i = 0; i < n; i += batch)
         {
-             var len = Math.Min(batch, n-i);
+             var len = Math.Min(batch, n - i);
              var batchIndices = new int[len];
              Array.Copy(indices, i, batchIndices, 0, len);
 
@@ -33,10 +31,12 @@ internal class DataLoader(PpoDataset ds, int batch, bool shuffle)
                  Actions = new int[len],
                  LogProbs = new float[len],
                  Advantages = new float[len],
-                 Returns = new float[len]
+                 Returns = new float[len],
+                 TpMultipliers = new float[len],
+                 SlMultipliers = new float[len]
              };
              
-             for(var j=0; j<len; j++)
+             for (var j = 0; j < len; j++)
              {
                  var idx = batchIndices[j];
                  batch1.States[j] = ds.States[idx];
@@ -44,6 +44,8 @@ internal class DataLoader(PpoDataset ds, int batch, bool shuffle)
                  batch1.LogProbs[j] = ds.LogProbs[idx];
                  batch1.Advantages[j] = ds.Advantages[idx];
                  batch1.Returns[j] = ds.Returns[idx];
+                 batch1.TpMultipliers[j] = ds.TpMultipliers[idx];
+                 batch1.SlMultipliers[j] = ds.SlMultipliers[idx];
              }
              
              yield return batch1;

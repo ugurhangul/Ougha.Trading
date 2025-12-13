@@ -26,12 +26,12 @@ public class RewardConfig
     /// <summary>
     /// Scale for realized profit rewards. Lower values = more stable learning.
     /// </summary>
-    public float RealizedProfitScale { get; set; } = 50f;  // Reduced from 200
+    public float RealizedProfitScale { get; set; } = 10f;  // Normalized from 50
     
     /// <summary>
     /// Bonus for winning trades (profit > 0).
     /// </summary>
-    public float WinBonus { get; set; } = 5f;  // Increased for stronger win signal
+    public float WinBonus { get; set; } = 3f;  // Symmetric with LossPenalty
     
     /// <summary>
     /// Penalty for losing trades. Symmetric with WinBonus for balanced risk.
@@ -41,7 +41,7 @@ public class RewardConfig
     /// <summary>
     /// Risk-adjusted reward: profit / SL distance. Rewards good R:R trades.
     /// </summary>
-    public float RiskRewardScale { get; set; } = 10f;
+    public float RiskRewardScale { get; set; } = 5f;  // Normalized: R-multiple capped at ±5, so max ±25
 
     // ========================
     // UNREALIZED PNL (SHAPING)
@@ -49,22 +49,22 @@ public class RewardConfig
     /// <summary>
     /// Scale for unrealized PnL shaping. Provides dense signal during trades.
     /// </summary>
-    public float UnrealizedPnlScale { get; set; } = 50f;  // Increased for denser learning signal
+    public float UnrealizedPnlScale { get; set; } = 10f;  // Normalized from 50
     
     /// <summary>
     /// Scale for PnL delta (improvement since last step). Encourages progress.
     /// </summary>
-    public float PnlDeltaScale { get; set; } = 20f;
+    public float PnlDeltaScale { get; set; } = 5f;  // Normalized from 20
     
     /// <summary>
     /// Penalty for drawdown from peak unrealized PnL.
     /// </summary>
-    public float DrawdownPenalty { get; set; } = 0.003f;  // Reduced from 0.005
+    public float DrawdownPenalty { get; set; } = 0.0001f;  // Reduced further - don't punish normal volatility
     
     /// <summary>
     /// Threshold before drawdown penalty kicks in.
     /// </summary>
-    public float DrawdownThreshold { get; set; } = 0.02f;  // Increased from 0.01
+    public float DrawdownThreshold { get; set; } = 0.15f;  // Increased to 5% - allow more room to breathe
 
     // ========================
     // POSITION MANAGEMENT
@@ -72,22 +72,27 @@ public class RewardConfig
     /// <summary>
     /// Per-tick penalty for holding a position. Discourages overly long trades.
     /// </summary>
-    public float HoldingTimePenalty { get; set; } = 0.00001f;  // Very small - don't discourage holding
+    public float HoldingTimePenalty { get; set; } = 0f;  // Disabled - let agent explore freely
     
     /// <summary>
-    /// Minimum ticks before a position can be closed without penalty.
+    /// Per-tick bonus for holding a profitable position. Encourages exploring longer holds.
     /// </summary>
-    public int MinHoldingTicks { get; set; } = 600;  // 10 minutes at S1 granularity (was 2 min)
+    public float HoldingBonus { get; set; } = 0.01f;  // Increased 5x - stronger incentive for holding profitable positions
     
     /// <summary>
-    /// Penalty for closing too early (before MinHoldingTicks).
+    /// Minimum ticks threshold for early close penalty (soft guidance, not enforcement).
     /// </summary>
-    public float EarlyClosePenalty { get; set; } = 15f;  // Strong penalty for closing too early
+    public int MinHoldingTicks { get; set; } = 300;  // 5 minutes - soft threshold only
+    
+    /// <summary>
+    /// Penalty for closing too early. Set to 0 to let agent explore freely.
+    /// </summary>
+    public float EarlyClosePenalty { get; set; } = 0f;  // Disabled - let agent discover holding value naturally
     
     /// <summary>
     /// Maximum holding ticks before increasing penalty.
     /// </summary>
-    public int MaxHoldingTicks { get; set; } = 14400;  // 4 hours at S1 granularity
+    public int MaxHoldingTicks { get; set; } = 43200;  // 12 hours - very long to allow exploration
     
     /// <summary>
     /// Ticks for quick profit bonus eligibility.
@@ -97,7 +102,7 @@ public class RewardConfig
     /// <summary>
     /// Bonus for quick profitable trades.
     /// </summary>
-    public float QuickProfitBonus { get; set; } = 0f;  // Disabled - was encouraging early closes
+    public float QuickProfitBonus { get; set; } = 0.0001f;  // Disabled - was encouraging early closes
 
     // ========================
     // OPPORTUNITY COST MODEL
@@ -111,7 +116,7 @@ public class RewardConfig
     /// <summary>
     /// Penalty when agent is flat but market moved significantly.
     /// </summary>
-    public float MissedOpportunityPenalty { get; set; } = 0.5f;
+    public float MissedOpportunityPenalty { get; set; } = 0.9f;
     
     /// <summary>
     /// ATR multiplier threshold: price move > this * ATR = missed opportunity.
@@ -129,17 +134,17 @@ public class RewardConfig
     /// <summary>
     /// Scale for rewarding correct direction (price moves in position direction).
     /// </summary>
-    public float PositionQualityScale { get; set; } = 10f;  // Reduced from 20
+    public float PositionQualityScale { get; set; } = 5f;  // Normalized from 100
     
     /// <summary>
     /// Scale for equity momentum (equity increasing).
     /// </summary>
-    public float EquityMomentumScale { get; set; } = 15f;  // Reduced from 30
+    public float EquityMomentumScale { get; set; } = 2f;  // Normalized from 15
     
     /// <summary>
     /// Scale for equity change percentage.
     /// </summary>
-    public float EquityChangeScale { get; set; } = 50f;  // Reduced from 100
+    public float EquityChangeScale { get; set; } = 5f;  // Normalized from 50
 
     // ========================
     // EPISODE-LEVEL METRICS
@@ -147,12 +152,12 @@ public class RewardConfig
     /// <summary>
     /// Weight for profit factor bonus/penalty.
     /// </summary>
-    public float ProfitFactorWeight { get; set; } = 20f;  // Reduced from 50
+    public float ProfitFactorWeight { get; set; } = 2f;  // Normalized from 10
     
     /// <summary>
     /// Weight for Sharpe ratio bonus/penalty.
     /// </summary>
-    public float SharpeRatioWeight { get; set; } = 20f;  // Reduced from 50
+    public float SharpeRatioWeight { get; set; } = 2f;  // Normalized from 10
     
     /// <summary>
     /// Minimum trades before PF is calculated.
@@ -167,12 +172,12 @@ public class RewardConfig
     /// <summary>
     /// Cap for profit factor (prevents outlier rewards).
     /// </summary>
-    public float PfCap { get; set; } = 5f;  // Reduced from 10
+    public float PfCap { get; set; } = 50f;  // Reduced from 10
     
     /// <summary>
     /// Cap for Sharpe ratio.
     /// </summary>
-    public float SharpeCap { get; set; } = 3f;  // Reduced from 5
+    public float SharpeCap { get; set; } = 30f;  // Reduced from 5
     
     /// <summary>
     /// Minimum PF threshold for positive reward.
@@ -190,7 +195,7 @@ public class RewardConfig
     /// <summary>
     /// Weight for max drawdown penalty.
     /// </summary>
-    public float MddPenaltyWeight { get; set; } = 25f;  // Reduced from 50
+    public float MddPenaltyWeight { get; set; } = 5f;  // Normalized from 25
     
     /// <summary>
     /// Threshold before MDD penalty kicks in (percentage).
@@ -208,7 +213,7 @@ public class RewardConfig
     /// <summary>
     /// Scale for reward normalization. Higher = less clipping.
     /// </summary>
-    public float RewardNormalizationScale { get; set; } = 50f;  // Increased for stronger gradient signal
+    public float RewardNormalizationScale { get; set; } = 10f;  // Reduced to match normalized reward magnitudes
     
     /// <summary>
     /// If true, normalize rewards to bounded range using tanh (smooth).

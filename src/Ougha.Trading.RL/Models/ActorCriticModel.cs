@@ -7,7 +7,7 @@ namespace Ougha.Trading.RL.Models;
 /// <summary>
 /// Actor-Critic Network for PPO.
 /// Enhanced architecture: MLP+LayerNorm body, cross-timeframe attention,
-/// LSTM temporal memory, separate value body, cross-symbol attention.
+/// stateful LSTM temporal memory (persisted across timesteps), separate value body.
 /// </summary>
 public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Tensor Value, Tensor TpSlParams)>
 {
@@ -32,21 +32,21 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     // Separate value body for better value estimation (reduces actor-critic interference)
     private readonly Sequential _valueBody;
     
-    // Cross-symbol attention for learning dynamic correlations between trading pairs
-    private readonly MultiheadAttention _symbolAttention;
-    private readonly LayerNorm _symbolLayerNorm;
+    // LSTM hidden states - persisted across forward passes for temporal memory
+    // Key: symbolId, Value: (h_n, c_n) hidden state tuple
+    private readonly Dictionary<int, (Tensor h, Tensor c)> _lstmHiddenStates = new();
 
     private readonly Sequential _actorHead;
     private readonly Sequential _criticHead;
     private readonly Sequential _tpSlHead;
 
     private const int TimeframeEmbedDim = 768;   // Scaled 3x for 24GB VRAM
-    private const int FeatureDim = 120;
+    private const int FeatureDim = 128;            // Model pads smaller inputs up to this size
     private const int HiddenDim = 4096;           // Scaled 4x for 24GB VRAM
     private const int ValueHiddenDim = 2048;      // Scaled 4x for 24GB VRAM
     private const int LstmHiddenDim = 2048;       // Scaled 4x for 24GB VRAM
 
-    public ActorCriticModel(string name, int numActions = 3, float dropout = 0.1f) : base(name)
+    public ActorCriticModel(string name, int numActions = 4, float dropout = 0.1f) : base(name)
     {
         _cnnM1 = CreateTimeframeEncoder();
         _cnnM5 = CreateTimeframeEncoder();
@@ -109,9 +109,8 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
             ReLU()
         );
         
-        // Cross-symbol attention: allows symbols to attend to each other
-        _symbolAttention = MultiheadAttention(LstmHiddenDim, 8, dropout: 0.1, bias: true);
-        _symbolLayerNorm = LayerNorm([LstmHiddenDim]);
+        // Note: Cross-symbol attention removed - requires synchronized timestamps which
+        // we cannot guarantee during PPO training with shuffled batches
 
         _actorHead = Sequential(
             Linear(LstmHiddenDim, 256),  // Takes from LSTM output
@@ -180,13 +179,15 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     }
     
     /// <summary>
-    /// Forward pass with cross-timeframe attention and LSTM temporal memory.
+    /// Forward pass with cross-timeframe attention and STATEFUL LSTM temporal memory.
     /// Inputs (packed): [PackedTimeframes, SymbolId, PackedFeatures]
+    /// The LSTM hidden states are persisted across forward calls for each symbol,
+    /// allowing the network to learn temporal patterns across trading decisions.
     /// </summary>
     public override (Tensor ActionLogits, Tensor Value, Tensor TpSlParams) forward(Tensor[] inputs)
     {
         var packedTf = inputs[0];  // [B, 5, W, F]
-        var symbolId = inputs[1];
+        var symbolId = inputs[1];  // [B, 1]
         var packedFeats = inputs[2];
         
         var batchSize = packedTf.shape[0];
@@ -231,19 +232,39 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
         // Actor path: shared body -> LSTM -> actor head
         var hidden = _sharedBody.forward(combined);
         
-        // LSTM temporal processing - treat batch as sequence of length 1
-        // Shape: [B, HiddenDim] -> [B, 1, HiddenDim] for LSTM
-        var lstmInput = hidden.unsqueeze(1);
-        var (lstmOut, _, _) = _temporalLstm.forward(lstmInput);
-        hidden = lstmOut.squeeze(1);  // [B, LstmHiddenDim]
-        hidden = _lstmLayerNorm.forward(hidden);
+        // LSTM temporal processing with STATEFUL hidden states
+        // Each sample in batch may have its own hidden state based on symbolId
+        var lstmInput = hidden.unsqueeze(1);  // [B, 1, HiddenDim]
         
-        // Apply cross-symbol attention when processing multiple symbols
-        // This allows each symbol to attend to others for portfolio-level decisions
-        if (batchSize > 1)
+        // For inference/single samples, use symbol-specific hidden state
+        // For training batches, we process without persistent state (shuffled data)
+        if (batchSize == 1)
         {
-            hidden = ApplyCrossSymbolAttention(hidden);
+            // Single sample - use persistent hidden state for this symbol
+            var symIdValue = (int)symbolId.cpu().data<long>()[0];
+            
+            (Tensor h, Tensor c)? priorState = null;
+            if (_lstmHiddenStates.TryGetValue(symIdValue, out var cachedState))
+            {
+                // Move to same device if needed
+                priorState = (cachedState.h.to(lstmInput.device), cachedState.c.to(lstmInput.device));
+            }
+            
+            var (lstmOut, h_n, c_n) = _temporalLstm.forward(lstmInput, priorState);
+            hidden = lstmOut.squeeze(1);  // [B, LstmHiddenDim]
+            
+            // Store detached hidden states for next forward pass
+            // Detach to prevent gradients flowing across episodes
+            _lstmHiddenStates[symIdValue] = (h_n.detach().cpu(), c_n.detach().cpu());
         }
+        else
+        {
+            // Batch processing (training) - no persistent state since batch is shuffled
+            var (lstmOut, _, _) = _temporalLstm.forward(lstmInput);
+            hidden = lstmOut.squeeze(1);  // [B, LstmHiddenDim]
+        }
+        
+        hidden = _lstmLayerNorm.forward(hidden);
         
         var actionLogits = _actorHead.forward(hidden);
         var tpSl = _tpSlHead.forward(hidden);
@@ -256,27 +277,31 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     }
     
     /// <summary>
-    /// Apply cross-symbol attention to learn dynamic correlations between symbols.
-    /// Each symbol's hidden state attends to all other symbols in the batch.
+    /// Reset the LSTM hidden state for a specific symbol.
+    /// Call this at episode boundaries to prevent information leakage across episodes.
     /// </summary>
-    private Tensor ApplyCrossSymbolAttention(Tensor hidden)
+    public void ResetHiddenState(int symbolId)
     {
-        // Reshape to sequence format: [1, BatchSize, HiddenDim] for attention
-        // This treats the batch as a sequence where each symbol is a token
-        var symbolSeq = hidden.unsqueeze(0);  // [1, B, H]
-        
-        // Self-attention across symbols
-        var (attended, _) = _symbolAttention.forward(
-            symbolSeq, symbolSeq, symbolSeq, 
-            key_padding_mask: null, 
-            need_weights: false, 
-            attn_mask: null);
-        
-        // Residual connection + layer norm
-        attended = attended + symbolSeq;
-        attended = _symbolLayerNorm.forward(attended.squeeze(0));  // Back to [B, H]
-        
-        return attended;
+        if (_lstmHiddenStates.TryGetValue(symbolId, out var state))
+        {
+            state.h.Dispose();
+            state.c.Dispose();
+            _lstmHiddenStates.Remove(symbolId);
+        }
+    }
+    
+    /// <summary>
+    /// Reset all LSTM hidden states.
+    /// Call this when starting a new episode or when syncing networks.
+    /// </summary>
+    public void ResetAllHiddenStates()
+    {
+        foreach (var (_, state) in _lstmHiddenStates)
+        {
+            state.h.Dispose();
+            state.c.Dispose();
+        }
+        _lstmHiddenStates.Clear();
     }
 }
 

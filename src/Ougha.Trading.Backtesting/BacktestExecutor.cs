@@ -304,7 +304,7 @@ public class BacktestExecutor : IOrderExecutor
             {
                 var holdingTicks = _currentTickIndex - _positionOpenTicks.GetValueOrDefault(currentSymbol);
                 ClosePositionAtPrice(currentSymbol, position, position.StopLoss, currentCandle.Time, ExitReason.StopLoss);
-                _pendingCloses.Add(new PendingCloseInfo(currentSymbol, 0, holdingTicks));
+                _pendingCloses.Add(new PendingCloseInfo(currentSymbol, 0, holdingTicks, ExitReason.StopLoss));
                 _positionOpenTicks.Remove(currentSymbol);
                 return;
             }
@@ -322,7 +322,7 @@ public class BacktestExecutor : IOrderExecutor
                  var holdingTicks = _currentTickIndex - _positionOpenTicks.GetValueOrDefault(currentSymbol);
                  ClosePositionAtPrice(currentSymbol, position, position.TakeProfit, currentCandle.Time, ExitReason.TakeProfit);
                  
-                 _pendingCloses.Add(new PendingCloseInfo(currentSymbol, 0, holdingTicks));
+                 _pendingCloses.Add(new PendingCloseInfo(currentSymbol, 0, holdingTicks, ExitReason.TakeProfit));
                  _positionOpenTicks.Remove(currentSymbol);
             }
         }

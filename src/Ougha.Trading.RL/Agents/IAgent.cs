@@ -26,7 +26,7 @@ public interface IAgent : IDisposable
     void AddExperience(AgentInput state, int action, float reward, AgentInput? nextState, bool done);
 
     /// <summary>
-    /// Add a batch of experiences with log probabilities for PPO training.
+    /// Add a batch of experiences with log probabilities and TP/SL multipliers for PPO training.
     /// </summary>
     void AddExperienceBatchWithLogProbs(
         AgentInput[] states,
@@ -34,7 +34,9 @@ public interface IAgent : IDisposable
         float[] rewards,
         AgentInput?[] nextStates,
         bool[] dones,
-        float[] logProbs);
+        float[] logProbs,
+        float[] tpMultipliers,
+        float[] slMultipliers);
 
     /// <summary>
     /// Perform a training step (optimization).

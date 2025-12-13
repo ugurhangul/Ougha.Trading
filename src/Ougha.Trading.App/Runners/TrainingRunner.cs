@@ -121,6 +121,16 @@ public static class TrainingRunner
 
         using var agent = CreateAgent(config, budget, batchSize, bufferSize, envConfig.NewsFeatureSize);
 
+        // Action logger for behavior analysis
+        var actionLoggingEnabled = config.GetValue("Training:EnableActionLogging", true);
+        using var actionLogger = new ActionLogger(
+            logDirectory: Path.Combine(Environment.CurrentDirectory, "action_logs"),
+            maxEntriesInMemory: 50000,
+            enabled: actionLoggingEnabled);
+        
+        if (actionLoggingEnabled)
+            AnsiConsole.MarkupLine("[grey]Action logging enabled - analyzing behavior patterns[/]");
+
         var earlyStop = new EarlyStopTracker(
             patience: budget.EarlyStopPatience,
             minEpisodes: budget.EarlyStopMinEpisodes);
@@ -253,6 +263,27 @@ public static class TrainingRunner
                                 var (nextStates, rewards, dones, stepsTaken) = await env.StepUntilM1CloseAsync(actions);
                                 envTimer.Stop();
                                 stats.EnvStepTimeMs = envTimer.Elapsed.TotalMilliseconds;
+                                
+                                // Log actions for analysis (every 10 steps to reduce overhead)
+                                if (step % 10 == 0 && actionLoggingEnabled)
+                                {
+                                    var positions = symbols.Select(s => env.Executor.GetPosition(s)).ToArray();
+                                    var hasPositions = positions.Select(p => p != null).ToArray();
+                                    var unrealizedPnls = positions.Select(p => (float)(p?.UnrealizedPnlPercent ?? 0)).ToArray();
+                                    var prices = symbols.Select(s => env.Executor.GetBid(s)).ToArray();
+                                    
+                                    actionLogger.LogActionBatch(
+                                        episode: ep,
+                                        step: step,
+                                        timestamp: env.Executor.CurrentTime,
+                                        symbols: symbols.ToArray(),
+                                        actions: actions,
+                                        rewards: rewards,
+                                        hasPositions: hasPositions,
+                                        unrealizedPnls: unrealizedPnls,
+                                        prices: prices,
+                                        entropy: stats.Entropy);
+                                }
 
                                 // Update step counter with actual S1 steps taken
                                 step += stepsTaken;
@@ -265,8 +296,17 @@ public static class TrainingRunner
                                 var doneFlags = new bool[stateInputs.Length];
                                 Array.Fill(doneFlags, episodeDone);
 
-                                // Add experience with accumulated M1 rewards
-                                agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs);
+                                // Extract TP/SL multipliers from 2D array for training
+                                var tpMults = new float[stateInputs.Length];
+                                var slMults = new float[stateInputs.Length];
+                                for (var i = 0; i < stateInputs.Length; i++)
+                                {
+                                    tpMults[i] = tpSlMults[i, 0];
+                                    slMults[i] = tpSlMults[i, 1];
+                                }
+
+                                // Add experience with accumulated M1 rewards and TP/SL multipliers
+                                agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs, tpMults, slMults);
 
                                 for (var i = 0; i < stateInputs.Length; i++)
                                 {
@@ -309,14 +349,27 @@ public static class TrainingRunner
                                     {
                                         trainTimer.Restart();
 
-                                        trainingTask = Task.Run(() =>
+                                        // PPO requires synchronous training (on-policy algorithm)
+                                        // Data must be collected by the current policy
+                                        if (agent is PpoAgent)
                                         {
-                                            // ReSharper disable once AccessToDisposedClosure
                                             var loss = agent.TrainMultipleBatches(budget.TrainBatches);
                                             trainTimer.Stop();
                                             stats.TrainTimeMs = trainTimer.Elapsed.TotalMilliseconds;
-                                            return loss;
-                                        });
+                                            stats.TrainCalls++;
+                                        }
+                                        else
+                                        {
+                                            // DQN is off-policy, can run async
+                                            trainingTask = Task.Run(() =>
+                                            {
+                                                // ReSharper disable once AccessToDisposedClosure
+                                                var loss = agent.TrainMultipleBatches(budget.TrainBatches);
+                                                trainTimer.Stop();
+                                                stats.TrainTimeMs = trainTimer.Elapsed.TotalMilliseconds;
+                                                return loss;
+                                            });
+                                        }
                                     }
                                 }
 
@@ -406,7 +459,7 @@ public static class TrainingRunner
                                 symStats.CumulativeSells += sells;
                                 symStats.TotalHoldingTimeSeconds += symbolHoldingSeconds;
                                 
-                                // Track min/max holding times per symbol
+                                // Track min/max holding times per symbol and update rolling window
                                 foreach (var trade in symbolTrades)
                                 {
                                     var holdSeconds = (trade.CloseTime - trade.OpenTime).TotalSeconds;
@@ -417,6 +470,12 @@ public static class TrainingRunner
                                         if (holdSeconds > symStats.MaxHoldingTimeSeconds)
                                             symStats.MaxHoldingTimeSeconds = holdSeconds;
                                     }
+                                    
+                                    // Add to rolling window for recent performance tracking
+                                    var isWin = trade.Profit > 0;
+                                    var profit = trade.Profit > 0 ? trade.Profit : 0;
+                                    var loss = trade.Profit < 0 ? Math.Abs(trade.Profit) : 0;
+                                    symStats.AddRollingTrade(isWin, profit, loss, holdSeconds);
                                 }
                                 
                                 // Track worst max drawdown per symbol
@@ -446,8 +505,8 @@ public static class TrainingRunner
 
                             agent.DecayEpsilon();
                             
-                            // Check for entropy reset every 100 episodes if PPO
-                            if (ep % 100 == 0 && agent is PpoAgent ppoAgent)
+                            // Check for entropy reset every 50 episodes if PPO (more frequent for earlier intervention)
+                            if (ep % 50 == 0 && agent is PpoAgent ppoAgent)
                             {
                                 var actionCountsArr = stats.GetActionCountsAsArray();
                                 if (ppoAgent.CheckAndResetEntropy(actionCountsArr, skewThreshold: 0.70f))
@@ -496,6 +555,21 @@ public static class TrainingRunner
         }
         finally
         {
+            // Generate and display action analysis report
+            if (actionLoggingEnabled)
+            {
+                var report = actionLogger.GenerateReport();
+                AnsiConsole.MarkupLine("\n[bold cyan]Action Analysis Report:[/]");
+                AnsiConsole.WriteLine(report.ToString());
+                Log.Information("Action Analysis Report:\n{Report}", report.ToString());
+                
+                // Log potential flaws as warnings
+                foreach (var flaw in report.PotentialFlaws)
+                {
+                    Log.Warning("[ActionAnalysis] {Flaw}", flaw);
+                }
+            }
+            
             Log.Information("=== Training session ended ===");
             await Log.CloseAndFlushAsync();
         }
@@ -557,6 +631,7 @@ public static class TrainingRunner
             0 => "HOLD",
             1 => "BUY",
             2 => "SELL",
+            3 => "CLOSE",
             _ => $"ACT_{action}"
         };
     }

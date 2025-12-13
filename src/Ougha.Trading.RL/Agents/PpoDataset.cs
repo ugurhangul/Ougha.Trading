@@ -1,4 +1,3 @@
-using Ougha.Trading.RL;
 using Ougha.Trading.RL.Training;
 
 namespace Ougha.Trading.RL.Agents;
@@ -10,21 +9,29 @@ internal class PpoDataset
     public readonly float[] LogProbs;
     public readonly float[] Advantages;
     public readonly float[] Returns;
+    public readonly float[] TpMultipliers;
+    public readonly float[] SlMultipliers;
+    public readonly float[] OldValues;  // For value function clipping
     
-    public PpoDataset(Experience[] rollouts, float[] advantages, float[] returns)
+    public PpoDataset(Experience[] rollouts, float[] advantages, float[] returns, float[]? oldValues = null)
     {
         var n = rollouts.Length;
         States = new AgentInput[n];
         Actions = new int[n];
         LogProbs = new float[n];
+        TpMultipliers = new float[n];
+        SlMultipliers = new float[n];
         Advantages = advantages;
         Returns = returns;
+        OldValues = oldValues ?? new float[n];  // Zero if not provided
         
-        for(var i=0; i<n; i++)
+        for (var i = 0; i < n; i++)
         {
             States[i] = rollouts[i].State;
             Actions[i] = rollouts[i].Action;
-            LogProbs[i] = rollouts[i].Priority;
+            LogProbs[i] = rollouts[i].LogProb;
+            TpMultipliers[i] = rollouts[i].TpMultiplier;
+            SlMultipliers[i] = rollouts[i].SlMultiplier;
         }
     }
 }

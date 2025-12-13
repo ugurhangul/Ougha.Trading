@@ -132,8 +132,11 @@ public class OnnxAgent : IAgent
         float[] rewards,
         AgentInput?[] nextStates,
         bool[] dones,
-        float[] logProbs)
+        float[] logProbs,
+        float[] tpMultipliers,
+        float[] slMultipliers)
     {
+        // OnnxAgent is inference-only, no training
     }
     
     public void SyncInferenceNetwork() {

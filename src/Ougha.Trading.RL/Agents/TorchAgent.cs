@@ -286,7 +286,8 @@ public class TorchAgent : IAgent
         var dones = tensor(_trainDoneBuffer, dtype: ScalarType.Float32, device: _device);
         var isWeights = tensor(weights, dtype: ScalarType.Float32, device: _device);
 
-        var (qValuesAll, _) = _policyNet.forward(stateTensors);
+        // Get Q-values AND TP/SL predictions (no longer discarding TP/SL)
+        var (qValuesAll, tpSlPred) = _policyNet.forward(stateTensors);
         var qValues = qValuesAll.gather(1, actions).squeeze(1);
 
         Tensor targetQ;
@@ -313,10 +314,38 @@ public class TorchAgent : IAgent
         }
 
         var elementWiseLoss = functional.smooth_l1_loss(qValues, targetQ, reduction: Reduction.None);
-        var weightedLoss = (elementWiseLoss * isWeights).mean();
+        var qLoss = (elementWiseLoss * isWeights).mean();
+
+        // TP/SL loss: train on experiences with positive rewards (profitable actions)
+        // Extract stored TP/SL targets from experiences
+        var tpTargets = new float[_batchSize];
+        var slTargets = new float[_batchSize];
+        for (var i = 0; i < _batchSize; i++)
+        {
+            tpTargets[i] = batch[i].TpMultiplier;
+            slTargets[i] = batch[i].SlMultiplier;
+        }
+        
+        var targetTp = tensor(tpTargets, dtype: ScalarType.Float32, device: _device);
+        var targetSl = tensor(slTargets, dtype: ScalarType.Float32, device: _device);
+        var predTp = tpSlPred[TensorIndex.Colon, 0];
+        var predSl = tpSlPred[TensorIndex.Colon, 1];
+        
+        // Weight by positive rewards and non-HOLD actions
+        var actionsTensor = tensor(_trainActionBuffer, dtype: ScalarType.Int64, device: _device);
+        var tradeMask = (actionsTensor != 0).to_type(ScalarType.Float32);
+        var posRewardMask = (rewards > 0).to_type(ScalarType.Float32);
+        var tpSlWeight = tradeMask * posRewardMask;
+        
+        var tpError = (predTp - targetTp).pow(2) * tpSlWeight;
+        var slError = (predSl - targetSl).pow(2) * tpSlWeight;
+        var tpSlLoss = (tpError.sum() + slError.sum()) / (tpSlWeight.sum() + 1e-8f);
+        
+        // Combined loss with TP/SL coefficient
+        var loss = qLoss + 0.1f * tpSlLoss;
 
         _optimizer.zero_grad();
-        weightedLoss.backward();
+        loss.backward();
         nn.utils.clip_grad_norm_(_policyNet.parameters(), 1.0);
         _optimizer.step();
 
@@ -327,7 +356,7 @@ public class TorchAgent : IAgent
         if (_stepCount % 100 == 0)
             SyncInferenceNetwork();
 
-        return weightedLoss.item<float>();
+        return loss.item<float>();
     }
     
     public void Observe(AgentInput state, int action, float reward, AgentInput nextState, bool done)
@@ -441,9 +470,15 @@ public class TorchAgent : IAgent
         float[] rewards,
         AgentInput?[] nextStates,
         bool[] dones,
-        float[] logProbs)
+        float[] logProbs,
+        float[] tpMultipliers,
+        float[] slMultipliers)
     {
-        AddExperienceBatch(states, actions, rewards, nextStates, dones);
+        // DQN now stores TP/SL for training the TP/SL head
+        lock (_bufferLock)
+        {
+            _buffer.AddBatchWithTpSl(states, actions, rewards, nextStates, dones, tpMultipliers, slMultipliers);
+        }
     }
 
     private Tensor[] PrepareInputTensors(AgentInput[] inputs, bool useTrainingBuffers)

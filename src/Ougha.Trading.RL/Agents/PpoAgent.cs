@@ -17,6 +17,7 @@ public class PpoAgent : IAgent
     private readonly float _gaeLambda;
     private readonly float _clipEpsilon;
     private readonly float _valueCoef;
+    private readonly float _tpSlCoef;
     private float _entropyCoef;
     private readonly float _minEntropyCoef;
     private readonly int _updateEpochs;
@@ -27,6 +28,11 @@ public class PpoAgent : IAgent
     private readonly float[] _zeroNews;
     
     private float _lastLogProb;
+    
+    // LR scheduling
+    private readonly float _initialLr;
+    private int _totalUpdates;
+    private readonly int _expectedTotalUpdates;
 
     private const int MAX_INFERENCE_BATCH = 64;
     private const int WINDOW_SIZE = 20;
@@ -54,11 +60,15 @@ public class PpoAgent : IAgent
         _gaeLambda = gaeLambda;
         _clipEpsilon = clipEpsilon;
         _valueCoef = 0.5f;
-        _entropyCoef = 0.12f;  // Lower start for more exploitation with massive model
-        _minEntropyCoef = 0.02f;  // Lower floor allows sharper final policy
-        _updateEpochs = 8; // More epochs per rollout for larger model
+        _tpSlCoef = 0.1f;  // TP/SL loss weight
+        _entropyCoef = 0.05f;  // Standard PPO range: 0.01-0.1 (was 1.1 - too high)
+        _minEntropyCoef = 0.02f;
+        _updateEpochs = 4;  // Reduced from 8 to prevent overfitting on trading data
         
-        // LR Scheduling
+        // LR Scheduling - linear decay over expected training
+        _initialLr = learningRate;
+        _totalUpdates = 0;
+        _expectedTotalUpdates = 10000;  // Estimated total PPO updates
 
         var cudaAvailable = cuda.is_available();
         _device = useCuda && cudaAvailable ? CUDA : CPU;
@@ -78,8 +88,8 @@ public class PpoAgent : IAgent
         _newsFeatureSize = newsFeatureSize;
         _zeroNews = new float[newsFeatureSize];
         
-        // totalFeatures = 5 + 10 + 5 + 9 + newsFeatureSize + 20 + 12
-        var totalFeatures = 5 + 10 + 5 + 9 + _newsFeatureSize + 20 + 12;
+        // totalFeatures = 5 + 10 + 5 + 9 + newsFeatureSize + 20 + 12 + 8 (DxyFeatures)
+        var totalFeatures = 5 + 10 + 5 + 9 + _newsFeatureSize + 20 + 12 + 8;
         
         _packedTfBuffer = new float[MAX_INFERENCE_BATCH * 5 * WINDOW_SIZE * NUM_FEATURES];
         _packedFeatBuffer = new float[MAX_INFERENCE_BATCH * totalFeatures];
@@ -92,6 +102,10 @@ public class PpoAgent : IAgent
              var stateDict = _model.state_dict();
              _inferenceNet.load_state_dict(stateDict);
         }
+        
+        // Reset LSTM hidden states - cached states may be invalid after weight sync
+        // The model's internal state dict changed, so old cached tensors could be stale
+        _inferenceNet.ResetAllHiddenStates();
     }
 
     public int Act(AgentInput input, bool training = true)
@@ -192,7 +206,7 @@ public class PpoAgent : IAgent
             Reward = reward,
             NextState = nextState,
             Done = done,
-            Priority = logProb
+            LogProb = logProb
         });
     }
 
@@ -203,7 +217,8 @@ public class PpoAgent : IAgent
         AgentInput?[] nextStates,
         bool[] dones)
     {
-        AddExperienceBatchWithLogProbs(states, actions, rewards, nextStates, dones, new float[states.Length]);
+        AddExperienceBatchWithLogProbs(states, actions, rewards, nextStates, dones, 
+            new float[states.Length], new float[states.Length], new float[states.Length]);
     }
 
     public void AddExperienceBatchWithLogProbs(
@@ -212,7 +227,9 @@ public class PpoAgent : IAgent
         float[] rewards,
         AgentInput?[] nextStates,
         bool[] dones,
-        float[] logProbs)
+        float[] logProbs,
+        float[] tpMultipliers,
+        float[] slMultipliers)
     {
         var count = states.Length;
         var usePreallocated = count <= MAX_INFERENCE_BATCH;
@@ -229,7 +246,9 @@ public class PpoAgent : IAgent
                 Reward = rewards[i],
                 NextState = nextStates[i],
                 Done = dones[i],
-                Priority = logProbs[i]
+                LogProb = logProbs[i],
+                TpMultiplier = tpMultipliers[i],
+                SlMultiplier = slMultipliers[i]
             };
         }
         
@@ -264,14 +283,23 @@ public class PpoAgent : IAgent
         for (var i = 0; i < T; i++)
             states[i] = rollouts[i].State;
 
-        var (advantages, returns) = ComputeGae(rollouts, states);
+        var (advantages, returns, oldValues) = ComputeGaeWithValues(rollouts, states);
 
-        var dataset = new PpoDataset(rollouts, advantages, returns);
+        var dataset = new PpoDataset(rollouts, advantages, returns, oldValues);
         var loader = new DataLoader(dataset, _batchSize, shuffle: true);
         
         _model.train();
         float totalLoss = 0;
         var steps = 0;
+        
+        // Apply LR scheduling (linear decay)
+        _totalUpdates++;
+        var progress = Math.Min(1.0f, (float)_totalUpdates / _expectedTotalUpdates);
+        var currentLr = _initialLr * (1.0f - 0.9f * progress);  // Decay to 10% of initial LR
+        foreach (var paramGroup in _optimizer.ParamGroups)
+        {
+            paramGroup.LearningRate = currentLr;
+        }
         
         // Use DisposeScope for all tensors to prevent heap corruption
         using (NewDisposeScope())
@@ -282,6 +310,9 @@ public class PpoAgent : IAgent
             var allLogProbs = tensor(dataset.LogProbs, dtype: ScalarType.Float32, device: _device);
             var allReturns = tensor(dataset.Returns, dtype: ScalarType.Float32, device: _device);
             var allAdvantages = tensor(dataset.Advantages, dtype: ScalarType.Float32, device: _device);
+            var allTpMults = tensor(dataset.TpMultipliers, dtype: ScalarType.Float32, device: _device);
+            var allSlMults = tensor(dataset.SlMultipliers, dtype: ScalarType.Float32, device: _device);
+            var allOldValues = tensor(dataset.OldValues, dtype: ScalarType.Float32, device: _device);
 
             for (var epoch = 0; epoch < _updateEpochs; epoch++)
             {
@@ -300,10 +331,13 @@ public class PpoAgent : IAgent
                         var oldLogProbs = allLogProbs.index_select(0, batchIndices);
                         var returnsTensor = allReturns.index_select(0, batchIndices);
                         var advs = allAdvantages.index_select(0, batchIndices);
+                        var targetTpMults = allTpMults.index_select(0, batchIndices);
+                        var targetSlMults = allSlMults.index_select(0, batchIndices);
+                        var oldValuesBatch = allOldValues.index_select(0, batchIndices);
 
                         var normalizedAdvs = (advs - advs.mean()) / (advs.std() + 1e-8f);
                         
-                        var (logits, values, _) = _model.forward(stateTensors);
+                        var (logits, values, tpSlPred) = _model.forward(stateTensors);
 
                         var probs = nn.functional.softmax(logits, dim: 1);
                         var dist = distributions.Categorical(probs);
@@ -315,9 +349,28 @@ public class PpoAgent : IAgent
                         var surr2 = clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * normalizedAdvs;
                         var actorLoss = -min(surr1, surr2).mean();
 
-                        var valueLoss = nn.functional.mse_loss(values.squeeze(), returnsTensor);
+                        // Value function clipping (standard PPO technique)
+                        var valuesSqueeezed = values.squeeze();
+                        var valueClipped = oldValuesBatch + clamp(valuesSqueeezed - oldValuesBatch, -_clipEpsilon, _clipEpsilon);
+                        var valueLoss1 = (valuesSqueeezed - returnsTensor).pow(2);
+                        var valueLoss2 = (valueClipped - returnsTensor).pow(2);
+                        var valueLoss = 0.5f * max(valueLoss1, valueLoss2).mean();
                         
-                        var loss = actorLoss + _valueCoef * valueLoss - _entropyCoef * entropy;
+                        // TP/SL loss: MSE weighted by positive advantages (reinforce good trades' TP/SL)
+                        // tpSlPred shape: [BatchSize, 2] where [:, 0] = TP, [:, 1] = SL
+                        var predTp = tpSlPred.select(1, 0);
+                        var predSl = tpSlPred.select(1, 1);
+                        
+                        // Create mask for trades (non-HOLD actions where advantage > 0)
+                        var tradeMask = (actions != 0).to_type(ScalarType.Float32);
+                        var positiveAdvMask = (advs > 0).to_type(ScalarType.Float32);
+                        var tpSlWeight = tradeMask * positiveAdvMask;  // Only train TP/SL on profitable trades
+                        
+                        var tpError = (predTp - targetTpMults).pow(2) * tpSlWeight;
+                        var slError = (predSl - targetSlMults).pow(2) * tpSlWeight;
+                        var tpSlLoss = (tpError.sum() + slError.sum()) / (tpSlWeight.sum() + 1e-8f);
+                        
+                        var loss = actorLoss + _valueCoef * valueLoss + _tpSlCoef * tpSlLoss - _entropyCoef * entropy;
                         
                         _optimizer.zero_grad();
                         loss.backward();
@@ -338,7 +391,7 @@ public class PpoAgent : IAgent
         return steps > 0 ? totalLoss / steps : 0;
     }
 
-    private (float[] Advantages, float[] Returns) ComputeGae(Experience[] rollouts, AgentInput[] states)
+    private (float[] Advantages, float[] Returns, float[] OldValues) ComputeGaeWithValues(Experience[] rollouts, AgentInput[] states)
     {
         var T = rollouts.Length;
         var advantages = new float[T];
@@ -413,7 +466,11 @@ public class PpoAgent : IAgent
             returns[t] = advantages[t] + values[t];
         }
         
-        return (advantages, returns);
+        // Extract old values (first T elements) for value clipping
+        var oldValues = new float[T];
+        Array.Copy(values, oldValues, T);
+        
+        return (advantages, returns, oldValues);
     }
 
     public void Save(string path) => _model.save(path);
@@ -430,7 +487,7 @@ public class PpoAgent : IAgent
     public void DecayEpsilon()
     {
         if (!(_entropyCoef > _minEntropyCoef)) return;
-        _entropyCoef *= 0.9999f;  // Very slow decay for large model stability
+        _entropyCoef *= 0.9990f;
         _entropyCoef = Math.Max(_entropyCoef, _minEntropyCoef);
     }
     
@@ -447,10 +504,10 @@ public class PpoAgent : IAgent
     /// Check action distribution and reset entropy if too skewed.
     /// Call this periodically (e.g., every 100 episodes) with action counts.
     /// </summary>
-    /// <param name="actionCounts">Array of action counts [Hold, Buy1, Buy2, Buy3, Sell1, Sell2, Sell3, Close]</param>
+    /// <param name="actionCounts">Array of action counts [Hold, Buy, Sell, Close] (4 actions)</param>
     /// <param name="skewThreshold">Max allowed percentage for any single action (0.0-1.0)</param>
     /// <returns>True if entropy was reset</returns>
-    public bool CheckAndResetEntropy(int[] actionCounts, float skewThreshold = 0.70f)
+    public bool CheckAndResetEntropy(int[] actionCounts, float skewThreshold = 0.55f)  // Reduced from 0.70 for earlier intervention
     {
         if (actionCounts == null || actionCounts.Length == 0) return false;
         
@@ -539,7 +596,7 @@ public class PpoAgent : IAgent
         tensors[1] = tensor(symBuffer, new long[] { batchSize, 1 }, 
             dtype: ScalarType.Int64, device: _device);
 
-        var totalFeatures = 5 + 10 + 5 + 9 + _newsFeatureSize + 20 + 12;
+        var totalFeatures = 5 + 10 + 5 + 9 + _newsFeatureSize + 20 + 12 + 8;  // Without TimeFeatures
         var featTotalLen = batchSize * totalFeatures;
         var featPackedBuffer = usePreallocated && _packedFeatBuffer != null 
             ? _packedFeatBuffer 
@@ -556,7 +613,8 @@ public class PpoAgent : IAgent
             CopyFeatures(featPackedBuffer, offset, inp.RiskState, 9); offset += 9;
             CopyFeatures(featPackedBuffer, offset, inp.NewsFeatures ?? _zeroNews, _newsFeatureSize); offset += _newsFeatureSize;
             CopyFeatures(featPackedBuffer, offset, inp.CorrelationFeatures ?? ZeroCorrelation, 20); offset += 20;
-            CopyFeatures(featPackedBuffer, offset, inp.PortfolioExposure ?? ZeroExposure, 12);
+            CopyFeatures(featPackedBuffer, offset, inp.PortfolioExposure ?? ZeroExposure, 12); offset += 12;
+            CopyFeatures(featPackedBuffer, offset, inp.DxyFeatures ?? ZeroDxy, 8);
         }
         
         tensors[2] = tensor(featPackedBuffer, new long[] { batchSize, totalFeatures }, 
@@ -580,6 +638,8 @@ public class PpoAgent : IAgent
 
     private static readonly float[] ZeroCorrelation = new float[20];
     private static readonly float[] ZeroExposure = new float[12];
+    private static readonly float[] ZeroDxy = new float[8];
+    private static readonly float[] ZeroTime = new float[4];
 
 
     public void Dispose()
