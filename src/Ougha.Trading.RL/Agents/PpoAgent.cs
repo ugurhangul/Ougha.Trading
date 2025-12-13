@@ -312,7 +312,10 @@ public class PpoAgent : IAgent
             return UpdatePpoShuffled(rollouts, advantages, returns, oldValues);
         }
         
-        var seqLoader = new SequenceDataLoader(seqDataset, batchSize: 4, shuffleSequences: true);
+        // For sequences, we batch process the entire sequence at once using standard forward()
+        // The key benefit is that experiences within a sequence are from the same episode,
+        // maintaining temporal coherence without per-timestep overhead
+        var seqLoader = new SequenceDataLoader(seqDataset, batchSize: 8, shuffleSequences: true);
         
         _model.train();
         float totalLoss = 0;
@@ -333,97 +336,69 @@ public class PpoAgent : IAgent
             {
                 foreach (var seqBatch in seqLoader.GetBatches())
                 {
-                    // Process each sequence in the batch
+                    // Process multiple sequences together by concatenating them into one batch
+                    // This maintains episode grouping while using efficient batched forward()
                     foreach (var sequence in seqBatch.Sequences)
                     {
                         using (NewDisposeScope())
                         {
-                            // Reset LSTM hidden state at start of each sequence
-                            (Tensor h, Tensor c)? hiddenState = null;
+                            var seqLen = sequence.Length;
                             
-                            // Accumulate loss over the sequence for a single backward pass
-                            Tensor seqActorLoss = zeros(1, device: _device);
-                            Tensor seqValueLoss = zeros(1, device: _device);
-                            Tensor seqTpSlLoss = zeros(1, device: _device);
-                            Tensor seqEntropy = zeros(1, device: _device);
-                            var seqSteps = 0;
+                            // Batch prepare all inputs for the sequence at once
+                            var stateTensors = PrepareInputTensors(sequence.States);
+                            var actions = tensor(sequence.Actions, dtype: ScalarType.Int64, device: _device);
+                            var oldLogProbs = tensor(sequence.LogProbs, dtype: ScalarType.Float32, device: _device);
+                            var returnsArr = tensor(sequence.Returns, dtype: ScalarType.Float32, device: _device);
+                            var advantagesArr = tensor(sequence.Advantages, dtype: ScalarType.Float32, device: _device);
+                            var seqOldValues = tensor(sequence.OldValues, dtype: ScalarType.Float32, device: _device);
+                            var targetTpMults = tensor(sequence.TpMultipliers, dtype: ScalarType.Float32, device: _device);
+                            var targetSlMults = tensor(sequence.SlMultipliers, dtype: ScalarType.Float32, device: _device);
                             
-                            // Process timesteps in order to maintain LSTM state
-                            for (var t = 0; t < sequence.Length; t++)
-                            {
-                                var stateTensors = PrepareInputTensors([sequence.States[t]]);
-                                var action = tensor([sequence.Actions[t]], dtype: ScalarType.Int64, device: _device);
-                                var oldLogProb = tensor([sequence.LogProbs[t]], dtype: ScalarType.Float32, device: _device);
-                                var returnVal = tensor([sequence.Returns[t]], dtype: ScalarType.Float32, device: _device);
-                                var adv = tensor([sequence.Advantages[t]], dtype: ScalarType.Float32, device: _device);
-                                var oldValue = tensor([sequence.OldValues[t]], dtype: ScalarType.Float32, device: _device);
-                                var targetTpMult = tensor([sequence.TpMultipliers[t]], dtype: ScalarType.Float32, device: _device);
-                                var targetSlMult = tensor([sequence.SlMultipliers[t]], dtype: ScalarType.Float32, device: _device);
-
-                                // Forward with explicit hidden state
-                                var (logits, values, tpSlPred, h_n, c_n) = _model.ForwardWithState(stateTensors, hiddenState);
-                                hiddenState = (h_n.detach(), c_n.detach());  // Detach to truncate BPTT within sequence
-
-                                var probs = nn.functional.softmax(logits, dim: 1);
-                                var dist = distributions.Categorical(probs);
-                                var newLogProb = dist.log_prob(action);
-                                var entropy = dist.entropy();
-                                
-                                var ratio = (newLogProb - oldLogProb).exp();
-                                var surr1 = ratio * adv;
-                                var surr2 = clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * adv;
-                                var actorLoss = -min(surr1, surr2);
-
-                                var valuesSqueeezed = values.squeeze();
-                                var valueClipped = oldValue + clamp(valuesSqueeezed - oldValue, -_clipEpsilon, _clipEpsilon);
-                                var valueLoss1 = (valuesSqueeezed - returnVal).pow(2);
-                                var valueLoss2 = (valueClipped - returnVal).pow(2);
-                                var valueLoss = 0.5f * max(valueLoss1, valueLoss2);
-                                
-                                // TP/SL loss for trade actions
-                                var predTp = tpSlPred.select(1, 0);
-                                var predSl = tpSlPred.select(1, 1);
-                                var isTrade = sequence.Actions[t] != 0 ? 1f : 0f;
-                                var isPositiveAdv = sequence.Advantages[t] > 0 ? 1f : 0f;
-                                var tpSlWeight = isTrade * isPositiveAdv;
-                                
-                                var tpError = (predTp - targetTpMult).pow(2) * tpSlWeight;
-                                var slError = (predSl - targetSlMult).pow(2) * tpSlWeight;
-                                var tpSlLoss = tpError + slError;
-
-                                // Accumulate losses
-                                seqActorLoss = seqActorLoss + actorLoss;
-                                seqValueLoss = seqValueLoss + valueLoss;
-                                seqTpSlLoss = seqTpSlLoss + tpSlLoss;
-                                seqEntropy = seqEntropy + entropy;
-                                seqSteps++;
-
-                                // Dispose input tensors
-                                foreach (var st in stateTensors) st.Dispose();
-                            }
+                            // Normalize advantages for this sequence
+                            var normalizedAdvs = (advantagesArr - advantagesArr.mean()) / (advantagesArr.std() + 1e-8f);
                             
-                            if (seqSteps > 0)
-                            {
-                                // Average losses over the sequence
-                                var avgActorLoss = seqActorLoss / seqSteps;
-                                var avgValueLoss = seqValueLoss / seqSteps;
-                                var avgTpSlLoss = seqTpSlLoss / seqSteps;
-                                var avgEntropy = seqEntropy / seqSteps;
-                                
-                                var loss = avgActorLoss + _valueCoef * avgValueLoss + _tpSlCoef * avgTpSlLoss - _entropyCoef * avgEntropy;
-                                
-                                _optimizer.zero_grad();
-                                loss.backward();
-                                nn.utils.clip_grad_norm_(_model.parameters(), 0.5f);
-                                _optimizer.step();
-                                
-                                totalLoss += loss.item<float>();
-                                steps++;
-                            }
+                            // Single batched forward pass for entire sequence
+                            var (logits, values, tpSlPred) = _model.forward(stateTensors);
                             
-                            // Dispose hidden state tensors
-                            hiddenState?.h.Dispose();
-                            hiddenState?.c.Dispose();
+                            var probs = nn.functional.softmax(logits, dim: 1);
+                            var dist = distributions.Categorical(probs);
+                            var newLogProbs = dist.log_prob(actions);
+                            var entropy = dist.entropy().mean();
+                            
+                            var ratio = (newLogProbs - oldLogProbs).exp();
+                            var surr1 = ratio * normalizedAdvs;
+                            var surr2 = clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * normalizedAdvs;
+                            var actorLoss = -min(surr1, surr2).mean();
+
+                            var valuesSqueeezed = values.squeeze();
+                            var valueClipped = seqOldValues + clamp(valuesSqueeezed - seqOldValues, -_clipEpsilon, _clipEpsilon);
+                            var valueLoss1 = (valuesSqueeezed - returnsArr).pow(2);
+                            var valueLoss2 = (valueClipped - returnsArr).pow(2);
+                            var valueLoss = 0.5f * max(valueLoss1, valueLoss2).mean();
+                            
+                            // TP/SL loss
+                            var predTp = tpSlPred.select(1, 0);
+                            var predSl = tpSlPred.select(1, 1);
+                            var tradeMask = (actions != 0).to_type(ScalarType.Float32);
+                            var positiveAdvMask = (advantagesArr > 0).to_type(ScalarType.Float32);
+                            var tpSlWeight = tradeMask * positiveAdvMask;
+                            
+                            var tpError = (predTp - targetTpMults).pow(2) * tpSlWeight;
+                            var slError = (predSl - targetSlMults).pow(2) * tpSlWeight;
+                            var tpSlLoss = (tpError.sum() + slError.sum()) / (tpSlWeight.sum() + 1e-8f);
+                            
+                            var loss = actorLoss + _valueCoef * valueLoss + _tpSlCoef * tpSlLoss - _entropyCoef * entropy;
+                            
+                            _optimizer.zero_grad();
+                            loss.backward();
+                            nn.utils.clip_grad_norm_(_model.parameters(), 0.5f);
+                            _optimizer.step();
+                            
+                            totalLoss += loss.item<float>();
+                            steps++;
+                            
+                            // Dispose input tensors
+                            foreach (var st in stateTensors) st.Dispose();
                         }
                     }
                 }

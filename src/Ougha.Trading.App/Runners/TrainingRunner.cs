@@ -528,11 +528,12 @@ public static class TrainingRunner
                             stats.Entropy = GetEntropy(agent);
                             ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
 
-                            if (ep % budget.SaveFrequency == 0)
-                            {
-                                var checkpointPath = Path.Combine(modelDir, $"checkpoint_ep{ep}.pt");
-                                agent.Save(checkpointPath);
-                            }
+                            // Disable checkpointing for now
+                            // if (ep % budget.SaveFrequency == 0)
+                            // {
+                            //     var checkpointPath = Path.Combine(modelDir, $"checkpoint_ep{ep}.pt");
+                            //     agent.Save(checkpointPath);
+                            // }
 
                             // Early stop disabled - train for full episodes
                             // if (shouldStop)
