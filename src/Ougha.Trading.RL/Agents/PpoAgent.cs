@@ -461,8 +461,8 @@ public class PpoAgent : IAgent
         var maxPct = (float)actionCounts.Max() / total;
         
         // Also check Buy vs Sell imbalance
-        var buyCount = actionCounts.Skip(1).Take(3).Sum();  // Actions 1-3
-        var sellCount = actionCounts.Skip(4).Take(3).Sum(); // Actions 4-6
+        var buyCount = actionCounts[1]
+        var sellCount = actionCounts[2]
         var tradeCount = buyCount + sellCount;
         
         // If one action > threshold OR extreme buy/sell imbalance, reset entropy

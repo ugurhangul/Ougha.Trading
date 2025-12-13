@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Spectre.Console;
+using Ougha.Trading.Analysis;
 using Ougha.Trading.Core.Models;
 using Ougha.Trading.Data;
 using Ougha.Trading.Data.Services;
@@ -359,6 +360,9 @@ public static class TrainingRunner
                             var allResults = env.Executor.GetResults();
                             var episodeTrades = allResults.TradeLog;
                             var totalHoldingSeconds = episodeTrades.Sum(t => (t.CloseTime - t.OpenTime).TotalSeconds);
+                            
+                            // Calculate episode max drawdown from equity curve
+                            var episodeMaxDrawdown = Analysis.ResultsAnalyzer.Analyze(allResults).MaxDrawdown;
 
                             stats.TradesOpened += allResults.TotalTrades;
                             stats.TradesClosed += episodeTrades.Count;
@@ -401,6 +405,23 @@ public static class TrainingRunner
                                 symStats.CumulativeBuys += buys;
                                 symStats.CumulativeSells += sells;
                                 symStats.TotalHoldingTimeSeconds += symbolHoldingSeconds;
+                                
+                                // Track min/max holding times per symbol
+                                foreach (var trade in symbolTrades)
+                                {
+                                    var holdSeconds = (trade.CloseTime - trade.OpenTime).TotalSeconds;
+                                    if (holdSeconds > 0)
+                                    {
+                                        if (holdSeconds < symStats.MinHoldingTimeSeconds)
+                                            symStats.MinHoldingTimeSeconds = holdSeconds;
+                                        if (holdSeconds > symStats.MaxHoldingTimeSeconds)
+                                            symStats.MaxHoldingTimeSeconds = holdSeconds;
+                                    }
+                                }
+                                
+                                // Track worst max drawdown per symbol
+                                if (symbolTrades.Count > 0 && episodeMaxDrawdown > symStats.CumulativeMaxDrawdown)
+                                    symStats.CumulativeMaxDrawdown = episodeMaxDrawdown;
 
                                 if (symbolReward > symStats.BestReward)
                                 {

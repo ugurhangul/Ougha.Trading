@@ -253,14 +253,17 @@ public static class TrainingDisplay
             .Expand();
 
         table.AddColumn(new TableColumn("[cyan]Symbol[/]").Width(10));
-        table.AddColumn(new TableColumn("Eps").RightAligned().Width(6));
-        table.AddColumn(new TableColumn("Avg R").RightAligned().Width(9));
-        table.AddColumn(new TableColumn("PF").RightAligned().Width(7));
-        table.AddColumn(new TableColumn("Win%").RightAligned().Width(7));
-        table.AddColumn(new TableColumn("Trades").RightAligned().Width(7));
-        table.AddColumn(new TableColumn("AvgHold").RightAligned().Width(8));
-        table.AddColumn(new TableColumn("Net P&L").RightAligned().Width(12));
-        table.AddColumn(new TableColumn("NoImp").Centered().Width(6));
+        table.AddColumn(new TableColumn("Eps").RightAligned().Width(5));
+        table.AddColumn(new TableColumn("Avg R").RightAligned().Width(7));
+        table.AddColumn(new TableColumn("PF").RightAligned().Width(5));
+        table.AddColumn(new TableColumn("Win%").RightAligned().Width(5));
+        table.AddColumn(new TableColumn("Trades").RightAligned().Width(6));
+        table.AddColumn(new TableColumn("MaxDD").RightAligned().Width(6));
+        table.AddColumn(new TableColumn("MinH").RightAligned().Width(5));
+        table.AddColumn(new TableColumn("MaxH").RightAligned().Width(5));
+        table.AddColumn(new TableColumn("AvgH").RightAligned().Width(5));
+        table.AddColumn(new TableColumn("Net P&L").RightAligned().Width(9));
+        table.AddColumn(new TableColumn("NoImp").Centered().Width(5));
 
         var sortedSymbols = stats.SymbolPerformance
             .OrderByDescending(x => x.Value.NetProfit)
@@ -275,11 +278,21 @@ public static class TrainingDisplay
             var wrStyle = s.CumulativeWinRate > 50 ? "green" : s.CumulativeWinRate > 40 ? "yellow" : "red";
             var profitStyle = s.NetProfit > 0 ? "green" : s.NetProfit < 0 ? "red" : "dim";
 
+            var minHold = s.MinHoldingTime;
+            var minHoldStr = minHold.TotalSeconds > 0
+                ? (minHold.TotalHours >= 1 ? $"{minHold.TotalHours:F1}h" : minHold.TotalMinutes >= 1 ? $"{minHold.TotalMinutes:F0}m" : $"{minHold.TotalSeconds:F0}s")
+                : "-";
+            
+            var maxHold = s.MaxHoldingTime;
+            var maxHoldStr = maxHold.TotalSeconds > 0
+                ? (maxHold.TotalHours >= 1 ? $"{maxHold.TotalHours:F1}h" : maxHold.TotalMinutes >= 1 ? $"{maxHold.TotalMinutes:F0}m" : $"{maxHold.TotalSeconds:F0}s")
+                : "-";
+            
             var avgHold = s.AverageHoldingTime;
             var avgHoldStr = avgHold.TotalHours >= 1
                 ? $"{avgHold.TotalHours:F1}h"
                 : avgHold.TotalMinutes >= 1
-                    ? $"{avgHold.TotalMinutes:F1}m"
+                    ? $"{avgHold.TotalMinutes:F0}m"
                     : $"{avgHold.TotalSeconds:F0}s";
 
             string statusStr;
@@ -289,6 +302,9 @@ public static class TrainingDisplay
                 statusStr = $"[yellow]{s.NoImprovementCount}[/]";
             else
                 statusStr = $"[green]{s.NoImprovementCount}[/]";
+            
+            var mddStyle = s.CumulativeMaxDrawdown > 20 ? "red" : s.CumulativeMaxDrawdown > 10 ? "yellow" : "green";
+            var mddStr = s.CumulativeMaxDrawdown > 0 ? $"{s.CumulativeMaxDrawdown:F1}%" : "-";
 
             table.AddRow(
                 Markup.Escape(symbol),
@@ -297,6 +313,9 @@ public static class TrainingDisplay
                 $"[{pfStyle}]{s.CumulativeProfitFactor:F2}[/]",
                 $"[{wrStyle}]{s.CumulativeWinRate:F0}%[/]",
                 $"{s.CumulativeTrades}",
+                $"[{mddStyle}]{mddStr}[/]",
+                $"[dim]{minHoldStr}[/]",
+                $"[dim]{maxHoldStr}[/]",
                 $"[cyan]{avgHoldStr}[/]",
                 $"[{profitStyle}]{s.NetProfit:N2}[/]",
                 statusStr
@@ -306,7 +325,7 @@ public static class TrainingDisplay
 
         while (rowCount < MaxSymbolRows)
         {
-            table.AddRow("", "", "", "", "", "", "", "", "");
+            table.AddRow("", "", "", "", "", "", "", "", "", "", "", "");
             rowCount++;
         }
 

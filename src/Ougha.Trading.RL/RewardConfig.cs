@@ -72,17 +72,17 @@ public class RewardConfig
     /// <summary>
     /// Per-tick penalty for holding a position. Discourages overly long trades.
     /// </summary>
-    public float HoldingTimePenalty { get; set; } = 0.00005f;  // Reduced from 0.0001
+    public float HoldingTimePenalty { get; set; } = 0.00001f;  // Very small - don't discourage holding
     
     /// <summary>
     /// Minimum ticks before a position can be closed without penalty.
     /// </summary>
-    public int MinHoldingTicks { get; set; } = 120;  // 2 minutes at S1 granularity
+    public int MinHoldingTicks { get; set; } = 600;  // 10 minutes at S1 granularity (was 2 min)
     
     /// <summary>
     /// Penalty for closing too early (before MinHoldingTicks).
     /// </summary>
-    public float EarlyClosePenalty { get; set; } = 5f;  // Reduced from 10
+    public float EarlyClosePenalty { get; set; } = 15f;  // Strong penalty for closing too early
     
     /// <summary>
     /// Maximum holding ticks before increasing penalty.
@@ -97,7 +97,7 @@ public class RewardConfig
     /// <summary>
     /// Bonus for quick profitable trades.
     /// </summary>
-    public float QuickProfitBonus { get; set; } = 5f;  // Reduced from 20
+    public float QuickProfitBonus { get; set; } = 0f;  // Disabled - was encouraging early closes
 
     // ========================
     // OPPORTUNITY COST MODEL

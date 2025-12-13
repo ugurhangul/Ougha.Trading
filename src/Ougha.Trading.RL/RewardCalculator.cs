@@ -247,9 +247,9 @@ public class RewardCalculator
             reward -= _config.HoldingTimePenalty * (excessTicks / 100f);
         }
 
-        // Unrealized PnL shaping (increased to 8% for denser learning signal)
+        // Unrealized PnL shaping (increased to 15% for stronger hold incentive)
         var unrealizedReward = (float)(unrealizedPnl / initialBalance) * 100f * _config.UnrealizedPnlScale;
-        reward += unrealizedReward * 0.08f;
+        reward += unrealizedReward * 0.15f;
 
         // Direction quality: reward when price moves in position direction
         if (positionDirection != 0 && priceChange != 0)
