@@ -33,6 +33,13 @@ public class PpoAgent : IAgent
     private readonly float _initialLr;
     private int _totalUpdates;
     private readonly int _expectedTotalUpdates;
+    
+    // KL divergence early stopping threshold
+    private const float KL_TARGET = 0.015f;
+    
+    // Training metrics for diagnostics
+    private float _lastValueLoss;
+    private float _lastKlDivergence;
 
     private const int MAX_INFERENCE_BATCH = 64;
     private const int WINDOW_SIZE = 20;
@@ -62,7 +69,7 @@ public class PpoAgent : IAgent
         _valueCoef = 0.5f;
         _tpSlCoef = 0.1f;  // TP/SL loss weight
         _entropyCoef = 0.05f;  // Standard PPO range: 0.01-0.1 (was 1.1 - too high)
-        _minEntropyCoef = 0.02f;
+        _minEntropyCoef = 0.05f;  // Increased from 0.02 for better exploration floor
         _updateEpochs = 4;  // Reduced from 8 to prevent overfitting on trading data
         
         // LR Scheduling - linear decay over expected training
@@ -252,7 +259,7 @@ public class PpoAgent : IAgent
                 SlMultiplier = slMultipliers[i],
                 EpisodeId = _rolloutBuffer.CurrentEpisodeId,
                 SequenceIndex = seqIdx,
-                SymbolIdx = i
+                SymbolIdx = states[i].SymbolId  // Use actual symbol ID, not loop index
             };
         }
         
@@ -376,18 +383,22 @@ public class PpoAgent : IAgent
                             var valueLoss2 = (valueClipped - returnsArr).pow(2);
                             var valueLoss = 0.5f * max(valueLoss1, valueLoss2).mean();
                             
-                            // TP/SL loss
+                            // TP/SL loss - train on ALL trades (not just positive advantage)
+                            // Learning from losing trades is critical for improving TP/SL predictions
                             var predTp = tpSlPred.select(1, 0);
                             var predSl = tpSlPred.select(1, 1);
                             var tradeMask = (actions != 0).to_type(ScalarType.Float32);
-                            var positiveAdvMask = (advantagesArr > 0).to_type(ScalarType.Float32);
-                            var tpSlWeight = tradeMask * positiveAdvMask;
                             
-                            var tpError = (predTp - targetTpMults).pow(2) * tpSlWeight;
-                            var slError = (predSl - targetSlMults).pow(2) * tpSlWeight;
-                            var tpSlLoss = (tpError.sum() + slError.sum()) / (tpSlWeight.sum() + 1e-8f);
+                            var tpError = (predTp - targetTpMults).pow(2) * tradeMask;
+                            var slError = (predSl - targetSlMults).pow(2) * tradeMask;
+                            var tpSlLoss = (tpError.sum() + slError.sum()) / (tradeMask.sum() + 1e-8f);
                             
                             var loss = actorLoss + _valueCoef * valueLoss + _tpSlCoef * tpSlLoss - _entropyCoef * entropy;
+                            
+                            // Calculate KL divergence for early stopping
+                            var klDiv = (oldLogProbs - newLogProbs).mean().item<float>();
+                            _lastKlDivergence = klDiv;
+                            _lastValueLoss = valueLoss.item<float>();
                             
                             _optimizer.zero_grad();
                             loss.backward();
@@ -401,7 +412,15 @@ public class PpoAgent : IAgent
                             foreach (var st in stateTensors) st.Dispose();
                         }
                     }
+                    
+                    // Early stop epoch if KL divergence too high
+                    if (_lastKlDivergence > KL_TARGET)
+                        break;
                 }
+                
+                // Early stop epochs if KL divergence too high
+                if (_lastKlDivergence > KL_TARGET)
+                    break;
             }
         }
 
@@ -473,16 +492,15 @@ public class PpoAgent : IAgent
                         var valueLoss2 = (valueClipped - returnsTensor).pow(2);
                         var valueLoss = 0.5f * max(valueLoss1, valueLoss2).mean();
                         
+                        // TP/SL loss - train on ALL trades (not just positive advantage)
                         var predTp = tpSlPred.select(1, 0);
                         var predSl = tpSlPred.select(1, 1);
                         
                         var tradeMask = (actions != 0).to_type(ScalarType.Float32);
-                        var positiveAdvMask = (advs > 0).to_type(ScalarType.Float32);
-                        var tpSlWeight = tradeMask * positiveAdvMask;
                         
-                        var tpError = (predTp - targetTpMults).pow(2) * tpSlWeight;
-                        var slError = (predSl - targetSlMults).pow(2) * tpSlWeight;
-                        var tpSlLoss = (tpError.sum() + slError.sum()) / (tpSlWeight.sum() + 1e-8f);
+                        var tpError = (predTp - targetTpMults).pow(2) * tradeMask;
+                        var slError = (predSl - targetSlMults).pow(2) * tradeMask;
+                        var tpSlLoss = (tpError.sum() + slError.sum()) / (tradeMask.sum() + 1e-8f);
                         
                         var loss = actorLoss + _valueCoef * valueLoss + _tpSlCoef * tpSlLoss - _entropyCoef * entropy;
                         
@@ -658,6 +676,8 @@ public class PpoAgent : IAgent
         return false;
     }
     public float GetEntropyCoef() => _entropyCoef;
+    public float GetValueLoss() => _lastValueLoss;
+    public float GetKlDivergence() => _lastKlDivergence;
 
     private Tensor[] PrepareInputTensors(AgentInput[] inputs)
     {

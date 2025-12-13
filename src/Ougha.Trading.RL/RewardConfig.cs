@@ -64,7 +64,7 @@ public class RewardConfig
     /// <summary>
     /// Threshold before drawdown penalty kicks in.
     /// </summary>
-    public float DrawdownThreshold { get; set; } = 0.15f;  // Increased to 5% - allow more room to breathe
+    public float DrawdownThreshold { get; set; } = 0.15f;  // 15% threshold - allow room to breathe
 
     // ========================
     // POSITION MANAGEMENT
@@ -116,12 +116,12 @@ public class RewardConfig
     /// <summary>
     /// Penalty when agent is flat but market moved significantly.
     /// </summary>
-    public float MissedOpportunityPenalty { get; set; } = 0.9f;
+    public float MissedOpportunityPenalty { get; set; } = 0.3f;  // Reduced from 0.9 to avoid over-penalizing consolidation
     
     /// <summary>
     /// ATR multiplier threshold: price move > this * ATR = missed opportunity.
     /// </summary>
-    public float OpportunityThresholdAtr { get; set; } = 0.5f;
+    public float OpportunityThresholdAtr { get; set; } = 1.0f;  // Increased from 0.5 - only penalize significant moves
     
     /// <summary>
     /// Legacy flat penalty (used when UseOpportunityCostModel is false).

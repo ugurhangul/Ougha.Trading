@@ -256,24 +256,17 @@ public class RewardCalculator
             reward -= 0.00001f * (excessTicks / 1000f);  // Negligible penalty
         }
         
-        // EXPLORATION INCENTIVE: Cumulative bonus for holding profitable positions
-        // The longer you hold in profit, the more reward you accumulate
-        // This teaches the agent that holding CAN be rewarding
+        // EXPLORATION INCENTIVE: Decaying bonus for holding profitable positions
+        // Decays over time to encourage eventual profit-taking rather than indefinite holding
         // NOTE: unrealizedPnl is already a decimal percentage (0.01 = 1%)
         if (unrealizedPnl > 0)
         {
-            // Time-based growing bonus: reward increases with holding time
+            // Exponential decay: bonus diminishes over ~30 minutes
             var holdingMinutes = holdingTicks / 60f;
-            var timeBonus = (float)Math.Log(1 + holdingMinutes) * 0.01f;  // Logarithmic growth - diminishing but continuous
-            reward += _config.HoldingBonus * (1.0f + timeBonus);
+            var decayFactor = (float)Math.Exp(-holdingMinutes / 30f);
+            reward += _config.HoldingBonus * decayFactor;
             
-            // Extra bonus when profit is growing (momentum)
-            // unrealizedPnl is decimal (0.01 = 1%), convert to percentage
-            var profitPct = (float)unrealizedPnl * 100f;
-            if (profitPct > 0.5f)  // >0.5% profit
-            {
-                reward += 0.005f * Math.Min(profitPct, 5f);  // Cap at 5% for stability
-            }
+            // Removed additional profit accumulation - already covered by unrealized PnL shaping
         }
 
         // Unrealized PnL shaping - strong signal that being in profit is good

@@ -295,19 +295,32 @@ public class PortfolioTradingEnvironment
         if (currentEquity > _peakEquity) _peakEquity = currentEquity;
 
         // Hard SL enforcement: force close positions with excessive unrealized loss
+        // Uses ATR-based threshold to account for symbol volatility
         // This protects against gaps where price skips over the SL level
         foreach (var symbol in _config.Symbols)
         {
             var pos = _executor.GetPosition(symbol);
-            if (pos != null && pos.UnrealizedPnlPercent < -2.0)  // >2% loss
+            if (pos == null) continue;
+            
+            // Calculate ATR-based hard stop threshold
+            // Volatile symbols (BTC) get more room, stable symbols keep tighter stops
+            var symbolAtr = CalculateAtr(symbol);
+            var currentBid = _executor.GetBid(symbol);
+            var atrPct = symbolAtr > 0 && currentBid > 0 
+                ? (symbolAtr / currentBid) * 100 * 3  // 3x ATR
+                : 2.0;  // Fallback to 2%
+            var hardSlThreshold = -Math.Max(atrPct, 2.0);  // At least -2%, up to ~-6% for volatile symbols
+            
+            if (pos.UnrealizedPnlPercent < hardSlThreshold)
             {
-                var symbolIndex = Array.IndexOf(_config.Symbols, symbol);
                 await _executor.ClosePositionAsync(symbol);
                 _positionOpenTicks[symbol] = 0;
                 _peakUnrealizedPnls[symbol] = 0;
-                Log.Debug("[HardSL] Force closed {Symbol} at {Loss:F2}% loss", symbol, pos.UnrealizedPnlPercent);
+                Log.Debug("[HardSL] Force closed {Symbol} at {Loss:F2}% loss (threshold: {Threshold:F2}%)", 
+                    symbol, pos.UnrealizedPnlPercent, hardSlThreshold);
             }
         }
+
 
         var globalDone = !moreData;
         if (currentEquity < _initialBalance * (1 - _config.MaxLossPercent / 100.0))
