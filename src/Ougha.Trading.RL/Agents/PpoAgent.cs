@@ -278,6 +278,10 @@ public class PpoAgent : IAgent
 
     private float UpdatePpo(Experience[] rollouts)
     {
+        // Clear any cached LSTM hidden states from previous runs to prevent stale tensor errors
+        // This is needed because ComputeGaeWithValues calls forward() with batchSize=1 which triggers caching
+        _model.ResetAllHiddenStates();
+        
         var T = rollouts.Length;
         var states = new AgentInput[T];
         for (var i = 0; i < T; i++)
