@@ -41,11 +41,11 @@ public class PpoAgent : IAgent
     private readonly Experience[] _experienceBuffer = new Experience[MAX_INFERENCE_BATCH];
  
     public PpoAgent(int batchSize = 256,
-        int rolloutHorizon = 4096,
+        int rolloutHorizon = 8192,
         float gamma = 0.99f,
         float gaeLambda = 0.95f,
         float clipEpsilon = 0.2f,
-        float learningRate = 3e-4f,
+        float learningRate = 1e-3f,
         bool useCuda = false,
         int newsFeatureSize = 17)
     {

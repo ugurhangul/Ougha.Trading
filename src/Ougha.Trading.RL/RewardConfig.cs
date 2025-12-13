@@ -31,12 +31,12 @@ public class RewardConfig
     /// <summary>
     /// Bonus for winning trades (profit > 0).
     /// </summary>
-    public float WinBonus { get; set; } = 3f;  // Reduced from 10
+    public float WinBonus { get; set; } = 5f;  // Increased for stronger win signal
     
     /// <summary>
     /// Penalty for losing trades. Symmetric with WinBonus for balanced risk.
     /// </summary>
-    public float LossPenalty { get; set; } = 4.5f;  // 1.5x asymmetry for capital preservation
+    public float LossPenalty { get; set; } = 3f;  // Symmetric with WinBonus for balanced exploration
     
     /// <summary>
     /// Risk-adjusted reward: profit / SL distance. Rewards good R:R trades.
@@ -208,13 +208,13 @@ public class RewardConfig
     /// <summary>
     /// Scale for reward normalization. Higher = less clipping.
     /// </summary>
-    public float RewardNormalizationScale { get; set; } = 20f;  // Reduced from 50
+    public float RewardNormalizationScale { get; set; } = 50f;  // Increased for stronger gradient signal
     
     /// <summary>
     /// If true, normalize rewards to bounded range using tanh (smooth).
     /// If false, use clamp (hard cutoff).
     /// </summary>
-    public bool UseTanhNormalization { get; set; } = true;  // NEW: smooth normalization
+    public bool UseTanhNormalization { get; set; } = false;  // Use clamp for clearer signal
     
     /// <summary>
     /// Enable/disable reward normalization.
