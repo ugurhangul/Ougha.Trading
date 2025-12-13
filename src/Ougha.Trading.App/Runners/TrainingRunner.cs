@@ -228,6 +228,13 @@ public static class TrainingRunner
                             }
 
                             await env.ResetAsync();
+                            
+                            // Signal episode boundary to PPO agent for sequence tracking
+                            if (agent is PpoAgent ppoAgentEp)
+                            {
+                                ppoAgentEp.StartNewEpisode();
+                            }
+                            
                             var stateInputs = env.BuildAgentInputs();
 
                             var done = false;

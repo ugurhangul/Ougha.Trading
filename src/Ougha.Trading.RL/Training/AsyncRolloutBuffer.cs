@@ -24,9 +24,46 @@ public class AsyncRolloutBuffer(int capacity, int maxPendingRollouts = 4)
     private List<Experience> _activeBuffer = [];
     private readonly Lock _bufferLock = new();
     
+    // Episode tracking for sequence-based batching
+    private int _currentEpisodeId;
+    private int _sequenceCounter;
+    
     public int ActiveBufferCount => _activeBuffer.Count;
 
     public int PendingRolloutsCount => _readyRollouts.Reader.Count;
+    
+    /// <summary>
+    /// Current episode ID. Set this before adding experiences to track episode boundaries.
+    /// </summary>
+    public int CurrentEpisodeId => _currentEpisodeId;
+    
+    /// <summary>
+    /// Current sequence index within the episode.
+    /// </summary>
+    public int CurrentSequenceIndex => _sequenceCounter;
+    
+    /// <summary>
+    /// Signal start of a new episode. Resets sequence counter.
+    /// </summary>
+    public void StartNewEpisode()
+    {
+        lock (_bufferLock)
+        {
+            _currentEpisodeId++;
+            _sequenceCounter = 0;
+        }
+    }
+    
+    /// <summary>
+    /// Get next sequence index and increment counter.
+    /// </summary>
+    public int GetNextSequenceIndex()
+    {
+        lock (_bufferLock)
+        {
+            return _sequenceCounter++;
+        }
+    }
 
     /// <summary>
     /// Add an experience to the active buffer (synchronous, non-blocking).

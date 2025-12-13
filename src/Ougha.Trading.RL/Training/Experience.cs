@@ -33,4 +33,21 @@ public class Experience
     /// Used to train the TP/SL head.
     /// </summary>
     public float SlMultiplier { get; set; }
+    
+    /// <summary>
+    /// Episode identifier for sequence-based batching.
+    /// Experiences from the same episode should be processed together.
+    /// </summary>
+    public int EpisodeId { get; set; }
+    
+    /// <summary>
+    /// Position within the episode (0, 1, 2, ...).
+    /// Used to maintain temporal order within sequences.
+    /// </summary>
+    public int SequenceIndex { get; set; }
+    
+    /// <summary>
+    /// Symbol index for multi-symbol environments.
+    /// </summary>
+    public int SymbolIdx { get; set; }
 }

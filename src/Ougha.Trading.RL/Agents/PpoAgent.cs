@@ -239,6 +239,7 @@ public class PpoAgent : IAgent
         
         for (var i = 0; i < count; i++)
         {
+            var seqIdx = _rolloutBuffer.GetNextSequenceIndex();
             experiences[i] = new Experience
             {
                 State = states[i],
@@ -248,7 +249,10 @@ public class PpoAgent : IAgent
                 Done = dones[i],
                 LogProb = logProbs[i],
                 TpMultiplier = tpMultipliers[i],
-                SlMultiplier = slMultipliers[i]
+                SlMultiplier = slMultipliers[i],
+                EpisodeId = _rolloutBuffer.CurrentEpisodeId,
+                SequenceIndex = seqIdx,
+                SymbolIdx = i
             };
         }
         
@@ -261,6 +265,15 @@ public class PpoAgent : IAgent
         {
             _rolloutBuffer.AddExperienceBatch(experiences);
         }
+    }
+
+    /// <summary>
+    /// Signal start of a new episode for sequence tracking.
+    /// Call this before collecting experiences for a new episode.
+    /// </summary>
+    public void StartNewEpisode()
+    {
+        _rolloutBuffer.StartNewEpisode();
     }
 
     public float Train()
@@ -279,7 +292,6 @@ public class PpoAgent : IAgent
     private float UpdatePpo(Experience[] rollouts)
     {
         // Clear any cached LSTM hidden states from previous runs to prevent stale tensor errors
-        // This is needed because ComputeGaeWithValues calls forward() with batchSize=1 which triggers caching
         _model.ResetAllHiddenStates();
         
         var T = rollouts.Length;
@@ -289,8 +301,18 @@ public class PpoAgent : IAgent
 
         var (advantages, returns, oldValues) = ComputeGaeWithValues(rollouts, states);
 
-        var dataset = new PpoDataset(rollouts, advantages, returns, oldValues);
-        var loader = new DataLoader(dataset, _batchSize, shuffle: true);
+        // Use sequence-based dataset for LSTM temporal coherence
+        var seqDataset = new SequentialPpoDataset(rollouts, advantages, returns, oldValues, 
+            sequenceLength: SequentialPpoDataset.DefaultSequenceLength);
+        
+        // Also keep original dataset for fallback if no valid sequences
+        if (seqDataset.Count == 0)
+        {
+            // Fall back to original shuffled training if no sequences formed
+            return UpdatePpoShuffled(rollouts, advantages, returns, oldValues);
+        }
+        
+        var seqLoader = new SequenceDataLoader(seqDataset, batchSize: 4, shuffleSequences: true);
         
         _model.train();
         float totalLoss = 0;
@@ -305,10 +327,128 @@ public class PpoAgent : IAgent
             paramGroup.LearningRate = currentLr;
         }
         
-        // Use DisposeScope for all tensors to prevent heap corruption
         using (NewDisposeScope())
         {
-            // Pre-compute all tensors once to avoid repeated creation during epochs
+            for (var epoch = 0; epoch < _updateEpochs; epoch++)
+            {
+                foreach (var seqBatch in seqLoader.GetBatches())
+                {
+                    // Process each sequence in the batch
+                    foreach (var sequence in seqBatch.Sequences)
+                    {
+                        using (NewDisposeScope())
+                        {
+                            // Reset LSTM hidden state at start of each sequence
+                            (Tensor h, Tensor c)? hiddenState = null;
+                            
+                            // Accumulate loss over the sequence for a single backward pass
+                            Tensor seqActorLoss = zeros(1, device: _device);
+                            Tensor seqValueLoss = zeros(1, device: _device);
+                            Tensor seqTpSlLoss = zeros(1, device: _device);
+                            Tensor seqEntropy = zeros(1, device: _device);
+                            var seqSteps = 0;
+                            
+                            // Process timesteps in order to maintain LSTM state
+                            for (var t = 0; t < sequence.Length; t++)
+                            {
+                                var stateTensors = PrepareInputTensors([sequence.States[t]]);
+                                var action = tensor([sequence.Actions[t]], dtype: ScalarType.Int64, device: _device);
+                                var oldLogProb = tensor([sequence.LogProbs[t]], dtype: ScalarType.Float32, device: _device);
+                                var returnVal = tensor([sequence.Returns[t]], dtype: ScalarType.Float32, device: _device);
+                                var adv = tensor([sequence.Advantages[t]], dtype: ScalarType.Float32, device: _device);
+                                var oldValue = tensor([sequence.OldValues[t]], dtype: ScalarType.Float32, device: _device);
+                                var targetTpMult = tensor([sequence.TpMultipliers[t]], dtype: ScalarType.Float32, device: _device);
+                                var targetSlMult = tensor([sequence.SlMultipliers[t]], dtype: ScalarType.Float32, device: _device);
+
+                                // Forward with explicit hidden state
+                                var (logits, values, tpSlPred, h_n, c_n) = _model.ForwardWithState(stateTensors, hiddenState);
+                                hiddenState = (h_n.detach(), c_n.detach());  // Detach to truncate BPTT within sequence
+
+                                var probs = nn.functional.softmax(logits, dim: 1);
+                                var dist = distributions.Categorical(probs);
+                                var newLogProb = dist.log_prob(action);
+                                var entropy = dist.entropy();
+                                
+                                var ratio = (newLogProb - oldLogProb).exp();
+                                var surr1 = ratio * adv;
+                                var surr2 = clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * adv;
+                                var actorLoss = -min(surr1, surr2);
+
+                                var valuesSqueeezed = values.squeeze();
+                                var valueClipped = oldValue + clamp(valuesSqueeezed - oldValue, -_clipEpsilon, _clipEpsilon);
+                                var valueLoss1 = (valuesSqueeezed - returnVal).pow(2);
+                                var valueLoss2 = (valueClipped - returnVal).pow(2);
+                                var valueLoss = 0.5f * max(valueLoss1, valueLoss2);
+                                
+                                // TP/SL loss for trade actions
+                                var predTp = tpSlPred.select(1, 0);
+                                var predSl = tpSlPred.select(1, 1);
+                                var isTrade = sequence.Actions[t] != 0 ? 1f : 0f;
+                                var isPositiveAdv = sequence.Advantages[t] > 0 ? 1f : 0f;
+                                var tpSlWeight = isTrade * isPositiveAdv;
+                                
+                                var tpError = (predTp - targetTpMult).pow(2) * tpSlWeight;
+                                var slError = (predSl - targetSlMult).pow(2) * tpSlWeight;
+                                var tpSlLoss = tpError + slError;
+
+                                // Accumulate losses
+                                seqActorLoss = seqActorLoss + actorLoss;
+                                seqValueLoss = seqValueLoss + valueLoss;
+                                seqTpSlLoss = seqTpSlLoss + tpSlLoss;
+                                seqEntropy = seqEntropy + entropy;
+                                seqSteps++;
+
+                                // Dispose input tensors
+                                foreach (var st in stateTensors) st.Dispose();
+                            }
+                            
+                            if (seqSteps > 0)
+                            {
+                                // Average losses over the sequence
+                                var avgActorLoss = seqActorLoss / seqSteps;
+                                var avgValueLoss = seqValueLoss / seqSteps;
+                                var avgTpSlLoss = seqTpSlLoss / seqSteps;
+                                var avgEntropy = seqEntropy / seqSteps;
+                                
+                                var loss = avgActorLoss + _valueCoef * avgValueLoss + _tpSlCoef * avgTpSlLoss - _entropyCoef * avgEntropy;
+                                
+                                _optimizer.zero_grad();
+                                loss.backward();
+                                nn.utils.clip_grad_norm_(_model.parameters(), 0.5f);
+                                _optimizer.step();
+                                
+                                totalLoss += loss.item<float>();
+                                steps++;
+                            }
+                            
+                            // Dispose hidden state tensors
+                            hiddenState?.h.Dispose();
+                            hiddenState?.c.Dispose();
+                        }
+                    }
+                }
+            }
+        }
+
+        SyncInferenceNetwork();
+        return steps > 0 ? totalLoss / steps : 0;
+    }
+    
+    /// <summary>
+    /// Fallback to original shuffled training when sequence-based training isn't possible.
+    /// Used when experiences don't have episode tracking or sequences are too short.
+    /// </summary>
+    private float UpdatePpoShuffled(Experience[] rollouts, float[] advantages, float[] returns, float[] oldValues)
+    {
+        var dataset = new PpoDataset(rollouts, advantages, returns, oldValues);
+        var loader = new DataLoader(dataset, _batchSize, shuffle: true);
+        
+        _model.train();
+        float totalLoss = 0;
+        var steps = 0;
+        
+        using (NewDisposeScope())
+        {
             var allStateTensors = PrepareInputTensors(dataset.States);
             var allActions = tensor(dataset.Actions, dtype: ScalarType.Int64, device: _device);
             var allLogProbs = tensor(dataset.LogProbs, dtype: ScalarType.Float32, device: _device);
@@ -322,7 +462,6 @@ public class PpoAgent : IAgent
             {
                 foreach (var batch in loader)
                 {
-                    // Use inner scope for batch tensors to free memory after each batch
                     using (NewDisposeScope())
                     {
                         var batchIndices = tensor(batch.Indices, dtype: ScalarType.Int64, device: _device);
@@ -353,22 +492,18 @@ public class PpoAgent : IAgent
                         var surr2 = clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * normalizedAdvs;
                         var actorLoss = -min(surr1, surr2).mean();
 
-                        // Value function clipping (standard PPO technique)
                         var valuesSqueeezed = values.squeeze();
                         var valueClipped = oldValuesBatch + clamp(valuesSqueeezed - oldValuesBatch, -_clipEpsilon, _clipEpsilon);
                         var valueLoss1 = (valuesSqueeezed - returnsTensor).pow(2);
                         var valueLoss2 = (valueClipped - returnsTensor).pow(2);
                         var valueLoss = 0.5f * max(valueLoss1, valueLoss2).mean();
                         
-                        // TP/SL loss: MSE weighted by positive advantages (reinforce good trades' TP/SL)
-                        // tpSlPred shape: [BatchSize, 2] where [:, 0] = TP, [:, 1] = SL
                         var predTp = tpSlPred.select(1, 0);
                         var predSl = tpSlPred.select(1, 1);
                         
-                        // Create mask for trades (non-HOLD actions where advantage > 0)
                         var tradeMask = (actions != 0).to_type(ScalarType.Float32);
                         var positiveAdvMask = (advs > 0).to_type(ScalarType.Float32);
-                        var tpSlWeight = tradeMask * positiveAdvMask;  // Only train TP/SL on profitable trades
+                        var tpSlWeight = tradeMask * positiveAdvMask;
                         
                         var tpError = (predTp - targetTpMults).pow(2) * tpSlWeight;
                         var slError = (predSl - targetSlMults).pow(2) * tpSlWeight;
@@ -383,13 +518,12 @@ public class PpoAgent : IAgent
                         
                         totalLoss += loss.item<float>();
                         steps++;
-                    } // batchScope disposes all batch tensors
+                    }
                 }
             }
             
-            // Explicitly dispose input tensors
             foreach (var t in allStateTensors) t.Dispose();
-        } // outerScope disposes any remaining tensors
+        }
 
         SyncInferenceNetwork();
         return steps > 0 ? totalLoss / steps : 0;

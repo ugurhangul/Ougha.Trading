@@ -277,6 +277,98 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     }
     
     /// <summary>
+    /// Forward pass with explicit LSTM hidden state for sequence-based training.
+    /// Use this during training to maintain temporal coherence within sequences.
+    /// </summary>
+    /// <param name="inputs">Input tensors: [PackedTimeframes, SymbolId, PackedFeatures]</param>
+    /// <param name="hiddenState">Optional LSTM hidden state (h, c) from previous timestep</param>
+    /// <returns>Outputs plus updated hidden state for next timestep</returns>
+    public (Tensor ActionLogits, Tensor Value, Tensor TpSlParams, Tensor H, Tensor C) ForwardWithState(
+        Tensor[] inputs, 
+        (Tensor h, Tensor c)? hiddenState = null)
+    {
+        var packedTf = inputs[0];  // [B, 5, W, F]
+        var symbolId = inputs[1];  // [B, 1]
+        var packedFeats = inputs[2];
+        
+        var batchSize = packedTf.shape[0];
+        
+        // Single permute: [B, 5, W, F] -> [B, 5, F, W] for Conv1d
+        var permuted = packedTf.permute(0, 1, 3, 2).contiguous();  // [B, 5, F, W]
+        
+        // Process each timeframe with its dedicated encoder
+        var m1 = _cnnM1.forward(permuted.select(1, 0));   // [B, EmbedDim]
+        var m5 = _cnnM5.forward(permuted.select(1, 1));
+        var m15 = _cnnM15.forward(permuted.select(1, 2));
+        var h1 = _cnnH1.forward(permuted.select(1, 3));
+        var h4 = _cnnH4.forward(permuted.select(1, 4));
+
+        var tfStack = stack([m1, m5, m15, h1, h4], dim: 1);  // [B, 5, EmbedDim]
+        var tfSeq = tfStack.transpose(0, 1);  // [5, B, EmbedDim] for attention
+
+        var (attended, _) = _tfAttention.forward(tfSeq, tfSeq, tfSeq, key_padding_mask: null, need_weights: false, attn_mask: null);
+        attended = attended + tfSeq;
+
+        attended = attended.transpose(0, 1);  // [B, 5, EmbedDim]
+        attended = _tfLayerNorm.forward(attended.reshape(-1, TimeframeEmbedDim));
+        attended = attended.reshape(batchSize, 5, TimeframeEmbedDim);
+
+        var fusedTf = attended.flatten(1);
+
+        var sym = symbolId.to_type(ScalarType.Float32);
+        var feats = cat([sym, packedFeats], dim: 1);
+        
+        if (feats.shape[1] < FeatureDim)
+        {
+            var pad = zeros(new[] { feats.shape[0], FeatureDim - feats.shape[1] }, device: feats.device);
+            feats = cat([feats, pad], dim: 1);
+        }
+        
+        var featEmbed = _featureNet.forward(feats);
+        featEmbed = _featureLayerNorm.forward(featEmbed);
+        featEmbed = functional.relu(featEmbed);
+
+        var combined = cat([fusedTf, featEmbed], dim: 1);
+        
+        // Actor path: shared body -> LSTM -> actor head
+        var hidden = _sharedBody.forward(combined);
+        
+        // LSTM temporal processing with EXPLICIT hidden state
+        var lstmInput = hidden.unsqueeze(1);  // [B, 1, HiddenDim]
+        
+        Tensor h_n, c_n;
+        if (hiddenState.HasValue)
+        {
+            // Move hidden state to correct device if needed
+            var hDevice = hiddenState.Value.h.to(lstmInput.device);
+            var cDevice = hiddenState.Value.c.to(lstmInput.device);
+            var (lstmOut, newH, newC) = _temporalLstm.forward(lstmInput, (hDevice, cDevice));
+            hidden = lstmOut.squeeze(1);  // [B, LstmHiddenDim]
+            h_n = newH;
+            c_n = newC;
+        }
+        else
+        {
+            // No prior state - start fresh
+            var (lstmOut, newH, newC) = _temporalLstm.forward(lstmInput);
+            hidden = lstmOut.squeeze(1);  // [B, LstmHiddenDim]
+            h_n = newH;
+            c_n = newC;
+        }
+        
+        hidden = _lstmLayerNorm.forward(hidden);
+        
+        var actionLogits = _actorHead.forward(hidden);
+        var tpSl = _tpSlHead.forward(hidden);
+        
+        // Critic path: separate value body -> critic head
+        var valueHidden = _valueBody.forward(combined);
+        var value = _criticHead.forward(valueHidden);
+        
+        return (actionLogits, value, tpSl, h_n, c_n);
+    }
+
+    /// <summary>
     /// Reset the LSTM hidden state for a specific symbol.
     /// Call this at episode boundaries to prevent information leakage across episodes.
     /// </summary>
