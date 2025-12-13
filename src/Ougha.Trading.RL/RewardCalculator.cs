@@ -25,6 +25,8 @@ public class RewardCalculator
         _episodeMetrics.Reset();
         _previousUnrealizedPnl = 0;
         _previousEquity = 0;
+        _flatStartPrice = 0;
+        _flatTicks = 0;
     }
 
     /// <summary>
@@ -79,6 +81,8 @@ public class RewardCalculator
 
     private double _previousUnrealizedPnl;
     private double _previousEquity;
+    private double _flatStartPrice;
+    private int _flatTicks;
     
     /// <summary>
     /// Calculate reward with optional ATR-based volatility normalization.
@@ -135,8 +139,15 @@ public class RewardCalculator
         }
         else
         {
-            // Flat (no position) - small penalty to encourage trading
-            reward -= _config.FlatPenalty;
+            // Opportunity cost model: only penalize if good setup was missed
+            if (_config.UseOpportunityCostModel && symbolAtr > 0)
+            {
+                reward -= CalculateOpportunityCostPenalty(currentEquity > 0 ? currentEquity : initialBalance, symbolAtr);
+            }
+            else
+            {
+                reward -= _config.FlatPenalty;
+            }
             reward -= mddPenalty * 0.5f;
             _previousUnrealizedPnl = 0;
         }
@@ -236,9 +247,9 @@ public class RewardCalculator
             reward -= _config.HoldingTimePenalty * (excessTicks / 100f);
         }
 
-        // Unrealized PnL shaping (scaled down to avoid overshadowing closed trades)
+        // Unrealized PnL shaping (increased to 8% for denser learning signal)
         var unrealizedReward = (float)(unrealizedPnl / initialBalance) * 100f * _config.UnrealizedPnlScale;
-        reward += unrealizedReward * 0.01f;
+        reward += unrealizedReward * 0.08f;
 
         // Direction quality: reward when price moves in position direction
         if (positionDirection != 0 && priceChange != 0)
@@ -295,5 +306,43 @@ public class RewardCalculator
             // Hard clamp: [-1, 1]
             return Math.Clamp(scaled, -1f, 1f);
         }
+    }
+    
+    /// <summary>
+    /// Calculate opportunity cost penalty based on missed price movement.
+    /// Only penalizes when the agent missed a significant move while flat.
+    /// </summary>
+    private float CalculateOpportunityCostPenalty(double currentPrice, double atr)
+    {
+        if (_flatStartPrice <= 0)
+        {
+            _flatStartPrice = currentPrice;
+            _flatTicks = 0;
+            return 0;
+        }
+        
+        _flatTicks++;
+        var priceMove = Math.Abs(currentPrice - _flatStartPrice);
+        var atrThreshold = atr * _config.OpportunityThresholdAtr;
+        
+        // If price moved significantly, agent missed an opportunity
+        if (priceMove > atrThreshold)
+        {
+            // Progressive penalty based on how much was missed
+            var missedAtrMultiple = (float)(priceMove / atr);
+            var penalty = _config.MissedOpportunityPenalty * Math.Min(missedAtrMultiple, 3f);
+            
+            // Reset tracking after penalty applied
+            _flatStartPrice = currentPrice;
+            return penalty;
+        }
+        
+        // Very small time decay after 60 ticks of inactivity
+        if (_flatTicks > 60)
+        {
+            return 0.0001f * (_flatTicks - 60);
+        }
+        
+        return 0;
     }
 }

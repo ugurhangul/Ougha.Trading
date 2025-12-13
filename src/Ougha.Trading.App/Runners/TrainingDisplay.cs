@@ -32,10 +32,17 @@ public static class TrainingDisplay
             BuildTradeStatsPanel(stats)
         );
         
+        // Config row - reward and model settings
+        var configGrid = new Grid();
+        configGrid.AddColumn(new GridColumn().NoWrap());
+        configGrid.AddColumn(new GridColumn().NoWrap());
+        configGrid.AddRow(BuildRewardConfigPanel(), BuildModelConfigPanel());
+        
         var rows = new List<IRenderable>
         {
             headerGrid,
             statusGrid,
+            configGrid,
             BuildSymbolPerformanceTable(stats),
             BuildProgressBar(stats)
         };
@@ -175,25 +182,32 @@ public static class TrainingDisplay
         var holdPct = (double)stats.ActionCounts.GetValueOrDefault(0, 0) / totalActions * 100;
         var buyPct = (double)stats.ActionCounts.GetValueOrDefault(1, 0) / totalActions * 100;
         var sellPct = (double)stats.ActionCounts.GetValueOrDefault(2, 0) / totalActions * 100;
-        
+
         var holdStyle = holdPct > 90 ? "red" : holdPct > 70 ? "yellow" : "green";
         var wrStyle = stats.WinRate > 50 ? "green" : stats.WinRate > 40 ? "yellow" : "red";
         var pfStyle = stats.ProfitFactor > 1.5 ? "green" : stats.ProfitFactor > 1 ? "yellow" : "red";
-        
+
         var netPnL = stats.TotalProfit - stats.TotalLoss;
         var pnlStyle = netPnL > 0 ? "green" : netPnL < 0 ? "red" : "dim";
-        
+
+        var avgHold = stats.AverageHoldingTime;
+        var avgHoldStr = avgHold.TotalHours >= 1
+            ? $"{avgHold.TotalHours:F1}h"
+            : avgHold.TotalMinutes >= 1
+                ? $"{avgHold.TotalMinutes:F1}m"
+                : $"{avgHold.TotalSeconds:F0}s";
+
         var table = new Table().Border(TableBorder.None).HideHeaders().Expand();
         table.AddColumn(new TableColumn("L").Width(8));
         table.AddColumn(new TableColumn("V").Width(14).NoWrap());
-        
+
         table.AddRow("[dim]Actions:[/]", $"[{holdStyle}]H{holdPct,2:F0}[/] [cyan]B{buyPct,2:F0}[/] [magenta]S{sellPct,2:F0}[/]");
         table.AddRow("[dim]Trades:[/]", $"[dim]{stats.TradesOpened,6:N0}/{stats.TradesClosed,-6:N0}[/]");
         table.AddRow("[dim]WinRate:[/]", $"[{wrStyle}]{stats.WinRate,6:F1}% {stats.Wins,4}W/{stats.Losses}L[/]");
         table.AddRow("[dim]PF:[/]", $"[{pfStyle}]{stats.ProfitFactor,12:F2}[/]");
-        table.AddRow("[dim]Gross:[/]", $"[green]+{stats.TotalProfit,7:N0}[/] [red]-{stats.TotalLoss,7:N0}[/]");
+        table.AddRow("[dim]AvgHold:[/]", $"[cyan]{avgHoldStr,12}[/]");
         table.AddRow("[dim]Net:[/]", $"[{pnlStyle}]${netPnL,12:N2}[/]");
-        
+
         return new Panel(table)
             .Header("[bold yellow]Trades[/]")
             .Border(BoxBorder.Rounded)
@@ -237,22 +251,22 @@ public static class TrainingDisplay
             .Border(TableBorder.Rounded)
             .BorderColor(Color.Magenta1)
             .Expand();
-        
+
         table.AddColumn(new TableColumn("[cyan]Symbol[/]").Width(10));
         table.AddColumn(new TableColumn("Eps").RightAligned().Width(6));
         table.AddColumn(new TableColumn("Avg R").RightAligned().Width(9));
         table.AddColumn(new TableColumn("PF").RightAligned().Width(7));
         table.AddColumn(new TableColumn("Win%").RightAligned().Width(7));
         table.AddColumn(new TableColumn("Trades").RightAligned().Width(7));
-        table.AddColumn(new TableColumn("$/Trade").RightAligned().Width(9));
+        table.AddColumn(new TableColumn("AvgHold").RightAligned().Width(8));
         table.AddColumn(new TableColumn("Net P&L").RightAligned().Width(12));
-        table.AddColumn(new TableColumn("Status").Centered().Width(8));
-        
+        table.AddColumn(new TableColumn("NoImp").Centered().Width(6));
+
         var sortedSymbols = stats.SymbolPerformance
             .OrderByDescending(x => x.Value.NetProfit)
             .Take(MaxSymbolRows)
             .ToList();
-        
+
         var rowCount = 0;
         foreach (var (symbol, s) in sortedSymbols)
         {
@@ -260,8 +274,14 @@ public static class TrainingDisplay
             var pfStyle = s.CumulativeProfitFactor > 1.5 ? "green" : s.CumulativeProfitFactor > 1 ? "yellow" : "red";
             var wrStyle = s.CumulativeWinRate > 50 ? "green" : s.CumulativeWinRate > 40 ? "yellow" : "red";
             var profitStyle = s.NetProfit > 0 ? "green" : s.NetProfit < 0 ? "red" : "dim";
-            var avgTradeStyle = s.AvgProfitPerTrade > 0 ? "green" : s.AvgProfitPerTrade < 0 ? "red" : "dim";
-            
+
+            var avgHold = s.AverageHoldingTime;
+            var avgHoldStr = avgHold.TotalHours >= 1
+                ? $"{avgHold.TotalHours:F1}h"
+                : avgHold.TotalMinutes >= 1
+                    ? $"{avgHold.TotalMinutes:F1}m"
+                    : $"{avgHold.TotalSeconds:F0}s";
+
             string statusStr;
             if (s.EarlyStopped)
                 statusStr = "[red]STOP[/]";
@@ -269,7 +289,7 @@ public static class TrainingDisplay
                 statusStr = $"[yellow]{s.NoImprovementCount}[/]";
             else
                 statusStr = $"[green]{s.NoImprovementCount}[/]";
-            
+
             table.AddRow(
                 Markup.Escape(symbol),
                 $"{s.Episodes}",
@@ -277,7 +297,7 @@ public static class TrainingDisplay
                 $"[{pfStyle}]{s.CumulativeProfitFactor:F2}[/]",
                 $"[{wrStyle}]{s.CumulativeWinRate:F0}%[/]",
                 $"{s.CumulativeTrades}",
-                $"[{avgTradeStyle}]{s.AvgProfitPerTrade:F2}[/]",
+                $"[cyan]{avgHoldStr}[/]",
                 $"[{profitStyle}]{s.NetProfit:N2}[/]",
                 statusStr
             );
@@ -289,7 +309,7 @@ public static class TrainingDisplay
             table.AddRow("", "", "", "", "", "", "", "", "");
             rowCount++;
         }
-        
+
         return table;
     }
 
@@ -308,11 +328,81 @@ public static class TrainingDisplay
         return new Markup($"  [bold]Progress:[/] [{progressColor}]{bar}[/] [bold]{progress:F1}%[/]");
     }
 
+    private static Panel BuildRewardConfigPanel()
+    {
+        var table = new Table().Border(TableBorder.None).HideHeaders().Expand();
+        table.AddColumn(new TableColumn("L").Width(12));
+        table.AddColumn(new TableColumn("V").Width(12).NoWrap());
+        table.AddColumn(new TableColumn("L2").Width(12));
+        table.AddColumn(new TableColumn("V2").Width(12).NoWrap());
+        
+        table.AddRow(
+            "[dim]Loss Penalty:[/]", "[yellow]4.5[/] (1.5x)",
+            "[dim]Shaping:[/]", "[cyan]8%[/]"
+        );
+        table.AddRow(
+            "[dim]Opp. Cost:[/]", "[green]ON[/] (0.5 ATR)",
+            "[dim]Flat Penalty:[/]", "[dim]Off[/]"
+        );
+        table.AddRow(
+            "[dim]MinHold:[/]", "[yellow]120[/] (2m)",
+            "[dim]MaxHold:[/]", "[yellow]14400[/] (4h)"
+        );
+        table.AddRow(
+            "[dim]QuickProfit:[/]", "[yellow]600[/] (10m)",
+            "[dim]UnrealScale:[/]", "[cyan]50[/]"
+        );
+        
+        return new Panel(table)
+            .Header("[bold orange3]Reward Config[/]")
+            .Border(BoxBorder.Rounded)
+            .BorderColor(Color.Orange3)
+            .Expand();
+    }
+
+    private static Panel BuildModelConfigPanel()
+    {
+        var table = new Table().Border(TableBorder.None).HideHeaders().Expand();
+        table.AddColumn(new TableColumn("L").Width(12));
+        table.AddColumn(new TableColumn("V").Width(12).NoWrap());
+        table.AddColumn(new TableColumn("L2").Width(12));
+        table.AddColumn(new TableColumn("V2").Width(14).NoWrap());
+        
+        table.AddRow(
+            "[dim]TF Embed:[/]", "[cyan]768[/]",
+            "[dim]Hidden:[/]", "[cyan]4096×5[/]"
+        );
+        table.AddRow(
+            "[dim]Value Net:[/]", "[cyan]2048×4[/]",
+            "[dim]LSTM:[/]", "[cyan]2048×3[/]"
+        );
+        table.AddRow(
+            "[dim]Entropy:[/]", "[yellow]0.12→0.02[/]",
+            "[dim]Decay:[/]", "[yellow]0.9999[/]"
+        );
+        table.AddRow(
+            "[dim]Epochs:[/]", "[yellow]8[/]",
+            "[dim]VRAM Est:[/]", "[green]~12GB[/]"
+        );
+        
+        return new Panel(table)
+            .Header("[bold teal]Model Config[/]")
+            .Border(BoxBorder.Rounded)
+            .BorderColor(Color.Teal)
+            .Expand();
+    }
+
     public static string GenerateResultReport(TrainingStats stats, TrainingBudget budget, string modelDir)
     {
         var elapsed = stats.Elapsed;
         var netPnL = stats.TotalProfit - stats.TotalLoss;
-        
+        var avgHold = stats.AverageHoldingTime;
+        var avgHoldStr = avgHold.TotalHours >= 1
+            ? $"{avgHold.TotalHours:F1} hours"
+            : avgHold.TotalMinutes >= 1
+                ? $"{avgHold.TotalMinutes:F1} minutes"
+                : $"{avgHold.TotalSeconds:F0} seconds";
+
         var lines = new List<string>
         {
             "",
@@ -337,24 +427,31 @@ public static class TrainingDisplay
             $"  Trades Closed:         {stats.TradesClosed:N0}",
             $"  Win Rate:              {stats.WinRate:F1}%",
             $"  Profit Factor:         {stats.ProfitFactor:F2}",
+            $"  Avg Holding Time:      {avgHoldStr}",
             $"  Net P&L:               ${netPnL:N2}",
             "",
             "SYMBOL PERFORMANCE",
             new('-', 40)
         };
-        
+
         foreach (var (symbol, s) in stats.SymbolPerformance.OrderByDescending(x => x.Value.NetProfit))
         {
             var trend = s.NetProfit > 0 ? "+" : "";
-            lines.Add($"  {symbol,-12} Eps:{s.Episodes,5} PF:{s.CumulativeProfitFactor,6:F2} Win:{s.CumulativeWinRate,5:F1}% P&L:{trend}${s.NetProfit:N2}");
+            var symAvgHold = s.AverageHoldingTime;
+            var symAvgHoldStr = symAvgHold.TotalHours >= 1
+                ? $"{symAvgHold.TotalHours:F1}h"
+                : symAvgHold.TotalMinutes >= 1
+                    ? $"{symAvgHold.TotalMinutes:F1}m"
+                    : $"{symAvgHold.TotalSeconds:F0}s";
+            lines.Add($"  {symbol,-12} Eps:{s.Episodes,5} PF:{s.CumulativeProfitFactor,6:F2} Win:{s.CumulativeWinRate,5:F1}% Hold:{symAvgHoldStr,6} P&L:{trend}${s.NetProfit:N2}");
         }
-        
+
         lines.Add("");
         lines.Add(new string('=', 80));
         lines.Add("                         END OF TRAINING REPORT");
         lines.Add(new string('=', 80));
         lines.Add("");
-        
+
         return string.Join(Environment.NewLine, lines);
     }
 }

@@ -40,11 +40,11 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     private readonly Sequential _criticHead;
     private readonly Sequential _tpSlHead;
 
-    private const int TimeframeEmbedDim = 256;  // Doubled from 128
+    private const int TimeframeEmbedDim = 768;   // Scaled 3x for 24GB VRAM
     private const int FeatureDim = 120;
-    private const int HiddenDim = 1024;         // Increased from 768
-    private const int ValueHiddenDim = 512;     // Increased from 384
-    private const int LstmHiddenDim = 512;      // LSTM hidden size
+    private const int HiddenDim = 4096;           // Scaled 4x for 24GB VRAM
+    private const int ValueHiddenDim = 2048;      // Scaled 4x for 24GB VRAM
+    private const int LstmHiddenDim = 2048;       // Scaled 4x for 24GB VRAM
 
     public ActorCriticModel(string name, int numActions = 3, float dropout = 0.1f) : base(name)
     {
@@ -62,7 +62,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
 
         long inputDim = 5 * TimeframeEmbedDim + 256;  // Updated for larger feature net
         
-        // Shared body for feature extraction - now 3 layers deep
+        // Shared body for feature extraction - 5 layers deep for massive capacity
         _sharedBody = Sequential(
             Linear(inputDim, HiddenDim),
             LayerNorm([HiddenDim]),
@@ -72,17 +72,25 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
             LayerNorm([HiddenDim]),
             ReLU(),
             Dropout(dropout),
-            Linear(HiddenDim, HiddenDim),  // 3rd layer
+            Linear(HiddenDim, HiddenDim),
+            LayerNorm([HiddenDim]),
+            ReLU(),
+            Dropout(dropout),
+            Linear(HiddenDim, HiddenDim),  // 4th layer
+            LayerNorm([HiddenDim]),
+            ReLU(),
+            Dropout(dropout),
+            Linear(HiddenDim, HiddenDim),  // 5th layer
             LayerNorm([HiddenDim]),
             ReLU(),
             Dropout(dropout)
         );
         
-        // LSTM for temporal memory - single layer, bidirectional=false for causal
-        _temporalLstm = LSTM(HiddenDim, LstmHiddenDim, numLayers: 1, bidirectional: false, dropout: dropout, batchFirst: true);
+        // LSTM for temporal memory - 3 layers for deep temporal patterns
+        _temporalLstm = LSTM(HiddenDim, LstmHiddenDim, numLayers: 3, bidirectional: false, dropout: dropout, batchFirst: true);
         _lstmLayerNorm = LayerNorm([LstmHiddenDim]);
         
-        // Separate value body - processes fused features independently for value estimation
+        // Separate value body - 4 layers for robust value estimation
         _valueBody = Sequential(
             Linear(inputDim, ValueHiddenDim),
             LayerNorm([ValueHiddenDim]),
@@ -92,7 +100,11 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
             LayerNorm([ValueHiddenDim]),
             ReLU(),
             Dropout(dropout),
-            Linear(ValueHiddenDim, ValueHiddenDim),  // 3rd layer for value too
+            Linear(ValueHiddenDim, ValueHiddenDim),
+            LayerNorm([ValueHiddenDim]),
+            ReLU(),
+            Dropout(dropout),
+            Linear(ValueHiddenDim, ValueHiddenDim),  // 4th layer
             LayerNorm([ValueHiddenDim]),
             ReLU()
         );

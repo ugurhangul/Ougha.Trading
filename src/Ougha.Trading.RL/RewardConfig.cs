@@ -36,7 +36,7 @@ public class RewardConfig
     /// <summary>
     /// Penalty for losing trades. Symmetric with WinBonus for balanced risk.
     /// </summary>
-    public float LossPenalty { get; set; } = 3f;  // Now symmetric
+    public float LossPenalty { get; set; } = 4.5f;  // 1.5x asymmetry for capital preservation
     
     /// <summary>
     /// Risk-adjusted reward: profit / SL distance. Rewards good R:R trades.
@@ -49,7 +49,7 @@ public class RewardConfig
     /// <summary>
     /// Scale for unrealized PnL shaping. Provides dense signal during trades.
     /// </summary>
-    public float UnrealizedPnlScale { get; set; } = 15f;  // Reduced from 50
+    public float UnrealizedPnlScale { get; set; } = 50f;  // Increased for denser learning signal
     
     /// <summary>
     /// Scale for PnL delta (improvement since last step). Encourages progress.
@@ -77,7 +77,7 @@ public class RewardConfig
     /// <summary>
     /// Minimum ticks before a position can be closed without penalty.
     /// </summary>
-    public int MinHoldingTicks { get; set; } = 30;  // Reduced from 50
+    public int MinHoldingTicks { get; set; } = 120;  // 2 minutes at S1 granularity
     
     /// <summary>
     /// Penalty for closing too early (before MinHoldingTicks).
@@ -87,12 +87,12 @@ public class RewardConfig
     /// <summary>
     /// Maximum holding ticks before increasing penalty.
     /// </summary>
-    public int MaxHoldingTicks { get; set; } = 1000;
+    public int MaxHoldingTicks { get; set; } = 14400;  // 4 hours at S1 granularity
     
     /// <summary>
     /// Ticks for quick profit bonus eligibility.
     /// </summary>
-    public int QuickProfitTicks { get; set; } = 150;  // Reduced from 200
+    public int QuickProfitTicks { get; set; } = 600;  // 10 minutes at S1 granularity
     
     /// <summary>
     /// Bonus for quick profitable trades.
@@ -100,13 +100,28 @@ public class RewardConfig
     public float QuickProfitBonus { get; set; } = 5f;  // Reduced from 20
 
     // ========================
-    // FLAT POSITION INCENTIVE
+    // OPPORTUNITY COST MODEL
     // ========================
     /// <summary>
-    /// Penalty for being flat (no position). Encourages trading activity.
-    /// Set to 0 to disable.
+    /// Enable opportunity cost model instead of flat penalty.
+    /// Only penalizes when agent misses significant price moves.
     /// </summary>
-    public float FlatPenalty { get; set; } = 0.002f;  // Increased from 0.0005 to reduce HOLD bias
+    public bool UseOpportunityCostModel { get; set; } = true;
+    
+    /// <summary>
+    /// Penalty when agent is flat but market moved significantly.
+    /// </summary>
+    public float MissedOpportunityPenalty { get; set; } = 0.5f;
+    
+    /// <summary>
+    /// ATR multiplier threshold: price move > this * ATR = missed opportunity.
+    /// </summary>
+    public float OpportunityThresholdAtr { get; set; } = 0.5f;
+    
+    /// <summary>
+    /// Legacy flat penalty (used when UseOpportunityCostModel is false).
+    /// </summary>
+    public float FlatPenalty { get; set; } = 0.002f;
 
     // ========================
     // DIRECTION QUALITY

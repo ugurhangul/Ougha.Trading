@@ -25,6 +25,11 @@ public class SymbolStats
     public double CumulativeMaxDrawdown { get; set; }
     public int CumulativeBuys { get; set; }
     public int CumulativeSells { get; set; }
+    public double TotalHoldingTimeSeconds { get; set; }
+
+    public TimeSpan AverageHoldingTime => CumulativeTrades > 0
+        ? TimeSpan.FromSeconds(TotalHoldingTimeSeconds / CumulativeTrades)
+        : TimeSpan.Zero;
     
     // Recent performance for trend tracking
     public double LastEpisodeReward { get; set; }

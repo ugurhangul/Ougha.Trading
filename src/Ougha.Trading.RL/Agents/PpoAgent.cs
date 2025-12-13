@@ -54,9 +54,9 @@ public class PpoAgent : IAgent
         _gaeLambda = gaeLambda;
         _clipEpsilon = clipEpsilon;
         _valueCoef = 0.5f;
-        _entropyCoef = 0.15f;  // Higher starting entropy for more exploration
-        _minEntropyCoef = 0.05f;  // Higher floor to prevent policy collapse
-        _updateEpochs = 4; // Reduced from 10 for faster training
+        _entropyCoef = 0.12f;  // Lower start for more exploitation with massive model
+        _minEntropyCoef = 0.02f;  // Lower floor allows sharper final policy
+        _updateEpochs = 8; // More epochs per rollout for larger model
         
         // LR Scheduling
 
@@ -430,7 +430,7 @@ public class PpoAgent : IAgent
     public void DecayEpsilon()
     {
         if (!(_entropyCoef > _minEntropyCoef)) return;
-        _entropyCoef *= 0.9998f;  // Even slower decay - was 0.9995
+        _entropyCoef *= 0.9999f;  // Very slow decay for large model stability
         _entropyCoef = Math.Max(_entropyCoef, _minEntropyCoef);
     }
     

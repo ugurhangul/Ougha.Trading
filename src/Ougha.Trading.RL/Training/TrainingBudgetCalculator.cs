@@ -305,7 +305,7 @@ public static class TrainingBudgetCalculator
     {
         var patience = Math.Max(50, (int)(episodes * 0.15));
         var minEpisodes = Math.Max(100, (int)(episodes * 0.5));
-        return (patience, minEpisodes);
+        return (patience, 0);
     }
     
     private static int  CalculateParallelism()

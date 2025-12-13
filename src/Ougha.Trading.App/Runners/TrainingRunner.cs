@@ -358,12 +358,15 @@ public static class TrainingRunner
 
                             var allResults = env.Executor.GetResults();
                             var episodeTrades = allResults.TradeLog;
+                            var totalHoldingSeconds = episodeTrades.Sum(t => (t.CloseTime - t.OpenTime).TotalSeconds);
+
                             stats.TradesOpened += allResults.TotalTrades;
                             stats.TradesClosed += episodeTrades.Count;
                             stats.Wins += episodeTrades.Count(t => t.Profit > 0);
                             stats.Losses += episodeTrades.Count(t => t.Profit <= 0);
                             stats.TotalProfit += episodeTrades.Where(t => t.Profit > 0).Sum(t => t.Profit);
                             stats.TotalLoss += Math.Abs(episodeTrades.Where(t => t.Profit < 0).Sum(t => t.Profit));
+                            stats.TotalHoldingTimeSeconds += totalHoldingSeconds;
 
                             foreach (var symbol in symbols)
                             {
@@ -388,6 +391,7 @@ public static class TrainingRunner
                                 var episodeLosses = symbolTrades.Count(t => t.Profit <= 0);
                                 var buys = symbolTrades.Count(t => t.Type == TradeType.Buy);
                                 var sells = symbolTrades.Count(t => t.Type == TradeType.Sell);
+                                var symbolHoldingSeconds = symbolTrades.Sum(t => (t.CloseTime - t.OpenTime).TotalSeconds);
 
                                 symStats.CumulativeTrades += symbolTrades.Count;
                                 symStats.CumulativeWins += episodeWins;
@@ -396,6 +400,7 @@ public static class TrainingRunner
                                 symStats.CumulativeLoss += grossLoss;
                                 symStats.CumulativeBuys += buys;
                                 symStats.CumulativeSells += sells;
+                                symStats.TotalHoldingTimeSeconds += symbolHoldingSeconds;
 
                                 if (symbolReward > symStats.BestReward)
                                 {

@@ -231,6 +231,7 @@ public class TrainingStats
     private int _losses;
     private double _totalProfit;
     private double _totalLoss;
+    private double _totalHoldingTimeSeconds;
 
     public int TradesOpened { get => _tradesOpened; set => _tradesOpened = value; }
     public int TradesClosed { get => _tradesClosed; set => _tradesClosed = value; }
@@ -238,15 +239,19 @@ public class TrainingStats
     public int Losses { get => _losses; set => _losses = value; }
     public double TotalProfit { get => _totalProfit; set => _totalProfit = value; }
     public double TotalLoss { get => _totalLoss; set => _totalLoss = value; }
+    public double TotalHoldingTimeSeconds { get => _totalHoldingTimeSeconds; set => _totalHoldingTimeSeconds = value; }
 
     public double WinRate => _tradesClosed > 0 ? (double)_wins / _tradesClosed * 100 : 0;
     public double ProfitFactor => _totalLoss > 0 ? _totalProfit / _totalLoss : (_totalProfit > 0 ? 999.0 : 0);
+    public TimeSpan AverageHoldingTime => _tradesClosed > 0
+        ? TimeSpan.FromSeconds(_totalHoldingTimeSeconds / _tradesClosed)
+        : TimeSpan.Zero;
 
     public void IncrementEpisode() => Interlocked.Increment(ref _completedEpisodes);
     public void IncrementTotalSteps(int count = 1) => Interlocked.Add(ref _totalSteps, count);
     public void IncrementTrainCalls() => Interlocked.Increment(ref _trainCalls);
 
-    public void AddTradeStats(int opened, int closed, int wins, int losses, double profit, double loss)
+    public void AddTradeStats(int opened, int closed, int wins, int losses, double profit, double loss, double holdingTimeSeconds = 0)
     {
         Interlocked.Add(ref _tradesOpened, opened);
         Interlocked.Add(ref _tradesClosed, closed);
@@ -256,6 +261,7 @@ public class TrainingStats
         {
             _totalProfit += profit;
             _totalLoss += loss;
+            _totalHoldingTimeSeconds += holdingTimeSeconds;
         }
     }
 
