@@ -68,8 +68,8 @@ public class PpoAgent : IAgent
         _clipEpsilon = clipEpsilon;
         _valueCoef = 0.5f;
         _tpSlCoef = 0.1f;  // TP/SL loss weight
-        _entropyCoef = 0.05f;  // Standard PPO range: 0.01-0.1 (was 1.1 - too high)
-        _minEntropyCoef = 0.05f;  // Increased from 0.02 for better exploration floor
+        _entropyCoef = 0.10f;  // Higher initial for trading (more exploration needed)
+        _minEntropyCoef = 0.08f;  // Higher floor to prevent policy collapse to HOLD
         _updateEpochs = 4;  // Reduced from 8 to prevent overfitting on trading data
         
         // LR Scheduling - linear decay over expected training
@@ -343,16 +343,14 @@ public class PpoAgent : IAgent
             {
                 foreach (var seqBatch in seqLoader.GetBatches())
                 {
-                    // Process multiple sequences together by concatenating them into one batch
-                    // This maintains episode grouping while using efficient batched forward()
+                    // Process sequences with LSTM state propagation for temporal coherence
                     foreach (var sequence in seqBatch.Sequences)
                     {
                         using (NewDisposeScope())
                         {
                             var seqLen = sequence.Length;
                             
-                            // Batch prepare all inputs for the sequence at once
-                            var stateTensors = PrepareInputTensors(sequence.States);
+                            // Prepare tensors for all timesteps
                             var actions = tensor(sequence.Actions, dtype: ScalarType.Int64, device: _device);
                             var oldLogProbs = tensor(sequence.LogProbs, dtype: ScalarType.Float32, device: _device);
                             var returnsArr = tensor(sequence.Returns, dtype: ScalarType.Float32, device: _device);
@@ -364,10 +362,43 @@ public class PpoAgent : IAgent
                             // Normalize advantages for this sequence
                             var normalizedAdvs = (advantagesArr - advantagesArr.mean()) / (advantagesArr.std() + 1e-8f);
                             
-                            // Single batched forward pass for entire sequence
-                            var (logits, values, tpSlPred) = _model.forward(stateTensors);
+                            // Process sequence with LSTM state propagation
+                            // This mirrors inference behavior where LSTM accumulates state
+                            var allLogits = new List<Tensor>();
+                            var allValues = new List<Tensor>();
+                            var allTpSl = new List<Tensor>();
+                            Tensor? lstmH = null, lstmC = null;
                             
-                            var probs = nn.functional.softmax(logits, dim: 1);
+                            for (var t = 0; t < seqLen; t++)
+                            {
+                                var stateTensors = PrepareInputTensors([sequence.States[t]]);
+                                
+                                var (logits, values, tpSlPred, h_n, c_n) = _model.ForwardWithState(
+                                    stateTensors, lstmH, lstmC);
+                                
+                                allLogits.Add(logits);
+                                allValues.Add(values);
+                                allTpSl.Add(tpSlPred);
+                                
+                                // Propagate hidden state to next timestep (detached to prevent backprop through time explosion)
+                                lstmH = h_n.detach();
+                                lstmC = c_n.detach();
+                                
+                                foreach (var st in stateTensors) st.Dispose();
+                            }
+                            
+                            // Stack outputs from all timesteps
+                            var logitsTensor = cat(allLogits.ToArray(), dim: 0);
+                            var valuesTensor = cat(allValues.ToArray(), dim: 0);
+                            var tpSlTensor = cat(allTpSl.ToArray(), dim: 0);
+                            
+                            // Clean up intermediate tensors
+                            foreach (var t in allLogits) t.Dispose();
+                            foreach (var t in allValues) t.Dispose();
+                            foreach (var t in allTpSl) t.Dispose();
+                            lstmH?.Dispose(); lstmC?.Dispose();
+                            
+                            var probs = nn.functional.softmax(logitsTensor, dim: 1);
                             var dist = distributions.Categorical(probs);
                             var newLogProbs = dist.log_prob(actions);
                             var entropy = dist.entropy().mean();
@@ -377,16 +408,15 @@ public class PpoAgent : IAgent
                             var surr2 = clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * normalizedAdvs;
                             var actorLoss = -min(surr1, surr2).mean();
 
-                            var valuesSqueeezed = values.squeeze();
-                            var valueClipped = seqOldValues + clamp(valuesSqueeezed - seqOldValues, -_clipEpsilon, _clipEpsilon);
-                            var valueLoss1 = (valuesSqueeezed - returnsArr).pow(2);
+                            var valuesSqueezed = valuesTensor.squeeze();
+                            var valueClipped = seqOldValues + clamp(valuesSqueezed - seqOldValues, -_clipEpsilon, _clipEpsilon);
+                            var valueLoss1 = (valuesSqueezed - returnsArr).pow(2);
                             var valueLoss2 = (valueClipped - returnsArr).pow(2);
                             var valueLoss = 0.5f * max(valueLoss1, valueLoss2).mean();
                             
                             // TP/SL loss - train on ALL trades (not just positive advantage)
-                            // Learning from losing trades is critical for improving TP/SL predictions
-                            var predTp = tpSlPred.select(1, 0);
-                            var predSl = tpSlPred.select(1, 1);
+                            var predTp = tpSlTensor.select(1, 0);
+                            var predSl = tpSlTensor.select(1, 1);
                             var tradeMask = (actions != 0).to_type(ScalarType.Float32);
                             
                             var tpError = (predTp - targetTpMults).pow(2) * tradeMask;
@@ -395,9 +425,9 @@ public class PpoAgent : IAgent
                             
                             var loss = actorLoss + _valueCoef * valueLoss + _tpSlCoef * tpSlLoss - _entropyCoef * entropy;
                             
-                            // Calculate KL divergence for early stopping
-                            var klDiv = (oldLogProbs - newLogProbs).mean().item<float>();
-                            _lastKlDivergence = klDiv;
+                            // Proper approximate KL divergence: 0.5 * E[(log π_old - log π_new)^2]
+                            var approxKl = 0.5f * (oldLogProbs - newLogProbs).pow(2).mean().item<float>();
+                            _lastKlDivergence = approxKl;
                             _lastValueLoss = valueLoss.item<float>();
                             
                             _optimizer.zero_grad();
@@ -407,9 +437,6 @@ public class PpoAgent : IAgent
                             
                             totalLoss += loss.item<float>();
                             steps++;
-                            
-                            // Dispose input tensors
-                            foreach (var st in stateTensors) st.Dispose();
                         }
                     }
                     
@@ -486,9 +513,9 @@ public class PpoAgent : IAgent
                         var surr2 = clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * normalizedAdvs;
                         var actorLoss = -min(surr1, surr2).mean();
 
-                        var valuesSqueeezed = values.squeeze();
-                        var valueClipped = oldValuesBatch + clamp(valuesSqueeezed - oldValuesBatch, -_clipEpsilon, _clipEpsilon);
-                        var valueLoss1 = (valuesSqueeezed - returnsTensor).pow(2);
+                        var valuesSqueezed = values.squeeze();
+                        var valueClipped = oldValuesBatch + clamp(valuesSqueezed - oldValuesBatch, -_clipEpsilon, _clipEpsilon);
+                        var valueLoss1 = (valuesSqueezed - returnsTensor).pow(2);
                         var valueLoss2 = (valueClipped - returnsTensor).pow(2);
                         var valueLoss = 0.5f * max(valueLoss1, valueLoss2).mean();
                         
@@ -503,6 +530,11 @@ public class PpoAgent : IAgent
                         var tpSlLoss = (tpError.sum() + slError.sum()) / (tradeMask.sum() + 1e-8f);
                         
                         var loss = actorLoss + _valueCoef * valueLoss + _tpSlCoef * tpSlLoss - _entropyCoef * entropy;
+                        
+                        // Proper approximate KL divergence (same as sequence training)
+                        var approxKl = 0.5f * (oldLogProbs - newLogProbs).pow(2).mean().item<float>();
+                        _lastKlDivergence = approxKl;
+                        _lastValueLoss = valueLoss.item<float>();
                         
                         _optimizer.zero_grad();
                         loss.backward();
@@ -618,7 +650,7 @@ public class PpoAgent : IAgent
     public void DecayEpsilon()
     {
         if (!(_entropyCoef > _minEntropyCoef)) return;
-        _entropyCoef *= 0.9990f;
+        _entropyCoef *= 0.9995f;  // Slower decay for better exploration
         _entropyCoef = Math.Max(_entropyCoef, _minEntropyCoef);
     }
     

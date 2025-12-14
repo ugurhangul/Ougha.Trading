@@ -321,6 +321,23 @@ public class PortfolioTradingEnvironment
             }
         }
 
+        // Market hours awareness: force close positions before weekend to avoid gap risk
+        // Friday 21:00 UTC is when most forex markets close
+        if (currentTime.DayOfWeek == DayOfWeek.Friday && currentTime.Hour >= 21)
+        {
+            foreach (var symbol in _config.Symbols)
+            {
+                var pos = _executor.GetPosition(symbol);
+                if (pos != null)
+                {
+                    await _executor.ClosePositionAsync(symbol);
+                    _positionOpenTicks[symbol] = 0;
+                    _peakUnrealizedPnls[symbol] = 0;
+                    Log.Debug("[WeekendClose] Force closed {Symbol} at {Time} to avoid gap risk", 
+                        symbol, currentTime);
+                }
+            }
+        }
 
         var globalDone = !moreData;
         if (currentEquity < _initialBalance * (1 - _config.MaxLossPercent / 100.0))

@@ -29,6 +29,8 @@ public class RewardCalculator
         _previousEquity = 0;
         _flatStartPrice = 0;
         _flatTicks = 0;
+        _flatPreviousPrice = 0;
+        _flatDirectionTicks = 0;
     }
 
     /// <summary>
@@ -261,9 +263,9 @@ public class RewardCalculator
         // NOTE: unrealizedPnl is already a decimal percentage (0.01 = 1%)
         if (unrealizedPnl > 0)
         {
-            // Exponential decay: bonus diminishes over ~30 minutes
+            // Exponential decay: bonus diminishes over ~60 minutes (slowed for day trading)
             var holdingMinutes = holdingTicks / 60f;
-            var decayFactor = (float)Math.Exp(-holdingMinutes / 30f);
+            var decayFactor = (float)Math.Exp(-holdingMinutes / 60f);  // Slower decay for day trading
             reward += _config.HoldingBonus * decayFactor;
             
             // Removed additional profit accumulation - already covered by unrealized PnL shaping
@@ -335,29 +337,51 @@ public class RewardCalculator
             return Math.Clamp(scaled, -1f, 1f);
         }
     }
+    private double _flatPreviousPrice;  // Track direction consistency
+    private int _flatDirectionTicks;     // Ticks moving in same direction
     
     /// <summary>
     /// Calculate opportunity cost penalty based on missed price movement.
-    /// Only penalizes when the agent missed a significant move while flat.
-    /// Uses ATR for volatility normalization and Point for price-scale normalization.
+    /// Only penalizes when the agent missed a SUSTAINED move (momentum), not just spikes.
+    /// Uses ATR for volatility normalization and requires directional consistency.
     /// </summary>
     private float CalculateOpportunityCostPenalty(double currentPrice, double atr, double symbolPoint)
     {
         if (_flatStartPrice <= 0)
         {
             _flatStartPrice = currentPrice;
+            _flatPreviousPrice = currentPrice;
             _flatTicks = 0;
+            _flatDirectionTicks = 0;
             return 0;
         }
         
         _flatTicks++;
         var priceMove = Math.Abs(currentPrice - _flatStartPrice);
         
+        // Track directional consistency (momentum requirement)
+        var tickDirection = Math.Sign(currentPrice - _flatPreviousPrice);
+        var overallDirection = Math.Sign(currentPrice - _flatStartPrice);
+        
+        if (tickDirection == overallDirection && tickDirection != 0)
+        {
+            _flatDirectionTicks++;
+        }
+        else if (tickDirection == -overallDirection)
+        {
+            _flatDirectionTicks = Math.Max(0, _flatDirectionTicks - 2);  // Faster reset on reversal
+        }
+        
+        _flatPreviousPrice = currentPrice;
+        
         // Normalize price move by ATR (volatility-relative)
         var atrThreshold = atr * _config.OpportunityThresholdAtr;
         
-        // If price moved significantly, agent missed an opportunity
-        if (priceMove > atrThreshold)
+        // Only penalize if move was SUSTAINED (not just a spike)
+        // Require at least 10 ticks of consistent direction movement
+        var hasmomentum = _flatDirectionTicks >= 10;
+        
+        if (priceMove > atrThreshold && hasmomentum)
         {
             // Use ATR-normalized missed opportunity (independent of symbol price scale)
             var missedAtrMultiple = (float)(priceMove / atr);
@@ -365,13 +389,14 @@ public class RewardCalculator
             
             // Reset tracking after penalty applied
             _flatStartPrice = currentPrice;
+            _flatDirectionTicks = 0;
             return penalty;
         }
         
-        // Very small time decay after 60 ticks of inactivity
-        if (_flatTicks > 60)
+        // Very small time decay after 120 ticks of inactivity (increased from 60)
+        if (_flatTicks > 120)
         {
-            return 0.0001f * (_flatTicks - 60);
+            return 0.00005f * (_flatTicks - 120);  // Even smaller penalty
         }
         
         return 0;

@@ -281,11 +281,13 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     /// Use this during training to maintain temporal coherence within sequences.
     /// </summary>
     /// <param name="inputs">Input tensors: [PackedTimeframes, SymbolId, PackedFeatures]</param>
-    /// <param name="hiddenState">Optional LSTM hidden state (h, c) from previous timestep</param>
+    /// <param name="h">Optional LSTM hidden state from previous timestep</param>
+    /// <param name="c">Optional LSTM cell state from previous timestep</param>
     /// <returns>Outputs plus updated hidden state for next timestep</returns>
     public (Tensor ActionLogits, Tensor Value, Tensor TpSlParams, Tensor H, Tensor C) ForwardWithState(
         Tensor[] inputs, 
-        (Tensor h, Tensor c)? hiddenState = null)
+        Tensor? h = null,
+        Tensor? c = null)
     {
         var packedTf = inputs[0];  // [B, 5, W, F]
         var symbolId = inputs[1];  // [B, 1]
@@ -337,11 +339,11 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
         var lstmInput = hidden.unsqueeze(1);  // [B, 1, HiddenDim]
         
         Tensor h_n, c_n;
-        if (hiddenState.HasValue)
+        if (h is not null && c is not null)
         {
             // Move hidden state to correct device if needed
-            var hDevice = hiddenState.Value.h.to(lstmInput.device);
-            var cDevice = hiddenState.Value.c.to(lstmInput.device);
+            var hDevice = h.to(lstmInput.device);
+            var cDevice = c.to(lstmInput.device);
             var (lstmOut, newH, newC) = _temporalLstm.forward(lstmInput, (hDevice, cDevice));
             hidden = lstmOut.squeeze(1);  // [B, LstmHiddenDim]
             h_n = newH;

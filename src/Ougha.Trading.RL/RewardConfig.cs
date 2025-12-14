@@ -29,14 +29,14 @@ public class RewardConfig
     public float RealizedProfitScale { get; set; } = 10f;  // Normalized from 50
     
     /// <summary>
-    /// Bonus for winning trades (profit > 0).
+    /// Bonus for winning trades (profit > 0). Reduced to not dominate actual profit signal.
     /// </summary>
-    public float WinBonus { get; set; } = 3f;  // Symmetric with LossPenalty
+    public float WinBonus { get; set; } = 1.0f;  // Reduced from 3 to not dominate profit signal
     
     /// <summary>
     /// Penalty for losing trades. Symmetric with WinBonus for balanced risk.
     /// </summary>
-    public float LossPenalty { get; set; } = 3f;  // Symmetric with WinBonus for balanced exploration
+    public float LossPenalty { get; set; } = 1.0f;  // Reduced from 3 to not dominate profit signal
     
     /// <summary>
     /// Risk-adjusted reward: profit / SL distance. Rewards good R:R trades.
@@ -115,8 +115,9 @@ public class RewardConfig
     
     /// <summary>
     /// Penalty when agent is flat but market moved significantly.
+    /// Reduced to avoid over-penalizing valid wait-for-confirmation strategies.
     /// </summary>
-    public float MissedOpportunityPenalty { get; set; } = 0.3f;  // Reduced from 0.9 to avoid over-penalizing consolidation
+    public float MissedOpportunityPenalty { get; set; } = 0.15f;  // Reduced from 0.3 to avoid overtrading
     
     /// <summary>
     /// ATR multiplier threshold: price move > this * ATR = missed opportunity.
@@ -199,8 +200,9 @@ public class RewardConfig
     
     /// <summary>
     /// Threshold before MDD penalty kicks in (percentage).
+    /// Increased for day trading where 5% drawdowns are normal.
     /// </summary>
-    public float MddThreshold { get; set; } = 5f;  // Reduced from 10
+    public float MddThreshold { get; set; } = 10f;  // Increased from 5 for day trading tolerance
     
     /// <summary>
     /// Scale multiplier for MDD penalty.
@@ -216,10 +218,10 @@ public class RewardConfig
     public float RewardNormalizationScale { get; set; } = 10f;  // Reduced to match normalized reward magnitudes
     
     /// <summary>
-    /// If true, normalize rewards to bounded range using tanh (smooth).
+    /// If true, normalize rewards to bounded range using tanh (smooth gradients).
     /// If false, use clamp (hard cutoff).
     /// </summary>
-    public bool UseTanhNormalization { get; set; } = false;  // Use clamp for clearer signal
+    public bool UseTanhNormalization { get; set; } = true;  // Enabled for smoother gradients
     
     /// <summary>
     /// Enable/disable reward normalization.

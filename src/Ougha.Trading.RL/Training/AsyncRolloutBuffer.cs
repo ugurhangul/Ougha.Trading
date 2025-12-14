@@ -1,4 +1,5 @@
 using System.Threading.Channels;
+using Serilog;
 
 namespace Ougha.Trading.RL.Training;
 
@@ -31,6 +32,11 @@ public class AsyncRolloutBuffer(int capacity, int maxPendingRollouts = 4)
     public int ActiveBufferCount => _activeBuffer.Count;
 
     public int PendingRolloutsCount => _readyRollouts.Reader.Count;
+    
+    /// <summary>
+    /// Counter for dropped rollouts (when training can't keep up with collection).
+    /// </summary>
+    public int DroppedRolloutsCount { get; private set; }
     
     /// <summary>
     /// Current episode ID. Set this before adding experiences to track episode boundaries.
@@ -86,7 +92,12 @@ public class AsyncRolloutBuffer(int capacity, int maxPendingRollouts = 4)
         
         if (rollout != null)
         {
-            _readyRollouts.Writer.TryWrite(rollout);
+            if (!_readyRollouts.Writer.TryWrite(rollout))
+            {
+                DroppedRolloutsCount++;
+                Log.Warning("[AsyncRolloutBuffer] Dropped rollout #{Count} - training can't keep up with collection", 
+                    DroppedRolloutsCount);
+            }
         }
     }
     
@@ -110,7 +121,12 @@ public class AsyncRolloutBuffer(int capacity, int maxPendingRollouts = 4)
         
         if (rollout != null)
         {
-            _readyRollouts.Writer.TryWrite(rollout);
+            if (!_readyRollouts.Writer.TryWrite(rollout))
+            {
+                DroppedRolloutsCount++;
+                Log.Warning("[AsyncRolloutBuffer] Dropped rollout #{Count} - training can't keep up with collection", 
+                    DroppedRolloutsCount);
+            }
         }
     }
     
