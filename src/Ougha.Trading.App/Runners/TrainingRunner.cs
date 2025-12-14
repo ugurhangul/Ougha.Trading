@@ -516,7 +516,7 @@ public static class TrainingRunner
                             if (ep % 50 == 0 && agent is PpoAgent ppoAgent)
                             {
                                 var actionCountsArr = stats.GetActionCountsAsArray();
-                                if (ppoAgent.CheckAndResetEntropy(actionCountsArr, skewThreshold: 0.70f))
+                                if (ppoAgent.CheckAndResetEntropy(actionCountsArr, skewThreshold: 0.55f))  // Reduced from 0.70 for earlier intervention
                                 {
                                     Log.Information("[TrainingRunner] Entropy reset triggered at episode {Episode}", ep);
                                     stats.EntropyResetCount++;
@@ -651,17 +651,23 @@ public static class TrainingRunner
         if (strategy.Equals("PPO", StringComparison.OrdinalIgnoreCase))
         {
             // Calculate expected updates for LR scheduling
-            var stepsPerRollout = 4096; // Increased rollout horizon
+            var stepsPerRollout = 2048; // Reduced from 4096 for fresher samples
             var expectedRollouts = budget.Episodes * budget.MaxSteps / stepsPerRollout;
+            
+            // Debug mode uses ~16x smaller model for fast hyperparameter tuning
+            var debugMode = config.GetValue("Training:DebugMode", false);
 
-            AnsiConsole.MarkupLine($"[bold cyan]Using PPO Strategy (rollout=4096, batch=256, LR schedule over {expectedRollouts} updates)[/]");
+            var modeLabel = debugMode ? "[yellow]DEBUG MODE (small model)[/]" : "[green]FULL MODE (large model)[/]";
+            AnsiConsole.MarkupLine($"[bold cyan]Using PPO Strategy[/] | {modeLabel} | rollout=2048, batch=256, LR schedule over {expectedRollouts} updates");
+            
             return new PpoAgent(
                 batchSize: 256, // Increased for RTX 3090
-                rolloutHorizon: 4096, // Increased from 2048
+                rolloutHorizon: 2048, // Reduced from 4096 for fresher samples
                 gamma: 0.99f,
                 learningRate: 3e-4f,
                 useCuda: budget.Hardware.GpuAvailable,
-                newsFeatureSize: newsFeatureSize
+                newsFeatureSize: newsFeatureSize,
+                debugMode: debugMode
             );
         }
 

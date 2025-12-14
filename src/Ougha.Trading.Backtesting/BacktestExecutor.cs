@@ -229,9 +229,7 @@ public class BacktestExecutor : IOrderExecutor
             : position.OpenPrice - closePrice;
 
         if (!_symbolInfo.TryGetValue(symbol, out var info))
-        {
-            info = new SymbolInfo(symbol, 0.00001, 100000, 1, 0.00001, "USD", "USD", 5);
-        }
+            throw new InvalidOperationException($"SymbolInfo not found for {symbol}. Ensure MT5 is connected and symbol info is loaded.");
 
         var profit = (priceDiff / info.Point) * info.TickValue * position.Volume;
 
@@ -303,8 +301,9 @@ public class BacktestExecutor : IOrderExecutor
             if (slHit)
             {
                 var holdingTicks = _currentTickIndex - _positionOpenTicks.GetValueOrDefault(currentSymbol);
+                var slDistance = Math.Abs(position.OpenPrice - position.InitialStopLoss);
                 ClosePositionAtPrice(currentSymbol, position, position.StopLoss, currentCandle.Time, ExitReason.StopLoss);
-                _pendingCloses.Add(new PendingCloseInfo(currentSymbol, 0, holdingTicks, ExitReason.StopLoss));
+                _pendingCloses.Add(new PendingCloseInfo(currentSymbol, 0, holdingTicks, position.Volume, slDistance, ExitReason.StopLoss));
                 _positionOpenTicks.Remove(currentSymbol);
                 return;
             }
@@ -320,9 +319,10 @@ public class BacktestExecutor : IOrderExecutor
             if (tpHit)
             {
                  var holdingTicks = _currentTickIndex - _positionOpenTicks.GetValueOrDefault(currentSymbol);
+                 var slDistance = Math.Abs(position.OpenPrice - position.InitialStopLoss);
                  ClosePositionAtPrice(currentSymbol, position, position.TakeProfit, currentCandle.Time, ExitReason.TakeProfit);
                  
-                 _pendingCloses.Add(new PendingCloseInfo(currentSymbol, 0, holdingTicks, ExitReason.TakeProfit));
+                 _pendingCloses.Add(new PendingCloseInfo(currentSymbol, 0, holdingTicks, position.Volume, slDistance, ExitReason.TakeProfit));
                  _positionOpenTicks.Remove(currentSymbol);
             }
         }
@@ -335,9 +335,7 @@ public class BacktestExecutor : IOrderExecutor
             : position.OpenPrice - exitPrice;
 
         if (!_symbolInfo.TryGetValue(symbol, out var info))
-        {
-            info = new SymbolInfo(symbol, 0.00001, 100000, 1, 0.00001, "USD", "USD", 5);
-        }
+            throw new InvalidOperationException($"SymbolInfo not found for {symbol}. Ensure MT5 is connected and symbol info is loaded.");
 
         var profit = (priceDiff / info.Point) * info.TickValue * position.Volume;
 
@@ -507,9 +505,19 @@ public class BacktestExecutor : IOrderExecutor
     
     private double CalculateSpread(string symbol)
     {
+        // Try to get real spread from candle data (if available from tick data)
+        var candle = GetLastKnownCandle(symbol);
+        if (candle != null && candle.Spread > 0)
+            return candle.Spread;  // Use real spread from S1 materialized view
+        
+        // Fallback to point-based estimate (10 points) - only if SymbolInfo available
         if (_symbolInfo.TryGetValue(symbol, out var info))
              return info.Point * 10;
-        return 0.0001;
+        
+        // STRICT VALIDATION: No fallbacks - fail fast if no data
+        throw new ArgumentException(
+            $"Cannot calculate spread for {symbol}. " +
+            $"No candle spread data and no SymbolInfo available.");
     }
 
     public double GetBid(string symbol) 

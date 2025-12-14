@@ -25,8 +25,11 @@ public class QuestDbDataLoader
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync();
 
+        // Only S1 has spread column - other timeframes use 0 default
+        var spreadColumn = table == "s1" ? "COALESCE(spread, 0) as Spread" : "0 as Spread";
+        
         var sql = $@"
-            SELECT timestamp as Time, open, high, low, close, volume
+            SELECT timestamp as Time, open, high, low, close, volume, {spreadColumn}
             FROM {table}
             WHERE symbol = @symbol and timestamp Between @start and @end";
 
@@ -55,8 +58,11 @@ public class QuestDbDataLoader
         // Build IN clause with quoted symbols (QuestDB doesn't support ANY)
         var symbolsIn = string.Join(", ", symbolList.Select(s => $"'{s}'"));
         
+        // Only S1 has spread column - other timeframes use 0 default
+        var spreadColumn = table == "s1" ? "COALESCE(spread, 0) as Spread" : "0 as Spread";
+        
         var sql = $@"
-            SELECT symbol as Symbol, timestamp as Time, open as Open, high as High, low as Low, close as Close, volume as Volume
+            SELECT symbol as Symbol, timestamp as Time, open as Open, high as High, low as Low, close as Close, volume as Volume, {spreadColumn}
             FROM {table}
             WHERE symbol IN ({symbolsIn}) 
               AND timestamp BETWEEN @start AND @end
@@ -69,12 +75,12 @@ public class QuestDbDataLoader
         foreach (var s in symbolList)
             result[s] = new List<Candle>();
 
-        var rows = await conn.QueryAsync<(string Symbol, DateTime Time, double Open, double High, double Low, double Close, double Volume)>(
+        var rows = await conn.QueryAsync<(string Symbol, DateTime Time, double Open, double High, double Low, double Close, double Volume, double Spread)>(
             sql, new { start = startParam, end = endParam });
 
         foreach (var row in rows)
         {
-            result[row.Symbol].Add(new Candle(row.Time, row.Open, row.High, row.Low, row.Close, (long)row.Volume));
+            result[row.Symbol].Add(new Candle(row.Time, row.Open, row.High, row.Low, row.Close, (long)row.Volume, row.Spread));
         }
 
         return result;
@@ -178,8 +184,11 @@ public class QuestDbDataLoader
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync();
 
+        // Only S1 has spread column - other timeframes use 0 default
+        var spreadColumn = table == "s1" ? "COALESCE(spread, 0) as Spread" : "0 as Spread";
+        
         var sql = $@"
-            SELECT timestamp as Time, open, high, low, close, volume
+            SELECT timestamp as Time, open, high, low, close, volume, {spreadColumn}
             FROM {table}
             WHERE symbol = @symbol
               AND timestamp < @before
@@ -204,8 +213,11 @@ public class QuestDbDataLoader
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync();
 
+        // Only S1 has spread column - other timeframes use 0 default
+        var spreadColumn = table == "s1" ? "COALESCE(spread, 0) as Spread" : "0 as Spread";
+        
         var sql = $@"
-            SELECT timestamp as Time, open, high, low, close, volume
+            SELECT timestamp as Time, open, high, low, close, volume, {spreadColumn}
             FROM {table}
             WHERE symbol = @symbol
               AND timestamp >= @start

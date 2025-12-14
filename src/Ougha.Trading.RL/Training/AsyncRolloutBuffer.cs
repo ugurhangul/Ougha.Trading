@@ -239,7 +239,13 @@ public class AsyncRolloutBuffer(int capacity, int maxPendingRollouts = 4)
         lock (_bufferLock)
         {
             _activeBuffer.Clear();
+            // Reset episode tracking for clean start
+            _currentEpisodeId = 0;
+            _sequenceCounter = 0;
         }
+        
+        // Reset dropped rollouts counter
+        DroppedRolloutsCount = 0;
         
         // Drain any pending rollouts
         while (_readyRollouts.Reader.TryRead(out _)) { }

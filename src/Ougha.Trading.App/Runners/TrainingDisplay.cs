@@ -177,6 +177,7 @@ public static class TrainingDisplay
         var holdPct = (double)stats.ActionCounts.GetValueOrDefault(0, 0) / totalActions * 100;
         var buyPct = (double)stats.ActionCounts.GetValueOrDefault(1, 0) / totalActions * 100;
         var sellPct = (double)stats.ActionCounts.GetValueOrDefault(2, 0) / totalActions * 100;
+        var closePct = (double)stats.ActionCounts.GetValueOrDefault(3, 0) / totalActions * 100;
 
         var holdStyle = holdPct > 90 ? "red" : holdPct > 70 ? "yellow" : "green";
         var wrStyle = stats.WinRate > 50 ? "green" : stats.WinRate > 40 ? "yellow" : "red";
@@ -196,7 +197,7 @@ public static class TrainingDisplay
         table.AddColumn(new TableColumn("L").Width(8));
         table.AddColumn(new TableColumn("V").Width(14).NoWrap());
 
-        table.AddRow("[dim]Actions:[/]", $"[{holdStyle}]H{holdPct,2:F0}[/] [cyan]B{buyPct,2:F0}[/] [magenta]S{sellPct,2:F0}[/]");
+        table.AddRow("[dim]Actions:[/]", $"[{holdStyle}]H{holdPct,2:F0}[/][cyan]B{buyPct,2:F0}[/][magenta]S{sellPct,2:F0}[/][yellow]C{closePct,2:F0}[/]");
         table.AddRow("[dim]Trades:[/]", $"[dim]{stats.TradesOpened,6:N0}/{stats.TradesClosed,-6:N0}[/]");
         table.AddRow("[dim]WinRate:[/]", $"[{wrStyle}]{stats.WinRate,6:F1}% {stats.Wins,4}W/{stats.Losses}L[/]");
         table.AddRow("[dim]PF:[/]", $"[{pfStyle}]{stats.ProfitFactor,12:F2}[/]");

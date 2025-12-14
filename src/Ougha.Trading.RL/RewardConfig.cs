@@ -49,12 +49,12 @@ public class RewardConfig
     /// <summary>
     /// Scale for unrealized PnL shaping. Provides dense signal during trades.
     /// </summary>
-    public float UnrealizedPnlScale { get; set; } = 10f;  // Normalized from 50
+    public float UnrealizedPnlScale { get; set; } = 2f;  // Reduced from 10 to prevent reward hacking
     
     /// <summary>
     /// Scale for PnL delta (improvement since last step). Encourages progress.
     /// </summary>
-    public float PnlDeltaScale { get; set; } = 5f;  // Normalized from 20
+    public float PnlDeltaScale { get; set; } = 0f;  // Disabled - tick-by-tick PnL changes are noise
     
     /// <summary>
     /// Penalty for drawdown from peak unrealized PnL.
@@ -77,7 +77,7 @@ public class RewardConfig
     /// <summary>
     /// Per-tick bonus for holding a profitable position. Encourages exploring longer holds.
     /// </summary>
-    public float HoldingBonus { get; set; } = 0.01f;  // Increased 5x - stronger incentive for holding profitable positions
+    public float HoldingBonus { get; set; } = 0.01f;  // Increased from 0.003 - reward staying in winning trades
     
     /// <summary>
     /// Minimum ticks threshold for early close penalty (soft guidance, not enforcement).
@@ -115,19 +115,19 @@ public class RewardConfig
     
     /// <summary>
     /// Penalty when agent is flat but market moved significantly.
-    /// Reduced to avoid over-penalizing valid wait-for-confirmation strategies.
+    /// Increased to penalize sitting out and encourage trading.
     /// </summary>
-    public float MissedOpportunityPenalty { get; set; } = 0.15f;  // Reduced from 0.3 to avoid overtrading
+    public float MissedOpportunityPenalty { get; set; } = 0.30f;  // Increased from 0.15 - punish missing moves
     
     /// <summary>
     /// ATR multiplier threshold: price move > this * ATR = missed opportunity.
     /// </summary>
-    public float OpportunityThresholdAtr { get; set; } = 1.0f;  // Increased from 0.5 - only penalize significant moves
+    public float OpportunityThresholdAtr { get; set; } = 0.5f;  // Lowered from 1.0 - trigger on smaller moves
     
     /// <summary>
     /// Legacy flat penalty (used when UseOpportunityCostModel is false).
     /// </summary>
-    public float FlatPenalty { get; set; } = 0.002f;
+    public float FlatPenalty { get; set; } = 0.01f;  // Increased from 0.002 - stronger penalty for inaction
 
     // ========================
     // DIRECTION QUALITY
@@ -202,7 +202,7 @@ public class RewardConfig
     /// Threshold before MDD penalty kicks in (percentage).
     /// Increased for day trading where 5% drawdowns are normal.
     /// </summary>
-    public float MddThreshold { get; set; } = 10f;  // Increased from 5 for day trading tolerance
+    public float MddThreshold { get; set; } = 5f;  // Tightened from 10% for stricter risk management
     
     /// <summary>
     /// Scale multiplier for MDD penalty.

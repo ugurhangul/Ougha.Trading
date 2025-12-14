@@ -185,6 +185,7 @@ public class ActionLogger : IDisposable
         0 => "HOLD",
         1 => "BUY",
         2 => "SELL",
+        3 => "CLOSE",
         _ => $"ACT_{action}"
     };
 
@@ -382,13 +383,15 @@ public class ActionAnalysisStats
                 {
                     ["HOLD"] = TotalActions > 0 ? (double)ActionCounts[0] / TotalActions * 100 : 0,
                     ["BUY"] = TotalActions > 0 ? (double)ActionCounts[1] / TotalActions * 100 : 0,
-                    ["SELL"] = TotalActions > 0 ? (double)ActionCounts[2] / TotalActions * 100 : 0
+                    ["SELL"] = TotalActions > 0 ? (double)ActionCounts[2] / TotalActions * 100 : 0,
+                    ["CLOSE"] = TotalActions > 0 ? (double)ActionCounts[3] / TotalActions * 100 : 0
                 },
                 AverageRewardByAction = new Dictionary<string, double>
                 {
                     ["HOLD"] = RewardCountByAction[0] > 0 ? RewardByAction[0] / RewardCountByAction[0] : 0,
                     ["BUY"] = RewardCountByAction[1] > 0 ? RewardByAction[1] / RewardCountByAction[1] : 0,
-                    ["SELL"] = RewardCountByAction[2] > 0 ? RewardByAction[2] / RewardCountByAction[2] : 0
+                    ["SELL"] = RewardCountByAction[2] > 0 ? RewardByAction[2] / RewardCountByAction[2] : 0,
+                    ["CLOSE"] = RewardCountByAction[3] > 0 ? RewardByAction[3] / RewardCountByAction[3] : 0
                 },
                 MaxConsecutiveHolds = MaxConsecutiveHolds,
                 HoldAfterProfit = HoldAfterProfit,

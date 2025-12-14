@@ -51,6 +51,11 @@ public class PortfolioTradingEnvironment
     private double _initialBalance;
     private bool _isDone;
     private int _lastM1Minute = -1;
+    
+    // Daily loss limit tracking
+    private double _dailyStartEquity;
+    private DateTime _lastDailyReset = DateTime.MinValue;
+    private const double DAILY_LOSS_LIMIT = 0.03;  // 3% max daily loss
 
     public int StateSize => _stateBuilder.GetStateSize(_config.Symbols.Length);
     
@@ -244,6 +249,7 @@ public class PortfolioTradingEnvironment
                 var symbolInfo = _executor.GetSymbolInfo(closeInfo.Symbol);
 
                 var closeReward = _rewardCalculator.Calculate(
+                    symbol: closeInfo.Symbol,  // CRITICAL: per-symbol state tracking
                     tradeClosed: true,
                     tradeProfit: closeInfo.Profit,
                     holdingTicks: closeInfo.HoldingTicks,
@@ -253,7 +259,9 @@ public class PortfolioTradingEnvironment
                     initialBalance: _initialBalance,
                     maxDrawdownPct: maxDrawdownPct,
                     symbolAtr: symbolAtr,
-                    symbolInfo: symbolInfo);
+                    slDistance: closeInfo.SlDistance,
+                    symbolInfo: symbolInfo,
+                    volume: closeInfo.Volume);
 
                 _reusableRewards[symbolIndex] += closeReward;
                 _positionOpenTicks[closeInfo.Symbol] = 0;
@@ -303,13 +311,14 @@ public class PortfolioTradingEnvironment
             if (pos == null) continue;
             
             // Calculate ATR-based hard stop threshold
-            // Volatile symbols (BTC) get more room, stable symbols keep tighter stops
+            // Reduced from 3x to 2x ATR for tighter risk control in day trading
             var symbolAtr = CalculateAtr(symbol);
             var currentBid = _executor.GetBid(symbol);
             var atrPct = symbolAtr > 0 && currentBid > 0 
-                ? (symbolAtr / currentBid) * 100 * 3  // 3x ATR
+                ? (symbolAtr / currentBid) * 100 * 2  // 2x ATR (was 3x)
                 : 2.0;  // Fallback to 2%
-            var hardSlThreshold = -Math.Max(atrPct, 2.0);  // At least -2%, up to ~-6% for volatile symbols
+            var hardSlThreshold = -Math.Max(atrPct, 2.0);  // At least -2%, capped at -3% for day trading
+            hardSlThreshold = Math.Max(hardSlThreshold, -3.0);  // Cap at 3% max loss per trade
             
             if (pos.UnrealizedPnlPercent < hardSlThreshold)
             {
@@ -318,6 +327,32 @@ public class PortfolioTradingEnvironment
                 _peakUnrealizedPnls[symbol] = 0;
                 Log.Debug("[HardSL] Force closed {Symbol} at {Loss:F2}% loss (threshold: {Threshold:F2}%)", 
                     symbol, pos.UnrealizedPnlPercent, hardSlThreshold);
+            }
+        }
+
+        // Daily loss limit enforcement
+        // Reset daily tracking at the start of each new trading day
+        if (currentTime.Date != _lastDailyReset.Date)
+        {
+            _lastDailyReset = currentTime.Date;
+            _dailyStartEquity = currentEquity;
+        }
+        
+        // If daily loss exceeds limit, close all positions and stop opening new ones
+        var dailyLoss = (_dailyStartEquity - currentEquity) / _dailyStartEquity;
+        if (dailyLoss >= DAILY_LOSS_LIMIT)
+        {
+            foreach (var symbol in _config.Symbols)
+            {
+                var pos = _executor.GetPosition(symbol);
+                if (pos != null)
+                {
+                    await _executor.ClosePositionAsync(symbol);
+                    _positionOpenTicks[symbol] = 0;
+                    _peakUnrealizedPnls[symbol] = 0;
+                    Log.Debug("[DailyLimit] Force closed {Symbol} - daily loss limit {Loss:F2}% hit", 
+                        symbol, dailyLoss * 100);
+                }
             }
         }
 
@@ -422,7 +457,7 @@ public class PortfolioTradingEnvironment
                     atr = candle.Close * 0.001;
 
                 var symInfo = _executor.GetSymbolInfo(symbol)
-                    ?? new SymbolInfo(symbol, 0.00001, 100000, 1, 0.00001, "USD", "USD", 5);
+                    ?? throw new InvalidOperationException($"SymbolInfo not found for {symbol}. Ensure MT5 is connected and symbol info is loaded.");
 
                 var (tpMult, slMult) = _lastTpSlMultipliers.GetValueOrDefault(symbol, (0.5f, 0.5f));
 
@@ -431,26 +466,61 @@ public class PortfolioTradingEnvironment
 
                 var slDistance = atr * slAtrMult;
                 var tpDistance = atr * tpAtrMult;
-
+                
+                // Universal minimum SL: 0.1% of price (fully dynamic, no if/else)
+                // EURUSD (1.08): 0.1% = ~10 pips | BTCUSD (100k): $100 | XAUUSD (2600): $2.60
                 var bid = _executor.GetBid(symbol);
                 var ask = _executor.GetAsk(symbol);
+                var minSlDistance = bid * 0.001;  // 0.1% of price
+                
+                if (slDistance < minSlDistance)
+                {
+                    var ratio = slDistance > 0 ? tpDistance / slDistance : 2.0;
+                    slDistance = minSlDistance;
+                    tpDistance = slDistance * ratio;
+                }
+                
+                // Add realistic slippage modeling - assume 0.5x spread slippage on entry
+                var spread = ask - bid;
+                var slippage = spread * 0.5;
+                var effectiveBid = bid - slippage;  // Worse fill for buys
+                var effectiveAsk = ask + slippage;  // Worse fill for sells
 
                 var sl = entryType.Value == TradeType.Buy
-                    ? bid - slDistance
-                    : ask + slDistance;
+                    ? effectiveBid - slDistance
+                    : effectiveAsk + slDistance;
 
                 var tp = entryType.Value == TradeType.Buy
-                    ? bid + tpDistance
-                    : ask - tpDistance;
+                    ? effectiveBid + tpDistance
+                    : effectiveAsk - tpDistance;
 
-                var riskAmount = _executor.GetEquity() * 0.01;
+                var riskAmount = _executor.GetEquity() * 0.003;  // 0.3% risk per trade (was 1%)
                 var slPoints = slDistance / symInfo.Point;
                 var tickValue = symInfo.TickValue;
-                var volume = tickValue > 0 && slPoints > 0
+                
+                // STRICT VALIDATION: No fallbacks - fail fast if data is bad
+                if (tickValue <= 0)
+                {
+                    throw new ArgumentException(
+                        $"Invalid TickValue ({tickValue}) for symbol {symbol}. " +
+                        $"Ensure MT5 is connected and SymbolInfo is properly loaded.");
+                }
+                
+                var volume = slPoints > 0
                     ? riskAmount / (tickValue * slPoints)
                     : 0.01;
-                volume = Math.Max(0.01, Math.Min(volume, 100.0));
+                    
+                // CRITICAL FIX: Cap volume at 0.1 lots for training stability
+                // Higher volume causes reward scale to vary wildly as equity grows
+                volume = Math.Max(0.01, Math.Min(volume, 0.1));
                 volume = Math.Round(volume, 2);
+                
+                // Debug log if volume seems unusual
+                if (volume >= 0.5)
+                {
+                    Log.Debug("[VolumeCalc] {Symbol}: risk={RiskAmt:F2}, slPts={SlPts:F1}, tickVal={TickVal:F4}, vol={Vol:F2}",
+                        symbol, riskAmount, slPoints, tickValue, volume);
+                }
 
                 var result = await _executor.ExecuteAsync(symbol, entryType.Value, volume,
                     sl, tp, "RL Portfolio Agent", RiskLevel.Moderate);
@@ -488,6 +558,7 @@ public class PortfolioTradingEnvironment
         var priceChange = lastCandle != null ? currentPrice - lastCandle.Close : 0;
 
         var reward = _rewardCalculator.Calculate(
+            symbol: symbol,  // CRITICAL: per-symbol state tracking
             tradeClosed, tradeProfit, holdingTicks,
             pos != null, unrealized, _peakUnrealizedPnls.GetValueOrDefault(symbol),
             _initialBalance, maxDrawdownPct,
@@ -679,6 +750,10 @@ public class PortfolioTradingEnvironment
         _initialBalance = _executor.GetBalance();
         _peakEquity = _initialBalance;
         _lastM1Minute = -1;
+        
+        // Reset daily loss tracking
+        _dailyStartEquity = _initialBalance;
+        _lastDailyReset = DateTime.MinValue;
 
         foreach (var symbol in _config.Symbols)
         {

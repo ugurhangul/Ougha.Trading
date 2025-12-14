@@ -34,8 +34,8 @@ public class PpoAgent : IAgent
     private int _totalUpdates;
     private readonly int _expectedTotalUpdates;
     
-    // KL divergence early stopping threshold
-    private const float KL_TARGET = 0.015f;
+    // KL divergence early stopping threshold - relaxed from 0.015 to allow more learning
+    private const float KL_TARGET = 0.02f;
     
     // Training metrics for diagnostics
     private float _lastValueLoss;
@@ -60,7 +60,8 @@ public class PpoAgent : IAgent
         float clipEpsilon = 0.2f,
         float learningRate = 1e-3f,
         bool useCuda = false,
-        int newsFeatureSize = 17)
+        int newsFeatureSize = 17,
+        bool debugMode = false)
     {
         _batchSize = batchSize;
         _gamma = gamma;
@@ -68,9 +69,9 @@ public class PpoAgent : IAgent
         _clipEpsilon = clipEpsilon;
         _valueCoef = 0.5f;
         _tpSlCoef = 0.1f;  // TP/SL loss weight
-        _entropyCoef = 0.10f;  // Higher initial for trading (more exploration needed)
-        _minEntropyCoef = 0.08f;  // Higher floor to prevent policy collapse to HOLD
-        _updateEpochs = 4;  // Reduced from 8 to prevent overfitting on trading data
+        _entropyCoef = 0.30f;  // Much higher initial to break HOLD dominance
+        _minEntropyCoef = 0.20f;  // Higher floor - policy entropy was collapsing to 0.05-0.15
+        _updateEpochs = 6;  // Increased from 4 for better sample utilization
         
         // LR Scheduling - linear decay over expected training
         _initialLr = learningRate;
@@ -79,12 +80,14 @@ public class PpoAgent : IAgent
 
         var cudaAvailable = cuda.is_available();
         _device = useCuda && cudaAvailable ? CUDA : CPU;
-        Console.WriteLine($"[PpoAgent] Device: {(useCuda && cudaAvailable ? "CUDA" : "CPU")} (useCuda={useCuda}, cudaAvailable={cudaAvailable})");
         
-        _model = new ActorCriticModel("ppo_net_train");
+        var modeStr = debugMode ? "DEBUG (small model ~600K params)" : "FULL (large model ~10M params)";
+        Console.WriteLine($"[PpoAgent] Device: {(useCuda && cudaAvailable ? "CUDA" : "CPU")} | Mode: {modeStr}");
+        
+        _model = new ActorCriticModel("ppo_net_train", debugMode: debugMode);
         _model.to(_device);
         
-        _inferenceNet = new ActorCriticModel("ppo_net_infer");
+        _inferenceNet = new ActorCriticModel("ppo_net_infer", debugMode: debugMode);
         _inferenceNet.to(_device);
         SyncInferenceNetwork();
         
@@ -348,8 +351,6 @@ public class PpoAgent : IAgent
                     {
                         using (NewDisposeScope())
                         {
-                            var seqLen = sequence.Length;
-                            
                             // Prepare tensors for all timesteps
                             var actions = tensor(sequence.Actions, dtype: ScalarType.Int64, device: _device);
                             var oldLogProbs = tensor(sequence.LogProbs, dtype: ScalarType.Float32, device: _device);
@@ -362,41 +363,15 @@ public class PpoAgent : IAgent
                             // Normalize advantages for this sequence
                             var normalizedAdvs = (advantagesArr - advantagesArr.mean()) / (advantagesArr.std() + 1e-8f);
                             
-                            // Process sequence with LSTM state propagation
-                            // This mirrors inference behavior where LSTM accumulates state
-                            var allLogits = new List<Tensor>();
-                            var allValues = new List<Tensor>();
-                            var allTpSl = new List<Tensor>();
-                            Tensor? lstmH = null, lstmC = null;
+                            // OPTIMIZED: Process entire sequence in ONE forward pass
+                            // Uses ForwardSequenceBatch which processes [SeqLen, ...] tensors natively
+                            var stateTensors = PrepareInputTensors(sequence.States);
                             
-                            for (var t = 0; t < seqLen; t++)
-                            {
-                                var stateTensors = PrepareInputTensors([sequence.States[t]]);
-                                
-                                var (logits, values, tpSlPred, h_n, c_n) = _model.ForwardWithState(
-                                    stateTensors, lstmH, lstmC);
-                                
-                                allLogits.Add(logits);
-                                allValues.Add(values);
-                                allTpSl.Add(tpSlPred);
-                                
-                                // Propagate hidden state to next timestep (detached to prevent backprop through time explosion)
-                                lstmH = h_n.detach();
-                                lstmC = c_n.detach();
-                                
-                                foreach (var st in stateTensors) st.Dispose();
-                            }
+                            var (logitsTensor, valuesTensor, tpSlTensor) = _model.ForwardSequenceBatch(
+                                stateTensors[0], stateTensors[1], stateTensors[2]);
                             
-                            // Stack outputs from all timesteps
-                            var logitsTensor = cat(allLogits.ToArray(), dim: 0);
-                            var valuesTensor = cat(allValues.ToArray(), dim: 0);
-                            var tpSlTensor = cat(allTpSl.ToArray(), dim: 0);
-                            
-                            // Clean up intermediate tensors
-                            foreach (var t in allLogits) t.Dispose();
-                            foreach (var t in allValues) t.Dispose();
-                            foreach (var t in allTpSl) t.Dispose();
-                            lstmH?.Dispose(); lstmC?.Dispose();
+                            // Clean up input tensors
+                            foreach (var st in stateTensors) st.Dispose();
                             
                             var probs = nn.functional.softmax(logitsTensor, dim: 1);
                             var dist = distributions.Categorical(probs);
@@ -650,7 +625,7 @@ public class PpoAgent : IAgent
     public void DecayEpsilon()
     {
         if (!(_entropyCoef > _minEntropyCoef)) return;
-        _entropyCoef *= 0.9995f;  // Slower decay for better exploration
+        _entropyCoef *= 0.99995f;  // Much slower decay - was decaying too fast
         _entropyCoef = Math.Max(_entropyCoef, _minEntropyCoef);
     }
     
@@ -659,7 +634,7 @@ public class PpoAgent : IAgent
     /// </summary>
     public void ResetEntropy(float? newValue = null)
     {
-        _entropyCoef = newValue ?? 0.15f;  // Reset to high value
+        _entropyCoef = newValue ?? 0.30f;  // Reset to high value to break HOLD dominance
         // Note: Console output removed - it corrupts the Spectre.Console Live display
     }
     
@@ -670,7 +645,7 @@ public class PpoAgent : IAgent
     /// <param name="actionCounts">Array of action counts [Hold, Buy, Sell, Close] (4 actions)</param>
     /// <param name="skewThreshold">Max allowed percentage for any single action (0.0-1.0)</param>
     /// <returns>True if entropy was reset</returns>
-    public bool CheckAndResetEntropy(int[] actionCounts, float skewThreshold = 0.55f)  // Reduced from 0.70 for earlier intervention
+    public bool CheckAndResetEntropy(int[] actionCounts, float skewThreshold = 0.45f)  // Aggressive - intervene when any action > 45%
     {
         if (actionCounts == null || actionCounts.Length == 0) return false;
         
@@ -698,9 +673,9 @@ public class PpoAgent : IAgent
         
         if (needsReset)
         {
-            // Reset entropy but not too high to avoid instability
-            var newEntropy = Math.Max(_entropyCoef * 2f, 0.08f);
-            newEntropy = Math.Min(newEntropy, 0.15f);
+            // Reset entropy aggressively to break HOLD dominance
+            var newEntropy = Math.Max(_entropyCoef * 2f, 0.20f);
+            newEntropy = Math.Min(newEntropy, 0.30f);
             ResetEntropy(newEntropy);
             return true;
         }
