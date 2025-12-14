@@ -271,6 +271,10 @@ public static class TrainingRunner
                                 envTimer.Stop();
                                 stats.EnvStepTimeMs = envTimer.Elapsed.TotalMilliseconds;
                                 
+                                // Update entropy stats BEFORE logging so logged values are current
+                                stats.EntropyCoefficient = GetEntropyCoefficient(agent);
+                                stats.PolicyEntropy = GetPolicyEntropy(agent);
+                                
                                 // Log actions for analysis (every 10 steps to reduce overhead)
                                 if (step % 10 == 0 && actionLoggingEnabled)
                                 {

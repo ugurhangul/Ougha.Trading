@@ -402,7 +402,7 @@ public class PortfolioTradingEnvironment
         // This teaches the agent that CLOSE is only valid when holding
         if (isCloseAction && !hasPosition)
         {
-            return (-0.001f, false);  // Small penalty for wasted action
+            return (-0.1f, false);  // Strong penalty for invalid action
         }
 
         var lastAction = _lastExecutedAction.GetValueOrDefault(symbol, -1);
