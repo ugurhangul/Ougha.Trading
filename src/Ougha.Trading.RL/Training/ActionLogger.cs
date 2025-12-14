@@ -77,7 +77,8 @@ public class ActionLogger : IDisposable
         bool[] hasPositions,
         float[] unrealizedPnls,
         double[] prices,
-        float entropy,
+        float entropyCoefficient,
+        float policyEntropy = 0f,
         float[]? actionProbabilities = null)
     {
         if (!_enabled) return;
@@ -96,7 +97,8 @@ public class ActionLogger : IDisposable
                 HasPosition = hasPositions[i],
                 UnrealizedPnl = unrealizedPnls[i],
                 CurrentPrice = prices[i],
-                Entropy = entropy,
+                EntropyCoefficient = entropyCoefficient,
+                PolicyEntropy = policyEntropy,
                 ActionProbabilities = actionProbabilities
             };
             
@@ -220,7 +222,21 @@ public class ActionLogEntry
     public double CurrentPrice { get; init; }
     
     // Agent state
-    public float Entropy { get; init; }
+    /// <summary>
+    /// Entropy coefficient (hyperparameter that weights entropy in PPO loss).
+    /// </summary>
+    public float EntropyCoefficient { get; init; }
+    
+    /// <summary>
+    /// Actual policy entropy from action distribution (max ~1.39 for 4 actions).
+    /// </summary>
+    public float PolicyEntropy { get; init; }
+    
+    /// <summary>
+    /// Backwards compatible alias for EntropyCoefficient.
+    /// </summary>
+    public float Entropy => EntropyCoefficient;
+    
     public float[]? ActionProbabilities { get; init; }
     
     // Trade close details (if applicable)

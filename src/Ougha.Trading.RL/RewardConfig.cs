@@ -29,9 +29,9 @@ public class RewardConfig
     public float RealizedProfitScale { get; set; } = 10f;  // Normalized from 50
     
     /// <summary>
-    /// Bonus for winning trades (profit > 0). Reduced to not dominate actual profit signal.
+    /// Bonus for winning trades (profit > 0). Increased to provide stronger positive signal.
     /// </summary>
-    public float WinBonus { get; set; } = 1.0f;  // Reduced from 3 to not dominate profit signal
+    public float WinBonus { get; set; } = 2.0f;  // Increased from 1.0 - stronger positive signal
     
     /// <summary>
     /// Penalty for losing trades. Symmetric with WinBonus for balanced risk.
@@ -77,7 +77,7 @@ public class RewardConfig
     /// <summary>
     /// Per-tick bonus for holding a profitable position. Encourages exploring longer holds.
     /// </summary>
-    public float HoldingBonus { get; set; } = 0.01f;  // Increased from 0.003 - reward staying in winning trades
+    public float HoldingBonus { get; set; } = 0.02f;  // Increased from 0.01 - more reward for staying in winners
     
     /// <summary>
     /// Minimum ticks threshold for early close penalty (soft guidance, not enforcement).
@@ -115,9 +115,9 @@ public class RewardConfig
     
     /// <summary>
     /// Penalty when agent is flat but market moved significantly.
-    /// Increased to penalize sitting out and encourage trading.
+    /// Reduced to prevent overwhelming negative reward bias.
     /// </summary>
-    public float MissedOpportunityPenalty { get; set; } = 0.30f;  // Increased from 0.15 - punish missing moves
+    public float MissedOpportunityPenalty { get; set; } = 0.05f;  // Reduced from 0.30 - was too harsh
     
     /// <summary>
     /// ATR multiplier threshold: price move > this * ATR = missed opportunity.
@@ -127,7 +127,7 @@ public class RewardConfig
     /// <summary>
     /// Legacy flat penalty (used when UseOpportunityCostModel is false).
     /// </summary>
-    public float FlatPenalty { get; set; } = 0.01f;  // Increased from 0.002 - stronger penalty for inaction
+    public float FlatPenalty { get; set; } = 0.001f;  // Reduced from 0.01 - less harsh
 
     // ========================
     // DIRECTION QUALITY

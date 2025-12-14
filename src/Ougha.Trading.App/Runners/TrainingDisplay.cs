@@ -101,9 +101,17 @@ public static class TrainingDisplay
         table.AddRow("[dim]Action:[/]", $"[yellow]{Markup.Escape(safeAction)}[/]");
         table.AddRow("[dim]Pos:[/]", $"[blue]{stats.Positions,6}[/]");
         
-        var expLabel = stats.IsPpoAgent ? "Entropy:" : "Epsilon:";
-        var expValue = stats.IsPpoAgent ? stats.Entropy : stats.Epsilon;
-        table.AddRow($"[dim]{expLabel}[/]", $"[magenta]{expValue,12:F4}[/]");
+        if (stats.IsPpoAgent)
+        {
+            // Show both entropy coefficient and actual policy entropy
+            table.AddRow("[dim]EntCoef:[/]", $"[magenta]{stats.EntropyCoefficient,12:F4}[/]");
+            table.AddRow("[dim]PolEnt:[/]", $"[cyan]{stats.PolicyEntropy,12:F4}[/]");  // Max ~1.39 for 4 actions
+        }
+        else
+        {
+            table.AddRow("[dim]Epsilon:[/]", $"[magenta]{stats.Epsilon,12:F4}[/]");
+            table.AddRow("", "");  // Empty row for alignment
+        }
         table.AddRow("[dim]Equity:[/]", $"[{pnlStyle}]${stats.Equity,12:N2}[/]");
         
         return new Panel(table)

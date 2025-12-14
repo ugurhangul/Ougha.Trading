@@ -40,6 +40,7 @@ public class PpoAgent : IAgent
     // Training metrics for diagnostics
     private float _lastValueLoss;
     private float _lastKlDivergence;
+    private float _lastPolicyEntropy;  // Actual policy entropy from distribution (not the coefficient)
 
     private const int MAX_INFERENCE_BATCH = 64;
     private const int WINDOW_SIZE = 20;
@@ -69,8 +70,8 @@ public class PpoAgent : IAgent
         _clipEpsilon = clipEpsilon;
         _valueCoef = 0.5f;
         _tpSlCoef = 0.1f;  // TP/SL loss weight
-        _entropyCoef = 0.30f;  // Much higher initial to break HOLD dominance
-        _minEntropyCoef = 0.20f;  // Higher floor - policy entropy was collapsing to 0.05-0.15
+        _entropyCoef = 0.60f;  // High initial for exploration (raised from 0.30)
+        _minEntropyCoef = 0.50f;  // Higher floor (raised from 0.20) - prevents policy collapse
         _updateEpochs = 6;  // Increased from 4 for better sample utilization
         
         // LR Scheduling - linear decay over expected training
@@ -159,6 +160,9 @@ public class PpoAgent : IAgent
 
             // Use logits-based Categorical (more numerically stable than probs-based)
             var dist = distributions.Categorical(logits: clampedLogits);
+            
+            // Track actual policy entropy (not the coefficient)
+            _lastPolicyEntropy = dist.entropy().mean().item<float>();
             
             // Use sample() with explicit fallback for edge cases
             Tensor actionsTensor;
@@ -625,7 +629,7 @@ public class PpoAgent : IAgent
     public void DecayEpsilon()
     {
         if (!(_entropyCoef > _minEntropyCoef)) return;
-        _entropyCoef *= 0.99995f;  // Much slower decay - was decaying too fast
+        _entropyCoef *= 0.999995f;  // 10x slower decay (was 0.99995)
         _entropyCoef = Math.Max(_entropyCoef, _minEntropyCoef);
     }
     
@@ -634,7 +638,7 @@ public class PpoAgent : IAgent
     /// </summary>
     public void ResetEntropy(float? newValue = null)
     {
-        _entropyCoef = newValue ?? 0.30f;  // Reset to high value to break HOLD dominance
+        _entropyCoef = newValue ?? 0.60f;  // Reset to high value (raised from 0.30)
         // Note: Console output removed - it corrupts the Spectre.Console Live display
     }
     
@@ -682,7 +686,22 @@ public class PpoAgent : IAgent
         
         return false;
     }
+    /// <summary>
+    /// Get the entropy coefficient (hyperparameter that weights entropy in the loss).
+    /// This is NOT the actual policy entropy - use GetPolicyEntropy() for that.
+    /// </summary>
+    public float GetEntropyCoefficient() => _entropyCoef;
+    
+    /// <summary>
+    /// Get the actual policy entropy from the last action distribution.
+    /// Higher values = more exploration (max ~1.39 for 4 actions).
+    /// </summary>
+    public float GetPolicyEntropy() => _lastPolicyEntropy;
+    
+    // Keep old name for backwards compatibility (deprecated)
+    [Obsolete("Use GetEntropyCoefficient() instead")]
     public float GetEntropyCoef() => _entropyCoef;
+    
     public float GetValueLoss() => _lastValueLoss;
     public float GetKlDivergence() => _lastKlDivergence;
 

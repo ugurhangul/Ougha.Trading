@@ -289,7 +289,8 @@ public static class TrainingRunner
                                         hasPositions: hasPositions,
                                         unrealizedPnls: unrealizedPnls,
                                         prices: prices,
-                                        entropy: stats.Entropy);
+                                        entropyCoefficient: stats.EntropyCoefficient,
+                                        policyEntropy: stats.PolicyEntropy);
                                 }
 
                                 // Update step counter with actual S1 steps taken
@@ -388,7 +389,8 @@ public static class TrainingRunner
 
                                 stats.EpisodeReward = episodeReward;
                                 stats.Epsilon = GetEpsilon(agent);
-                                stats.Entropy = GetEntropy(agent);
+                                stats.EntropyCoefficient = GetEntropyCoefficient(agent);
+                                stats.PolicyEntropy = GetPolicyEntropy(agent);
                                 stats.BufferSize = GetBufferSize(agent);
                                 stats.Positions = env.Executor.GetPositions().Count();
                                 stats.Equity = env.Executor.GetBalance();
@@ -547,7 +549,8 @@ public static class TrainingRunner
                             }
 
                             stats.Epsilon = GetEpsilon(agent);
-                            stats.Entropy = GetEntropy(agent);
+                            stats.EntropyCoefficient = GetEntropyCoefficient(agent);
+                            stats.PolicyEntropy = GetPolicyEntropy(agent);
                             ctx.UpdateTarget(TrainingDisplay.BuildDisplay(stats, budget));
 
                             // Disable checkpointing for now
@@ -625,11 +628,21 @@ public static class TrainingRunner
         return 0f;
     }
 
-    private static float GetEntropy(IAgent agent)
+    private static float GetEntropyCoefficient(IAgent agent)
     {
         if (agent is PpoAgent ppo)
         {
-            return ppo.GetEntropyCoef();
+            return ppo.GetEntropyCoefficient();
+        }
+
+        return 0f;
+    }
+    
+    private static float GetPolicyEntropy(IAgent agent)
+    {
+        if (agent is PpoAgent ppo)
+        {
+            return ppo.GetPolicyEntropy();
         }
 
         return 0f;

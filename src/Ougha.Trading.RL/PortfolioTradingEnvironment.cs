@@ -397,6 +397,13 @@ public class PortfolioTradingEnvironment
 
         var pos = _executor.GetPosition(symbol);
         var hasPosition = pos != null;
+        
+        // Penalty for invalid CLOSE action when no position is held
+        // This teaches the agent that CLOSE is only valid when holding
+        if (isCloseAction && !hasPosition)
+        {
+            return (-0.001f, false);  // Small penalty for wasted action
+        }
 
         var lastAction = _lastExecutedAction.GetValueOrDefault(symbol, -1);
         var lastTick = _lastExecutedTick.GetValueOrDefault(symbol, -_actionMemoryWindow);

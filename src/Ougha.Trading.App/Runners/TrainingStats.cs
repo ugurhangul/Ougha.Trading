@@ -71,7 +71,27 @@ public class TrainingStats
     private double _bestReward = double.MinValue;
     public double BestReward { get => _bestReward; set => _bestReward = value; }
     public float Epsilon { get; set; } = 1.0f;
-    public float Entropy { get; set; } = 0.05f;
+    
+    /// <summary>
+    /// Entropy coefficient (hyperparameter that weights entropy in PPO loss).
+    /// </summary>
+    public float EntropyCoefficient { get; set; } = 0.60f;
+    
+    /// <summary>
+    /// Actual policy entropy from the action distribution (max ~1.39 for 4 actions).
+    /// Higher = more exploration.
+    /// </summary>
+    public float PolicyEntropy { get; set; } = 0f;
+    
+    /// <summary>
+    /// Backwards compatible alias for EntropyCoefficient.
+    /// </summary>
+    public float Entropy
+    {
+        get => EntropyCoefficient;
+        set => EntropyCoefficient = value;
+    }
+    
     public bool IsPpoAgent { get; set; }
 
     private readonly Queue<double> _recentRewards = new();
