@@ -89,37 +89,21 @@ public static class BacktestRunner
 
         if (isTraining)
         {
-            AnsiConsole.MarkupLine($"[bold yellow]Initializing TorchAgent for Online Training...[/]");
-            agent = new TorchAgent(
+            AnsiConsole.MarkupLine($"[bold yellow]Initializing PpoAgent for Training...[/]");
+            agent = new PpoAgent(
                 batchSize: 64,
+                rolloutHorizon: 2048,
                 gamma: 0.99f,
-                epsilon: 0.5f, epsilonMin: 0.05f,
-                epsilonDecay: 0.999f,
-                bufferSize: 10000,
+                learningRate: 3e-4f,
                 useCuda: useCuda,
                 newsFeatureSize: portfolioConfig.NewsFeatureSize
             );
             agent.ResetOnlineLearning();
-            AnsiConsole.MarkupLine("[green]TorchAgent ready for online learning (state reset)![/]");
-        }
-        else if (File.Exists(modelPath))
-        {
-            try
-            {
-                AnsiConsole.MarkupLine($"[cyan]Loading ONNX model: {modelPath}[/]");
-                agent = new OnnxAgent(modelPath, useCuda);
-                AnsiConsole.MarkupLine("[green]ONNX agent loaded successfully![/]");
-            }
-            catch (Exception ex)
-            {
-                AnsiConsole.MarkupLine($"[yellow]Warning: Failed to load ONNX model: {ex.Message}[/]");
-                AnsiConsole.MarkupLine("[yellow]Falling back to HOLD action[/]");
-            }
+            AnsiConsole.MarkupLine("[green]PpoAgent ready for training![/]");
         }
         else
         {
-            AnsiConsole.MarkupLine($"[yellow]ONNX model not found at: {modelPath}[/]");
-            AnsiConsole.MarkupLine("[yellow]Falling back to HOLD action[/]");
+            AnsiConsole.MarkupLine($"[yellow]No model loaded - using HOLD action (inference requires training first)[/]");
         }
 
         var env = new PortfolioTradingEnvironment(

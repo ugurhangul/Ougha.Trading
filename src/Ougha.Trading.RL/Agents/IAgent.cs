@@ -18,7 +18,7 @@ public interface IAgent : IDisposable
     /// Select actions for a batch of states, including TP/SL multipliers and log probabilities.
     /// Used by PPO for on-policy training where log probs must be stored with experiences.
     /// </summary>
-    (int[] Actions, float[,] TpSlMultipliers, float[] LogProbs) ActBatchWithTpSlAndLogProbs(AgentInput[] inputs, bool training = true);
+    (int[] Actions, float[,] TpSlMultipliers, float[] LogProbs) ActBatchWithTpSlAndLogProbs(AgentInput[] inputs, bool training = true, bool[]? hasPositions = null);
 
     /// <summary>
     /// Add an experience tuple to the replay buffer.

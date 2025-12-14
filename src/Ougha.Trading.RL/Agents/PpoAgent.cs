@@ -143,7 +143,7 @@ public class PpoAgent : IAgent
         return (actions, tpSl);
     }
 
-    public (int[] Actions, float[,] TpSlMultipliers, float[] LogProbs) ActBatchWithTpSlAndLogProbs(AgentInput[] inputs, bool training = true)
+    public (int[] Actions, float[,] TpSlMultipliers, float[] LogProbs) ActBatchWithTpSlAndLogProbs(AgentInput[] inputs, bool training = true, bool[]? hasPositions = null)
     {
         var count = inputs.Length;
         
@@ -157,6 +157,24 @@ public class PpoAgent : IAgent
             // Sanitize logits to prevent NaN/Inf issues
             var sanitizedLogits = nan_to_num(logits, nan: 0.0, posinf: 10.0, neginf: -10.0);
             var clampedLogits = clamp(sanitizedLogits, -20.0f, 20.0f);
+            
+            // Apply action masking: mask CLOSE (action 3) when no position held
+            if (hasPositions != null)
+            {
+                // Create mask array: 0 for valid, large negative for invalid CLOSE actions
+                var maskArray = new float[count];
+                for (var i = 0; i < count; i++)
+                {
+                    if (!hasPositions[i])
+                    {
+                        maskArray[i] = -1e10f;  // Makes CLOSE probability ~0
+                    }
+                }
+                // Create tensor on correct device and add to CLOSE column
+                using var maskTensor = tensor(maskArray, device: _device);
+                var closeColumn = clampedLogits.narrow(1, 3, 1).squeeze(1);  // Get column 3
+                closeColumn.add_(maskTensor);  // In-place add
+            }
 
             // Use logits-based Categorical (more numerically stable than probs-based)
             var dist = distributions.Categorical(logits: clampedLogits);

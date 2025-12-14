@@ -250,9 +250,12 @@ public static class TrainingRunner
                                 stats.CurrentStep = step;
                                 stats.StartStepTimer();
 
-                                // Get action at M1 decision point
+                                // Get position state for action masking (prevents CLOSE when no position)
+                                var currentPositions = symbols.Select(s => env.Executor.GetPosition(s) != null).ToArray();
+                                
+                                // Get action at M1 decision point (with action masking)
                                 actionTimer.Restart();
-                                var (actions, tpSlMults, logProbs) = agent.ActBatchWithTpSlAndLogProbs(stateInputs, training: true);
+                                var (actions, tpSlMults, logProbs) = agent.ActBatchWithTpSlAndLogProbs(stateInputs, training: true, hasPositions: currentPositions);
                                 foreach (var a in actions) stats.RecordAction(a);
                                 actionTimer.Stop();
                                 stats.ActionTimeMs = actionTimer.Elapsed.TotalMilliseconds;
@@ -278,8 +281,9 @@ public static class TrainingRunner
                                 // Log actions for analysis (every 10 steps to reduce overhead)
                                 if (step % 10 == 0 && actionLoggingEnabled)
                                 {
+                                    // Note: Use currentPositions (captured BEFORE action) to correctly log
+                                    // whether agent had position when deciding the action
                                     var positions = symbols.Select(s => env.Executor.GetPosition(s)).ToArray();
-                                    var hasPositions = positions.Select(p => p != null).ToArray();
                                     var unrealizedPnls = positions.Select(p => (float)(p?.UnrealizedPnlPercent ?? 0)).ToArray();
                                     var prices = symbols.Select(s => env.Executor.GetBid(s)).ToArray();
                                     
@@ -290,7 +294,7 @@ public static class TrainingRunner
                                         symbols: symbols.ToArray(),
                                         actions: actions,
                                         rewards: rewards,
-                                        hasPositions: hasPositions,
+                                        hasPositions: currentPositions,  // Use PRE-action state for correct analysis
                                         unrealizedPnls: unrealizedPnls,
                                         prices: prices,
                                         entropyCoefficient: stats.EntropyCoefficient,
@@ -363,25 +367,11 @@ public static class TrainingRunner
 
                                         // PPO requires synchronous training (on-policy algorithm)
                                         // Data must be collected by the current policy
-                                        if (agent is PpoAgent)
-                                        {
-                                            var loss = agent.TrainMultipleBatches(budget.TrainBatches);
-                                            trainTimer.Stop();
-                                            stats.TrainTimeMs = trainTimer.Elapsed.TotalMilliseconds;
-                                            stats.TrainCalls++;
-                                        }
-                                        else
-                                        {
-                                            // DQN is off-policy, can run async
-                                            trainingTask = Task.Run(() =>
-                                            {
-                                                // ReSharper disable once AccessToDisposedClosure
-                                                var loss = agent.TrainMultipleBatches(budget.TrainBatches);
-                                                trainTimer.Stop();
-                                                stats.TrainTimeMs = trainTimer.Elapsed.TotalMilliseconds;
-                                                return loss;
-                                            });
-                                        }
+                                        // PPO requires synchronous training (on-policy algorithm)
+                                        var loss = agent.TrainMultipleBatches(budget.TrainBatches);
+                                        trainTimer.Stop();
+                                        stats.TrainTimeMs = trainTimer.Elapsed.TotalMilliseconds;
+                                        stats.TrainCalls++;
                                     }
                                 }
 
@@ -623,12 +613,7 @@ public static class TrainingRunner
 
     private static float GetEpsilon(IAgent agent)
     {
-        if (agent is TorchAgent)
-        {
-            var field = typeof(TorchAgent).GetField("_epsilon", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            return (float)(field?.GetValue(agent) ?? 0f);
-        }
-
+        // PPO uses entropy instead of epsilon
         return 0f;
     }
 
@@ -654,16 +639,7 @@ public static class TrainingRunner
 
     private static int GetBufferSize(IAgent agent)
     {
-        if (agent is TorchAgent)
-        {
-            var field = typeof(TorchAgent).GetField("_buffer", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var buffer = field?.GetValue(agent);
-            if (buffer == null) return 0;
-
-            var countProp = buffer.GetType().GetProperty("Count");
-            return (int)(countProp?.GetValue(buffer) ?? 0);
-        }
-        else if (agent is PpoAgent ppo)
+        if (agent is PpoAgent ppo)
         {
             return ppo.GetActiveBufferCount();
         }
@@ -685,41 +661,25 @@ public static class TrainingRunner
 
     private static IAgent CreateAgent(IConfiguration config, TrainingBudget budget, int batchSize, int bufferSize, int newsFeatureSize)
     {
-        var strategy = config.GetValue<string>("Training:Strategy", "DQN");
+        // Only PPO is supported now (DQN removed)
+        // Calculate expected updates for LR scheduling
+        var stepsPerRollout = 2048; // Reduced from 4096 for fresher samples
+        var expectedRollouts = budget.Episodes * budget.MaxSteps / stepsPerRollout;
+        
+        // Debug mode uses ~16x smaller model for fast hyperparameter tuning
+        var debugMode = config.GetValue("Training:DebugMode", false);
 
-        if (strategy.Equals("PPO", StringComparison.OrdinalIgnoreCase))
-        {
-            // Calculate expected updates for LR scheduling
-            var stepsPerRollout = 2048; // Reduced from 4096 for fresher samples
-            var expectedRollouts = budget.Episodes * budget.MaxSteps / stepsPerRollout;
-            
-            // Debug mode uses ~16x smaller model for fast hyperparameter tuning
-            var debugMode = config.GetValue("Training:DebugMode", false);
-
-            var modeLabel = debugMode ? "[yellow]DEBUG MODE (small model)[/]" : "[green]FULL MODE (large model)[/]";
-            AnsiConsole.MarkupLine($"[bold cyan]Using PPO Strategy[/] | {modeLabel} | rollout=2048, batch=256, LR schedule over {expectedRollouts} updates");
-            
-            return new PpoAgent(
-                batchSize: 256, // Increased for RTX 3090
-                rolloutHorizon: 2048, // Reduced from 4096 for fresher samples
-                gamma: 0.99f,
-                learningRate: 3e-4f,
-                useCuda: budget.Hardware.GpuAvailable,
-                newsFeatureSize: newsFeatureSize,
-                debugMode: debugMode
-            );
-        }
-
-        AnsiConsole.MarkupLine("[bold cyan]Using DQN Strategy[/]");
-        return new TorchAgent(
-            batchSize: batchSize,
+        var modeLabel = debugMode ? "[yellow]DEBUG MODE (small model)[/]" : "[green]FULL MODE (large model)[/]";
+        AnsiConsole.MarkupLine($"[bold cyan]Using PPO Strategy[/] | {modeLabel} | rollout=2048, batch=256, LR schedule over {expectedRollouts} updates");
+        
+        return new PpoAgent(
+            batchSize: 256, // Increased for RTX 3090
+            rolloutHorizon: 2048, // Reduced from 4096 for fresher samples
             gamma: 0.99f,
-            epsilon: 1.0f,
-            epsilonMin: 0.01f,
-            epsilonDecay: (float)budget.EpsilonDecay,
-            bufferSize: bufferSize,
+            learningRate: 3e-4f,
             useCuda: budget.Hardware.GpuAvailable,
-            newsFeatureSize: newsFeatureSize
+            newsFeatureSize: newsFeatureSize,
+            debugMode: debugMode
         );
     }
 }

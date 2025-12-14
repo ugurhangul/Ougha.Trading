@@ -538,6 +538,34 @@ public class PortfolioTradingEnvironment
                     _peakUnrealizedPnls[symbol] = 0;
                     _lastExecutedAction[symbol] = action;
                     _lastExecutedTick[symbol] = _currentTick;
+                    
+                    // Entry quality bonus: reward entries that align with recent momentum
+                    // BUY when price rising = good entry, SELL when price falling = good entry
+                    var candlePriceChange = candle.Close - candle.Open;
+                    var momentum = candlePriceChange / (atr > 0 ? atr : candle.Close * 0.001);  // Normalize by ATR
+                    
+                    var entryQualityBonus = 0f;
+                    if (entryType.Value == TradeType.Buy && momentum > 0.2)
+                    {
+                        // BUY with upward momentum - good entry
+                        entryQualityBonus = Math.Min(0.5f, (float)momentum * 0.3f);
+                    }
+                    else if (entryType.Value == TradeType.Sell && momentum < -0.2)
+                    {
+                        // SELL with downward momentum - good entry  
+                        entryQualityBonus = Math.Min(0.5f, (float)Math.Abs(momentum) * 0.3f);
+                    }
+                    else if ((entryType.Value == TradeType.Buy && momentum < -0.2) ||
+                             (entryType.Value == TradeType.Sell && momentum > 0.2))
+                    {
+                        // Counter-trend entry - small penalty
+                        entryQualityBonus = -0.1f;
+                    }
+                    
+                    if (Math.Abs(entryQualityBonus) > 0.01f)
+                    {
+                        return (entryQualityBonus, false);
+                    }
                 }
             }
         }

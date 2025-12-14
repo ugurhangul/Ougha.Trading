@@ -31,12 +31,12 @@ public class RewardConfig
     /// <summary>
     /// Bonus for winning trades (profit > 0). Increased to provide stronger positive signal.
     /// </summary>
-    public float WinBonus { get; set; } = 2.0f;  // Increased from 1.0 - stronger positive signal
+    public float WinBonus { get; set; } = 3.0f;  // Win bonus: strong positive signal for profitable trades
     
     /// <summary>
     /// Penalty for losing trades. Symmetric with WinBonus for balanced risk.
     /// </summary>
-    public float LossPenalty { get; set; } = 1.0f;  // Reduced from 3 to not dominate profit signal
+    public float LossPenalty { get; set; } = 0.3f;  // Very low: let profit signal dominate, not punishment
     
     /// <summary>
     /// Risk-adjusted reward: profit / SL distance. Rewards good R:R trades.
@@ -49,7 +49,7 @@ public class RewardConfig
     /// <summary>
     /// Scale for unrealized PnL shaping. Provides dense signal during trades.
     /// </summary>
-    public float UnrealizedPnlScale { get; set; } = 2f;  // Reduced from 10 to prevent reward hacking
+    public float UnrealizedPnlScale { get; set; } = 0.5f;  // Reduced: let trade outcome dominate, not per-tick noise
     
     /// <summary>
     /// Scale for PnL delta (improvement since last step). Encourages progress.
@@ -77,7 +77,7 @@ public class RewardConfig
     /// <summary>
     /// Per-tick bonus for holding a profitable position. Encourages exploring longer holds.
     /// </summary>
-    public float HoldingBonus { get; set; } = 0.02f;  // Increased from 0.01 - more reward for staying in winners
+    public float HoldingBonus { get; set; } = 0.05f;  // Strong per-tick bonus for holding profitable positions
     
     /// <summary>
     /// Minimum ticks threshold for early close penalty (soft guidance, not enforcement).
@@ -117,7 +117,7 @@ public class RewardConfig
     /// Penalty when agent is flat but market moved significantly.
     /// Reduced to prevent overwhelming negative reward bias.
     /// </summary>
-    public float MissedOpportunityPenalty { get; set; } = 0.05f;  // Reduced from 0.30 - was too harsh
+    public float MissedOpportunityPenalty { get; set; } = 0f;  // Disabled - was causing too many negative rewards
     
     /// <summary>
     /// ATR multiplier threshold: price move > this * ATR = missed opportunity.
