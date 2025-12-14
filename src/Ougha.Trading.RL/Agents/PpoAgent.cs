@@ -644,6 +644,32 @@ public class PpoAgent : IAgent
     {
         _rolloutBuffer.Reset();
     }
+    
+    /// <summary>
+    /// Force flush the buffer and train on current experiences.
+    /// Call this at the end of each episode to train every episode.
+    /// </summary>
+    /// <returns>Average loss from training, or 0 if no experiences to train on</returns>
+    public async Task<float> TrainEpisodeAsync()
+    {
+        // Force flush any pending experiences to make them available for training
+        await _rolloutBuffer.FlushAsync();
+        
+        // Now try to train on the flushed rollout
+        var rollout = _rolloutBuffer.TryGetRollout();
+        if (rollout == null || rollout.Length == 0)
+            return 0f;
+            
+        return UpdatePpo(rollout);
+    }
+    
+    /// <summary>
+    /// Synchronous version of TrainEpisodeAsync for simpler usage.
+    /// </summary>
+    public float TrainEpisode()
+    {
+        return TrainEpisodeAsync().GetAwaiter().GetResult();
+    }
     public void DecayEpsilon()
     {
         if (!(_entropyCoef > _minEntropyCoef)) return;
@@ -773,7 +799,16 @@ public class PpoAgent : IAgent
         tensors[1] = tensor(symBuffer, new long[] { batchSize, 1 }, 
             dtype: ScalarType.Int64, device: _device);
 
-        var totalFeatures = 5 + 10 + 5 + 9 + _newsFeatureSize + 20 + 12 + 8;  // Without TimeFeatures
+        // Fixed feature sizes (model expects these dimensions)
+        const int TriggerLen = 5;
+        const int ConfluenceLen = 10;
+        const int PortfolioLen = 5;
+        const int RiskLen = 9;
+        const int CorrelationLen = 20;
+        const int ExposureLen = 12;
+        const int DxyLen = 8;
+        
+        var totalFeatures = TriggerLen + ConfluenceLen + PortfolioLen + RiskLen + _newsFeatureSize + CorrelationLen + ExposureLen + DxyLen;
         var featTotalLen = batchSize * totalFeatures;
         var featPackedBuffer = usePreallocated && _packedFeatBuffer != null 
             ? _packedFeatBuffer 
@@ -784,14 +819,15 @@ public class PpoAgent : IAgent
             var offset = b * totalFeatures;
             var inp = inputs[b];
 
-            CopyFeatures(featPackedBuffer, offset, inp.TriggerContext, 5); offset += 5;
-            CopyFeatures(featPackedBuffer, offset, inp.ConfluenceFeatures, 10); offset += 10;
-            CopyFeatures(featPackedBuffer, offset, inp.PortfolioFeatures, 5); offset += 5;
-            CopyFeatures(featPackedBuffer, offset, inp.RiskState, 9); offset += 9;
-            CopyFeatures(featPackedBuffer, offset, inp.NewsFeatures ?? _zeroNews, _newsFeatureSize); offset += _newsFeatureSize;
-            CopyFeatures(featPackedBuffer, offset, inp.CorrelationFeatures ?? ZeroCorrelation, 20); offset += 20;
-            CopyFeatures(featPackedBuffer, offset, inp.PortfolioExposure ?? ZeroExposure, 12); offset += 12;
-            CopyFeatures(featPackedBuffer, offset, inp.DxyFeatures ?? ZeroDxy, 8);
+            // Use Math.Min to handle cases where actual array is smaller or larger than expected
+            CopyFeaturesWithPadding(featPackedBuffer, offset, inp.TriggerContext, TriggerLen); offset += TriggerLen;
+            CopyFeaturesWithPadding(featPackedBuffer, offset, inp.ConfluenceFeatures, ConfluenceLen); offset += ConfluenceLen;
+            CopyFeaturesWithPadding(featPackedBuffer, offset, inp.PortfolioFeatures, PortfolioLen); offset += PortfolioLen;
+            CopyFeaturesWithPadding(featPackedBuffer, offset, inp.RiskState, RiskLen); offset += RiskLen;
+            CopyFeaturesWithPadding(featPackedBuffer, offset, inp.NewsFeatures ?? _zeroNews, _newsFeatureSize); offset += _newsFeatureSize;
+            CopyFeaturesWithPadding(featPackedBuffer, offset, inp.CorrelationFeatures ?? ZeroCorrelation, CorrelationLen); offset += CorrelationLen;
+            CopyFeaturesWithPadding(featPackedBuffer, offset, inp.PortfolioExposure ?? ZeroExposure, ExposureLen); offset += ExposureLen;
+            CopyFeaturesWithPadding(featPackedBuffer, offset, inp.DxyFeatures ?? ZeroDxy, DxyLen);
         }
         
         tensors[2] = tensor(featPackedBuffer, new long[] { batchSize, totalFeatures }, 
@@ -800,13 +836,29 @@ public class PpoAgent : IAgent
         return tensors;
     }
 
-    private static void CopyFeatures(float[] dest, int destOffset, float[] source, int len)
+    /// <summary>
+    /// Copy features with automatic padding/truncation to match expected length.
+    /// If source is smaller than expectedLen, remaining slots are zeroed.
+    /// If source is larger, only first expectedLen elements are copied.
+    /// </summary>
+    private static void CopyFeaturesWithPadding(float[] dest, int destOffset, float[] source, int expectedLen)
     {
-        // Fast path: use Buffer.BlockCopy for bulk copy, then sanitize
-        Buffer.BlockCopy(source, 0, dest, destOffset * sizeof(float), len * sizeof(float));
+        var copyLen = Math.Min(source.Length, expectedLen);
+        
+        // Copy available data
+        if (copyLen > 0)
+        {
+            Buffer.BlockCopy(source, 0, dest, destOffset * sizeof(float), copyLen * sizeof(float));
+        }
+        
+        // Zero-pad remaining slots if source is shorter than expected
+        for (var i = copyLen; i < expectedLen; i++)
+        {
+            dest[destOffset + i] = 0f;
+        }
         
         // Sanitize NaN/Inf values in-place
-        for (var i = 0; i < len; i++)
+        for (var i = 0; i < expectedLen; i++)
         {
             if (!float.IsFinite(dest[destOffset + i]))
                 dest[destOffset + i] = 0f;

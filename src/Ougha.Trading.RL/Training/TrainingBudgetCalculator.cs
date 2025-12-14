@@ -158,9 +158,9 @@ public static class TrainingBudgetCalculator
         var effectiveEpisodes = episodes ?? CalculateEpisodes(
             trainingDays, numSymbols);
 
-        var (calcTickSkipMin, calcTickSkipMax) = CalculateTickSkip(targetDaysPerEpisode, effectiveTicksPerDay);
-        var effectiveTickSkipMin = tickSkipMin ?? calcTickSkipMin;
-        var effectiveTickSkipMax = tickSkipMax ?? calcTickSkipMax;
+        // Fixed tick skip of 60 = one decision per M1 candle (~4000 decisions per 5-day episode)
+        var effectiveTickSkipMin = tickSkipMin ?? 60;
+        var effectiveTickSkipMax = tickSkipMax ?? 60;
         var tickSkipAvg = (effectiveTickSkipMin + effectiveTickSkipMax) / 2.0;
 
         var effectiveMaxSteps =CalculateMaxSteps(tickSkipAvg, targetDaysPerEpisode, effectiveTicksPerDay);

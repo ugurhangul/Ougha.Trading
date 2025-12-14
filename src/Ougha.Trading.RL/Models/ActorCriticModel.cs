@@ -73,7 +73,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
         {
             // Debug mode: ~600K parameters (16x smaller) - for fast hyperparameter tuning
             _timeframeEmbedDim = 64;    // vs 256
-            _featureDim = 128;          // same
+            _featureDim = 512;          // Large to support many symbols (NewsFeatures = 4*symbols + 1)
             _hiddenDim = 256;           // vs 1024
             _valueHiddenDim = 128;      // vs 512
             _lstmHiddenDim = 128;       // vs 512
@@ -83,7 +83,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
         {
             // Full mode: ~10M parameters - for final training
             _timeframeEmbedDim = 256;
-            _featureDim = 128;
+            _featureDim = 512;          // Large to support many symbols (NewsFeatures = 4*symbols + 1)
             _hiddenDim = 1024;
             _valueHiddenDim = 512;
             _lstmHiddenDim = 512;

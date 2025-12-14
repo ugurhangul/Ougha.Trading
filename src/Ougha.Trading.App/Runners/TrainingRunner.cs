@@ -3,6 +3,7 @@ using Spectre.Console;
 using Ougha.Trading.Analysis;
 using Ougha.Trading.Core.Models;
 using Ougha.Trading.Data;
+using Ougha.Trading.Data.Downloaders;
 using Ougha.Trading.Data.Services;
 using Ougha.Trading.Data.Streamers;
 using Ougha.Trading.RL;
@@ -29,6 +30,39 @@ public static class TrainingRunner
 
         var endDate = config.GetValue("Training:End", new DateTime(DateTime.UtcNow.Year, DateTime.UtcNow.Month, DateTime.UtcNow.Day));
         var startDate = config.GetValue("Training:Start", new DateTime(2025, 01, 01));
+
+        // Ensure tick data is ready for all symbols before training
+        AnsiConsole.MarkupLine("[bold cyan]Checking tick data readiness...[/]");
+        using var httpClient = new HttpClient();
+        var downloader = new Ex2ArchiveDownloader(httpClient);
+        var dataService = new DataService(dbLoader, downloader);
+        
+        var tickReport = await dataService.EnsureTicksReadyAsync(symbols, startDate, endDate);
+        
+        if (!tickReport.AllReady)
+        {
+            AnsiConsole.MarkupLine($"[yellow]Warning: {tickReport.MissingSymbols.Count} symbols have no data available[/]");
+            foreach (var missing in tickReport.MissingSymbols)
+            {
+                AnsiConsole.MarkupLine($"  [yellow]• {missing}[/]");
+            }
+            
+            // Filter out symbols with no data
+            var originalCount = symbols.Count;
+            symbols = tickReport.ReadySymbols;
+            
+            if (symbols.Count == 0)
+            {
+                AnsiConsole.MarkupLine("[red]No symbols have available data. Exiting.[/]");
+                return;
+            }
+            
+            AnsiConsole.MarkupLine($"[grey]Continuing with {symbols.Count}/{originalCount} symbols that have data[/]");
+        }
+        else
+        {
+            AnsiConsole.MarkupLine($"[green]All {symbols.Count} symbols have tick data ready ({tickReport.TotalCandleCount:N0} total candles)[/]");
+        }
 
         AnsiConsole.MarkupLine("[bold cyan]Calculating optimal training budget...[/]");
 
@@ -398,6 +432,21 @@ public static class TrainingRunner
                                 await trainingTask;
                                 stats.TrainCalls++;
                                 trainingTask = null;
+                            }
+
+                            // Train every episode: flush buffer and train on accumulated experiences
+                            if (agent is PpoAgent ppoAgentTrain)
+                            {
+                                trainTimer.Restart();
+                                var episodeLoss = await ppoAgentTrain.TrainEpisodeAsync();
+                                trainTimer.Stop();
+                                
+                                if (episodeLoss > 0)
+                                {
+                                    stats.TrainTimeMs = trainTimer.Elapsed.TotalMilliseconds;
+                                    stats.TrainCalls++;
+                                    stats.EpisodeLoss = episodeLoss;
+                                }
                             }
 
                             agent.SyncInferenceNetwork();

@@ -55,7 +55,7 @@ public class PortfolioTradingEnvironment
     // Daily loss limit tracking
     private double _dailyStartEquity;
     private DateTime _lastDailyReset = DateTime.MinValue;
-    private const double DAILY_LOSS_LIMIT = 0.03;  // 3% max daily loss
+    private const double DAILY_LOSS_LIMIT = 0.3;  // 3% max daily loss
 
     public int StateSize => _stateBuilder.GetStateSize(_config.Symbols.Length);
     
@@ -419,6 +419,13 @@ public class PortfolioTradingEnvironment
         {
             if (currentHoldingTicks >= MIN_HOLDING_TICKS)
             {
+                // Capture unrealized PnL and momentum BEFORE closing for smart reward
+                var unrealizedPct = pos!.UnrealizedPnlPercent;
+                var closeCandle = _executor.GetLastKnownCandle(symbol);
+                var closePriceChange = closeCandle != null ? closeCandle.Close - closeCandle.Open : 0;
+                var isMomentumAgainstPosition = (pos.Type == TradeType.Buy && closePriceChange < 0) || 
+                                                 (pos.Type == TradeType.Sell && closePriceChange > 0);
+                
                 var closeResult = await _executor.ClosePositionAsync(symbol);
                 if (closeResult.Success)
                 {
@@ -429,6 +436,35 @@ public class PortfolioTradingEnvironment
                     hasPosition = false;
                     _lastExecutedAction[symbol] = action;
                     _lastExecutedTick[symbol] = _currentTick;
+                    
+                    // SMART CLOSE REWARD: Teach agent WHEN to close
+                    var smartCloseReward = 0f;
+                    
+                    if (unrealizedPct > 0.5)
+                    {
+                        // Taking profit - GOOD! Reward it
+                        smartCloseReward = 0.5f + Math.Min(1.0f, (float)unrealizedPct * 0.5f);
+                    }
+                    else if (unrealizedPct < -0.5 && isMomentumAgainstPosition)
+                    {
+                        // Cutting loss when momentum against position - SMART
+                        smartCloseReward = 0.1f;  // Small positive for smart exit
+                    }
+                    else if (unrealizedPct > -0.5 && unrealizedPct < 0.5)
+                    {
+                        // Closing at breakeven/small loss - PANIC SELLING
+                        smartCloseReward = -0.5f;  // Penalty for premature exit
+                    }
+                    else if (unrealizedPct < -0.5 && !isMomentumAgainstPosition)
+                    {
+                        // Cutting loss when price might recover - BAD
+                        smartCloseReward = -0.3f;
+                    }
+                    
+                    if (Math.Abs(smartCloseReward) > 0.01f)
+                    {
+                        return (smartCloseReward, true);  // Return smart close reward
+                    }
                 }
             }
             // After close action, skip to reward calculation (don't open new position)

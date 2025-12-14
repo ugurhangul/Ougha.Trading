@@ -10,7 +10,6 @@ namespace Ougha.Trading.App.Runners;
 /// </summary>
 public static class TrainingDisplay
 {
-    private const int MaxSymbolRows = 10;
     
     public static IRenderable BuildDisplay(TrainingStats stats, TrainingBudget budget)
     {
@@ -287,10 +286,27 @@ public static class TrainingDisplay
             .Expand();
     }
 
+    private const int SymbolsPerPage = 20;  // Show 20 symbols per page
+    
     private static Table BuildSymbolPerformanceTable(TrainingStats stats)
     {
+        var allSymbols = stats.SymbolPerformance
+            .OrderByDescending(x => x.Value.NetProfit)
+            .ToList();
+        
+        var totalSymbols = allSymbols.Count;
+        var totalPages = Math.Max(1, (int)Math.Ceiling((double)totalSymbols / SymbolsPerPage));
+        
+        // Auto-rotate pages based on step count (changes every ~500 steps = ~5 seconds at 100 steps/sec)
+        var currentPage = (stats.CurrentStep / 1500) % totalPages;
+        
+        var pageSymbols = allSymbols
+            .Skip(currentPage * SymbolsPerPage)
+            .Take(SymbolsPerPage)
+            .ToList();
+
         var table = new Table()
-            .Title("[bold magenta]Symbol Performance (Cumulative)[/]")
+            .Title($"[bold magenta]Symbol Performance[/] [dim](Page {currentPage + 1}/{totalPages}, {totalSymbols} symbols)[/]")
             .Border(TableBorder.Rounded)
             .BorderColor(Color.Magenta1)
             .Expand();
@@ -309,13 +325,8 @@ public static class TrainingDisplay
         table.AddColumn(new TableColumn("Net P&L").RightAligned().Width(9));
         table.AddColumn(new TableColumn("NoImp").Centered().Width(5));
 
-        var sortedSymbols = stats.SymbolPerformance
-            .OrderByDescending(x => x.Value.NetProfit)
-            .Take(MaxSymbolRows)
-            .ToList();
-
         var rowCount = 0;
-        foreach (var (symbol, s) in sortedSymbols)
+        foreach (var (symbol, s) in pageSymbols)
         {
             var avgStyle = s.AverageReward > 0 ? "green" : s.AverageReward < 0 ? "red" : "dim";
             var pfStyle = s.CumulativeProfitFactor > 1.5 ? "green" : s.CumulativeProfitFactor > 1 ? "yellow" : "red";
@@ -372,9 +383,10 @@ public static class TrainingDisplay
             rowCount++;
         }
 
-        while (rowCount < MaxSymbolRows)
+        // Pad remaining rows to keep consistent height
+        while (rowCount < SymbolsPerPage)
         {
-            table.AddRow("", "", "", "", "", "", "", "", "", "", "", "", "");  // 13 columns now
+            table.AddRow("", "", "", "", "", "", "", "", "", "", "", "", "");  // 13 columns
             rowCount++;
         }
 
