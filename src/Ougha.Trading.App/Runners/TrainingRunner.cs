@@ -421,6 +421,28 @@ public static class TrainingRunner
                             var episodeTrades = allResults.TradeLog;
                             var totalHoldingSeconds = episodeTrades.Sum(t => (t.CloseTime - t.OpenTime).TotalSeconds);
                             
+                            // Log trade closes for detailed analytics
+                            if (actionLoggingEnabled)
+                            {
+                                foreach (var trade in episodeTrades)
+                                {
+                                    var holdingTicks = (int)(trade.CloseTime - trade.OpenTime).TotalSeconds;
+                                    var entryAction = trade.Type == TradeType.Buy ? 1 : 2;
+                                    var closeReason = trade.ExitReason.ToString();
+                                    
+                                    actionLogger.LogTradeClose(
+                                        episode: ep,
+                                        step: stats.CurrentStep,
+                                        symbol: trade.Symbol,
+                                        profit: trade.Profit,
+                                        holdingTicks: holdingTicks,
+                                        entryAction: entryAction,
+                                        entryPrice: trade.OpenPrice,
+                                        closePrice: trade.ClosePrice,
+                                        closeReason: closeReason);
+                                }
+                            }
+                            
                             // Calculate episode max drawdown from equity curve
                             var episodeMaxDrawdown = Analysis.ResultsAnalyzer.Analyze(allResults).MaxDrawdown;
 

@@ -415,6 +415,8 @@ public class RewardCalculator
             return 0.00005f * (flatTicks - 120);  // Even smaller penalty
         }
         
-        return 0;
+        // DENSE REWARD: Small positive reward for patient waiting when no opportunity
+        // This reduces the 84% zero-reward problem by providing continuous signal
+        return -0.0001f;  // Tiny reward for waiting (net positive after normalization offset)
     }
 }
