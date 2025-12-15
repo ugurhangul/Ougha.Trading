@@ -13,7 +13,7 @@ public class MultiTimeframeStateBuilder
     /// <summary>
     /// Supported timeframes in order (matching Python's SUPPORTED_TIMEFRAMES).
     /// </summary>
-    public static readonly string[] Timeframes = ["M1", "M5", "M15", "H1", "H4"];
+    public static readonly string[] Timeframes = ["M1", "M5", "M15", "H1", "H4", "D1"];
 
     private static readonly Dictionary<string, int> TimeframeIndex = Timeframes
         .Select((tf, i) => (tf, i))
@@ -153,16 +153,16 @@ public class MultiTimeframeStateBuilder
     /// Build trigger context indicating which timeframes just closed.
     /// </summary>
     /// <param name="closedTimeframes">List of timeframe names that just closed a candle</param>
-    /// <returns>One-hot encoded trigger vector (5D)</returns>
+    /// <returns>One-hot encoded trigger vector (6D for M1, M5, M15, H1, H4, D1)</returns>
     public float[] BuildTriggerContext(IEnumerable<string>? closedTimeframes = null)
     {
-        var trigger = new float[5];
+        var trigger = new float[6];
         if (closedTimeframes == null)
             return trigger;
 
         foreach (var tf in closedTimeframes)
         {
-            if (TimeframeIndex.TryGetValue(tf, out var idx))
+            if (TimeframeIndex.TryGetValue(tf, out var idx) && idx < trigger.Length)
                 trigger[idx] = 1.0f;
         }
         return trigger;

@@ -18,8 +18,6 @@ public class EnvironmentPool : IDisposable
     private readonly Channel<PreparedEnvironment> _envChannel;
     private readonly CancellationTokenSource _cts;
     private Task? _producerTask;
-
-    private readonly Lock _lock = new();
     
     // Track producer failures for diagnostics
     private Exception? _producerException;
@@ -69,9 +67,6 @@ public class EnvironmentPool : IDisposable
             {
                 if (_envChannel.Reader.TryRead(out var preparedEnv))
                 {
-                    lock (_lock)
-                    {
-                    }
                     return preparedEnv;
                 }
             }

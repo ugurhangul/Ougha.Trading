@@ -140,20 +140,23 @@ public class FeatureBuilder : IFeatureBuilder
             else
                 features[i, col++] = 0.5f;
 
-            features[i, col++] = (float)rsi14[i];
-            features[i, col++] = (float)rsi7[i];
+            // RSI normalized to 0-1 range
+            features[i, col++] = (float)(rsi14[i] / 100.0);
+            features[i, col++] = (float)(rsi7[i] / 100.0);
 
             features[i, col++] = (float)(macd[i] / c);
             features[i, col++] = (float)(signal[i] / c);
             features[i, col++] = (float)(hist[i] / c);
 
-            features[i, col++] = (float)stochK[i];
-            features[i, col++] = (float)stochD[i];
+            // Stochastic normalized to 0-1 range
+            features[i, col++] = (float)(stochK[i] / 100.0);
+            features[i, col++] = (float)(stochD[i] / 100.0);
+            // ROC scaled to roughly -1 to +1 range
+            features[i, col++] = (float)(roc14[i] / 100.0);
 
-            features[i, col++] = (float)roc14[i];
-
-            features[i, col++] = (float)adx14[i];
+            // ADX normalized to 0-1 range (already was trend_strength)
             features[i, col++] = (float)(adx14[i] / 100.0);
+            features[i, col++] = (float)(adx14[i] / 100.0);  // trend_strength (same as normalized ADX)
             features[i, col++] = atr14[i] > atr14Ma[i] ? 1f : 0f;
 
             var spread = atr14[i] * 0.1;

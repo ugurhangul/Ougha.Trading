@@ -757,7 +757,7 @@ public static class TrainingRunner
         
         return new PpoAgent(
             batchSize: 256, // Increased for RTX 3090
-            rolloutHorizon: 2048, // Reduced from 4096 for fresher samples
+            rolloutHorizon: 8192, // Reduced from 4096 for fresher samples
             gamma: 0.95f,  // Reduced from 0.99 for day trading (shorter horizon)
             learningRate: 3e-4f,
             useCuda: budget.Hardware.GpuAvailable,

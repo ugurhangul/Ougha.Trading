@@ -244,8 +244,10 @@ public class PpoAgent : IAgent
                 tpSlMults[i, 1] = Math.Max(0.3f, slData[i]);  // Minimum SL multiplier too
             }
             
-            // Track prediction variance for diagnostics
-            _lastPolicyEntropy = (float)predData.Select(p => Math.Abs(p)).Average();
+            // Track prediction variance for diagnostics - std dev is proxy for policy uncertainty
+            // Higher std = more varied predictions = more exploration
+            var predStd = predData.Length > 1 ? (float)Math.Sqrt(predData.Select(p => Math.Pow(p - predData.Average(), 2)).Average()) : 0f;
+            _lastPolicyEntropy = predStd;  // Prediction spread (higher = more exploratory)
             _lastPredictions = predData;  // Store for accuracy tracking
             
             // Explicitly dispose tensors
@@ -502,9 +504,11 @@ public class PpoAgent : IAgent
                             
                             var loss = predictionLoss + _valueCoef * valueLoss + _tpSlCoef * (slLoss + closeLoss) - _entropyCoef * explorationBonus;
                             
-                            // Track metrics (predictionLoss used for training diagnostics)
-                            _lastKlDivergence = predictionLoss.item<float>();  // Approximate: higher = worse
+                            // Track metrics for training diagnostics
+                            // Use prediction variance as proxy for KL - high variance means predictions changing a lot
+                            _lastKlDivergence = predVariance.item<float>();
                             _lastValueLoss = valueLoss.item<float>();
+                            _lastPolicyEntropy = (float)Math.Sqrt(predVariance.item<float>());  // Std dev for display
                             
                             _optimizer.zero_grad();
                             loss.backward();
@@ -838,21 +842,21 @@ public class PpoAgent : IAgent
         var usePreallocated = batchSize <= MAX_INFERENCE_BATCH;
         
         var tensors = new Tensor[3];
-        string[] tfNames = ["M1", "M5", "M15", "H1", "H4"];
+        string[] tfNames = ["M1", "M5", "M15", "H1", "H4", "D1"];  // 6 timeframes
 
-        var tfTotalLen = batchSize * 5 * WINDOW_SIZE * NUM_FEATURES;
+        var tfTotalLen = batchSize * 6 * WINDOW_SIZE * NUM_FEATURES;
         var tfPackedBuffer = usePreallocated && _packedTfBuffer != null 
             ? _packedTfBuffer 
             : new float[tfTotalLen];
         
-        for (var tfIdx = 0; tfIdx < 5; tfIdx++)
+        for (var tfIdx = 0; tfIdx < 6; tfIdx++)
         {
             var tf = tfNames[tfIdx];
             var tfOffset = tfIdx * WINDOW_SIZE * NUM_FEATURES;
 
             for (var b = 0; b < batchSize; b++)
             {
-                var batchOffset = b * 5 * WINDOW_SIZE * NUM_FEATURES + tfOffset;
+                var batchOffset = b * 6 * WINDOW_SIZE * NUM_FEATURES + tfOffset;
                 
                 if (!inputs[b].TimeframeFeatures.TryGetValue(tf, out var tfData))
                 {
@@ -873,7 +877,7 @@ public class PpoAgent : IAgent
             }
         }
         
-        tensors[0] = tensor(tfPackedBuffer, new long[] { batchSize, 5, WINDOW_SIZE, NUM_FEATURES }, 
+        tensors[0] = tensor(tfPackedBuffer, new long[] { batchSize, 6, WINDOW_SIZE, NUM_FEATURES }, 
             dtype: ScalarType.Float32, device: _device);
 
         var symBuffer = usePreallocated ? _symbolBuffer : new long[batchSize];
@@ -883,7 +887,7 @@ public class PpoAgent : IAgent
             dtype: ScalarType.Int64, device: _device);
 
         // Fixed feature sizes (model expects these dimensions)
-        const int TriggerLen = 5;
+        const int TriggerLen = 6;  // 6 timeframes now
         const int ConfluenceLen = 10;
         const int PortfolioLen = 5;
         const int RiskLen = 9;

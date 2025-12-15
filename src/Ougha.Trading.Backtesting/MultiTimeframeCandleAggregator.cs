@@ -3,7 +3,7 @@ using Ougha.Trading.Core.Models;
 namespace Ougha.Trading.Backtesting;
 
 /// <summary>
-/// Aggregates M1 candles into higher timeframes (M5, M15, H1, H4).
+/// Aggregates M1 candles into higher timeframes (M5, M15, H1, H4, D1).
 /// Maintains rolling buffers for each timeframe.
 /// </summary>
 public class MultiTimeframeCandleAggregator
@@ -14,7 +14,8 @@ public class MultiTimeframeCandleAggregator
         ["M5"] = TimeSpan.FromMinutes(5),
         ["M15"] = TimeSpan.FromMinutes(15),
         ["H1"] = TimeSpan.FromHours(1),
-        ["H4"] = TimeSpan.FromHours(4)
+        ["H4"] = TimeSpan.FromHours(4),
+        ["D1"] = TimeSpan.FromDays(1)
     };
 
     private readonly int _maxCandlesPerTimeframe;
@@ -23,7 +24,7 @@ public class MultiTimeframeCandleAggregator
 
     private readonly Dictionary<string, Candle?> _currentCandles = new();
 
-    public static readonly string[] Timeframes = ["M1", "M5", "M15", "H1", "H4"];
+    public static readonly string[] Timeframes = ["M1", "M5", "M15", "H1", "H4", "D1"];
 
     public MultiTimeframeCandleAggregator(int maxCandlesPerTimeframe = 100)
     {
@@ -202,7 +203,7 @@ public class MultiTimeframeCandleAggregator
     /// Preload historical candles into the aggregator.
     /// This allows skipping warmup by loading pre-built candles from QuestDB materialized views.
     /// </summary>
-    /// <param name="timeframe">Timeframe key (M1, M5, M15, H1, H4)</param>
+    /// <param name="timeframe">Timeframe key (M1, M5, M15, H1, H4, D1)</param>
     /// <param name="candles">Candles ordered chronologically (oldest first)</param>
     public void PreloadCandles(string timeframe, IReadOnlyList<Candle> candles)
     {

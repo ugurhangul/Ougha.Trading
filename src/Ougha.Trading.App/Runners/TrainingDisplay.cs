@@ -290,7 +290,7 @@ public static class TrainingDisplay
             .Expand();
     }
 
-    private const int SymbolsPerPage = 20;  // Show 20 symbols per page
+    private const int SymbolsPerPage = 30;  // Show 20 symbols per page
     
     private static Table BuildSymbolPerformanceTable(TrainingStats stats)
     {
@@ -302,7 +302,7 @@ public static class TrainingDisplay
         var totalPages = Math.Max(1, (int)Math.Ceiling((double)totalSymbols / SymbolsPerPage));
         
         // Auto-rotate pages based on step count (changes every ~500 steps = ~5 seconds at 100 steps/sec)
-        var currentPage = (stats.CurrentStep / 1500) % totalPages;
+        var currentPage = (stats.CurrentStep / 4160) % totalPages;
         
         var pageSymbols = allSymbols
             .Skip(currentPage * SymbolsPerPage)

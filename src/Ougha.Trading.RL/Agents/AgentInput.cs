@@ -10,7 +10,7 @@ public record AgentInput
 
     public int SymbolId { get; init; }
 
-    public float[] TriggerContext { get; init; } = new float[5];
+    public float[] TriggerContext { get; init; } = new float[6];
 
     public float[] ConfluenceFeatures { get; init; } = new float[10];
 

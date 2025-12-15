@@ -27,6 +27,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor PricePrediction,
     private readonly Module<Tensor, Tensor> _cnnM15;
     private readonly Module<Tensor, Tensor> _cnnH1;
     private readonly Module<Tensor, Tensor> _cnnH4;
+    private readonly Module<Tensor, Tensor> _cnnD1;  // Daily timeframe encoder
 
     private readonly MultiheadAttention _tfAttention;
     private readonly LayerNorm _tfLayerNorm;
@@ -104,6 +105,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor PricePrediction,
         _cnnM15 = CreateTimeframeEncoder();
         _cnnH1 = CreateTimeframeEncoder();
         _cnnH4 = CreateTimeframeEncoder();
+        _cnnD1 = CreateTimeframeEncoder();  // Daily timeframe for swing context
 
         var attentionHeads = debugMode ? 2 : 4;
         _tfAttention = MultiheadAttention(_timeframeEmbedDim, attentionHeads, dropout: 0.1, bias: true, add_bias_kv: false, add_zero_attn: false, kdim: null, vdim: null);
@@ -113,7 +115,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor PricePrediction,
         _featureNet = Linear(_featureDim, featureOutDim);
         _featureLayerNorm = LayerNorm([featureOutDim]);
 
-        long inputDim = 5 * _timeframeEmbedDim + featureOutDim;
+        long inputDim = 6 * _timeframeEmbedDim + featureOutDim;  // 6 timeframes now
         
         // Shared body for feature extraction - reduced layers in debug mode
         var bodyLayers = debugMode ? 2 : 3;
@@ -255,16 +257,17 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor PricePrediction,
         var m15 = _cnnM15.forward(permuted.select(1, 2));
         var h1 = _cnnH1.forward(permuted.select(1, 3));
         var h4 = _cnnH4.forward(permuted.select(1, 4));
+        var d1 = _cnnD1.forward(permuted.select(1, 5));   // Daily timeframe
 
-        var tfStack = stack([m1, m5, m15, h1, h4], dim: 1);  // [B, 5, EmbedDim]
-        var tfSeq = tfStack.transpose(0, 1);  // [5, B, EmbedDim] for attention
+        var tfStack = stack([m1, m5, m15, h1, h4, d1], dim: 1);  // [B, 6, EmbedDim]
+        var tfSeq = tfStack.transpose(0, 1);  // [6, B, EmbedDim] for attention
 
         var (attended, _) = _tfAttention.forward(tfSeq, tfSeq, tfSeq, key_padding_mask: null, need_weights: false, attn_mask: null);
         attended = attended + tfSeq;
 
-        attended = attended.transpose(0, 1);  // [B, 5, EmbedDim]
+        attended = attended.transpose(0, 1);  // [B, 6, EmbedDim]
         attended = _tfLayerNorm.forward(attended.reshape(-1, _timeframeEmbedDim));
-        attended = attended.reshape(batchSize, 5, _timeframeEmbedDim);
+        attended = attended.reshape(batchSize, 6, _timeframeEmbedDim);
 
         var fusedTf = attended.flatten(1);
 
@@ -376,8 +379,8 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor PricePrediction,
         
         var batchSize = packedTf.shape[0];
         
-        // Single permute: [B, 5, W, F] -> [B, 5, F, W] for Conv1d
-        var permuted = packedTf.permute(0, 1, 3, 2).contiguous();  // [B, 5, F, W]
+        // Single permute: [B, 6, W, F] -> [B, 6, F, W] for Conv1d
+        var permuted = packedTf.permute(0, 1, 3, 2).contiguous();  // [B, 6, F, W]
         
         // Process each timeframe with its dedicated encoder
         var m1 = _cnnM1.forward(permuted.select(1, 0));   // [B, EmbedDim]
@@ -385,16 +388,17 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor PricePrediction,
         var m15 = _cnnM15.forward(permuted.select(1, 2));
         var h1 = _cnnH1.forward(permuted.select(1, 3));
         var h4 = _cnnH4.forward(permuted.select(1, 4));
+        var d1 = _cnnD1.forward(permuted.select(1, 5));   // Daily timeframe
 
-        var tfStack = stack([m1, m5, m15, h1, h4], dim: 1);  // [B, 5, EmbedDim]
-        var tfSeq = tfStack.transpose(0, 1);  // [5, B, EmbedDim] for attention
+        var tfStack = stack([m1, m5, m15, h1, h4, d1], dim: 1);  // [B, 6, EmbedDim]
+        var tfSeq = tfStack.transpose(0, 1);  // [6, B, EmbedDim] for attention
 
         var (attended, _) = _tfAttention.forward(tfSeq, tfSeq, tfSeq, key_padding_mask: null, need_weights: false, attn_mask: null);
         attended = attended + tfSeq;
 
-        attended = attended.transpose(0, 1);  // [B, 5, EmbedDim]
+        attended = attended.transpose(0, 1);  // [B, 6, EmbedDim]
         attended = _tfLayerNorm.forward(attended.reshape(-1, _timeframeEmbedDim));
-        attended = attended.reshape(batchSize, 5, _timeframeEmbedDim);
+        attended = attended.reshape(batchSize, 6, _timeframeEmbedDim);
 
         var fusedTf = attended.flatten(1);
 
@@ -461,7 +465,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor PricePrediction,
     /// Processes an entire sequence in a SINGLE forward pass using native LSTM sequence processing.
     /// This is O(1) forward passes instead of O(n) per sequence - major performance improvement.
     /// </summary>
-    /// <param name="packedTf">Packed timeframes [SeqLen, 5, W, F]</param>
+    /// <param name="packedTf">Packed timeframes [SeqLen, 6, W, F]</param>
     /// <param name="symbolIds">Symbol IDs [SeqLen, 1]</param>
     /// <param name="packedFeats">Packed features [SeqLen, FeatureCount]</param>
     /// <returns>PricePrediction, Values, SlMultiplier, CloseSignal for entire sequence</returns>
@@ -473,7 +477,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor PricePrediction,
         var seqLen = packedTf.shape[0];
         
         // Process all timesteps through the shared feature processing (CNN + attention)
-        // [SeqLen, 5, W, F] -> [SeqLen, 5, F, W] for Conv1d
+        // [SeqLen, 6, W, F] -> [SeqLen, 6, F, W] for Conv1d
         var permuted = packedTf.permute(0, 1, 3, 2).contiguous();
         
         // Process each timeframe with its dedicated encoder - works on full batch
@@ -482,18 +486,19 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor PricePrediction,
         var m15 = _cnnM15.forward(permuted.select(1, 2));
         var h1 = _cnnH1.forward(permuted.select(1, 3));
         var h4 = _cnnH4.forward(permuted.select(1, 4));
+        var d1 = _cnnD1.forward(permuted.select(1, 5));   // Daily timeframe
 
-        var tfStack = stack([m1, m5, m15, h1, h4], dim: 1);  // [SeqLen, 5, EmbedDim]
-        var tfSeq = tfStack.transpose(0, 1);  // [5, SeqLen, EmbedDim] for attention
+        var tfStack = stack([m1, m5, m15, h1, h4, d1], dim: 1);  // [SeqLen, 6, EmbedDim]
+        var tfSeq = tfStack.transpose(0, 1);  // [6, SeqLen, EmbedDim] for attention
 
         var (attended, _) = _tfAttention.forward(tfSeq, tfSeq, tfSeq, key_padding_mask: null, need_weights: false, attn_mask: null);
         attended = attended + tfSeq;
 
-        attended = attended.transpose(0, 1);  // [SeqLen, 5, EmbedDim]
+        attended = attended.transpose(0, 1);  // [SeqLen, 6, EmbedDim]
         attended = _tfLayerNorm.forward(attended.reshape(-1, _timeframeEmbedDim));
-        attended = attended.reshape(seqLen, 5, _timeframeEmbedDim);
+        attended = attended.reshape(seqLen, 6, _timeframeEmbedDim);
 
-        var fusedTf = attended.flatten(1);  // [SeqLen, 5*EmbedDim]
+        var fusedTf = attended.flatten(1);  // [SeqLen, 6*EmbedDim]
 
         var sym = symbolIds.to_type(ScalarType.Float32);
         var feats = cat([sym, packedFeats], dim: 1);
