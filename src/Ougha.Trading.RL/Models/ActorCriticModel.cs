@@ -543,6 +543,107 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor PricePrediction,
         
         return (pricePrediction, values, slMultiplier, closeSignal);
     }
+    
+    /// <summary>
+    /// OPTIMIZATION C1: Process multiple sequences in a SINGLE batched forward pass.
+    /// Concatenates all sequences, processes them together, then splits results.
+    /// Much more efficient than calling ForwardSequenceBatch repeatedly.
+    /// </summary>
+    /// <param name="sequences">Array of (packedTf, symbolIds, packedFeats) tuples, one per sequence</param>
+    /// <param name="sequenceLengths">Length of each sequence (for splitting output)</param>
+    /// <returns>Arrays of outputs, one per sequence</returns>
+    public (Tensor[] PricePredictions, Tensor[] Values, Tensor[] SlMultipliers, Tensor[] CloseSignals) ForwardMultiSequence(
+        (Tensor packedTf, Tensor symbolIds, Tensor packedFeats)[] sequences,
+        long[] sequenceLengths)
+    {
+        if (sequences.Length == 0)
+            return ([], [], [], []);
+        
+        if (sequences.Length == 1)
+        {
+            // Fast path for single sequence
+            var (pp, v, sl, cs) = ForwardSequenceBatch(sequences[0].packedTf, sequences[0].symbolIds, sequences[0].packedFeats);
+            return ([pp], [v], [sl], [cs]);
+        }
+        
+        // Concatenate all sequences along batch dimension
+        var allPackedTf = cat(sequences.Select(s => s.packedTf).ToArray(), dim: 0);
+        var allSymbolIds = cat(sequences.Select(s => s.symbolIds).ToArray(), dim: 0);
+        var allPackedFeats = cat(sequences.Select(s => s.packedFeats).ToArray(), dim: 0);
+        
+        var totalLen = allPackedTf.shape[0];
+        
+        // Process through feature extraction (CNN + attention) - all at once
+        var permuted = allPackedTf.permute(0, 1, 3, 2).contiguous();
+        
+        var m1 = _cnnM1.forward(permuted.select(1, 0));
+        var m5 = _cnnM5.forward(permuted.select(1, 1));
+        var m15 = _cnnM15.forward(permuted.select(1, 2));
+        var h1 = _cnnH1.forward(permuted.select(1, 3));
+        var h4 = _cnnH4.forward(permuted.select(1, 4));
+        var d1 = _cnnD1.forward(permuted.select(1, 5));
+
+        var tfStack = stack([m1, m5, m15, h1, h4, d1], dim: 1);
+        var tfSeq = tfStack.transpose(0, 1);
+
+        var (attended, _) = _tfAttention.forward(tfSeq, tfSeq, tfSeq, key_padding_mask: null, need_weights: false, attn_mask: null);
+        attended = attended + tfSeq;
+
+        attended = attended.transpose(0, 1);
+        attended = _tfLayerNorm.forward(attended.reshape(-1, _timeframeEmbedDim));
+        attended = attended.reshape(totalLen, 6, _timeframeEmbedDim);
+
+        var fusedTf = attended.flatten(1);
+
+        var sym = allSymbolIds.to_type(ScalarType.Float32);
+        var feats = cat([sym, allPackedFeats], dim: 1);
+        
+        if (feats.shape[1] < _featureDim)
+        {
+            var pad = zeros(new[] { feats.shape[0], _featureDim - feats.shape[1] }, device: feats.device);
+            feats = cat([feats, pad], dim: 1);
+        }
+        
+        var featEmbed = _featureNet.forward(feats);
+        featEmbed = _featureLayerNorm.forward(featEmbed);
+        featEmbed = functional.relu(featEmbed);
+
+        var combined = cat([fusedTf, featEmbed], dim: 1);
+        var hidden = _sharedBody.forward(combined);
+        
+        // LSTM: Process each sequence separately to maintain proper temporal memory
+        // Split hidden back into per-sequence tensors for LSTM processing
+        var hiddenList = hidden.split(sequenceLengths, dim: 0);
+        var lstmOutputs = new List<Tensor>();
+        
+        foreach (var seqHidden in hiddenList)
+        {
+            var lstmInput = seqHidden.unsqueeze(0);  // [1, SeqLen, HiddenDim]
+            var (lstmOut, _, _) = _temporalLstm.forward(lstmInput);
+            lstmOutputs.Add(lstmOut.squeeze(0));  // [SeqLen, LstmHiddenDim]
+        }
+        
+        // Concatenate LSTM outputs back together
+        var allLstmOut = cat(lstmOutputs.ToArray(), dim: 0);
+        allLstmOut = _lstmLayerNorm.forward(allLstmOut);
+        
+        // Apply heads to all outputs at once
+        var allPricePred = _pricePredictionHead.forward(allLstmOut) * 0.05f;
+        var allSlMult = _slHead.forward(allLstmOut);
+        var allCloseSignal = _closeHead.forward(allLstmOut);
+        
+        // Critic path
+        var valueHidden = _valueBody.forward(combined);
+        var allValues = _criticHead.forward(valueHidden);
+        
+        // Split outputs back into per-sequence tensors
+        var pricePreds = allPricePred.split(sequenceLengths, dim: 0);
+        var values = allValues.split(sequenceLengths, dim: 0);
+        var slMults = allSlMult.split(sequenceLengths, dim: 0);
+        var closeSignals = allCloseSignal.split(sequenceLengths, dim: 0);
+        
+        return (pricePreds, values, slMults, closeSignals);
+    }
 
     /// <summary>
     /// Reset the LSTM hidden state for a specific symbol.
