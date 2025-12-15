@@ -349,14 +349,24 @@ public static class TrainingRunner
                                 // Extract TP/SL multipliers from 2D array for training
                                 var tpMults = new float[stateInputs.Length];
                                 var slMults = new float[stateInputs.Length];
+                                var hindsightSlMults = new float[stateInputs.Length];
                                 for (var i = 0; i < stateInputs.Length; i++)
                                 {
                                     tpMults[i] = tpSlMults[i, 0];
                                     slMults[i] = tpSlMults[i, 1];
+                                    
+                                    // Get hindsight SL from environment (computed from MAE tracking)
+                                    // Only populated for symbols where a trade was closed
+                                    var symbol = symbols[i];
+                                    hindsightSlMults[i] = env.GetHindsightSlMultiplier(symbol);
+                                    
+                                    // Clear tracking after retrieving (ready for next trade)
+                                    if (hindsightSlMults[i] > 0)
+                                        env.ClearHindsightTracking(symbol);
                                 }
 
-                                // Add experience with accumulated M1 rewards and TP/SL multipliers
-                                agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs, tpMults, slMults);
+                                // Add experience with accumulated M1 rewards, hindsight SL, and position state
+                                agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs, tpMults, slMults, hindsightSlMults, currentPositions);
 
                                 for (var i = 0; i < stateInputs.Length; i++)
                                 {

@@ -16,6 +16,15 @@ public class PpoSequence
     public required float[] OldValues { get; init; }
     public required float[] TpMultipliers { get; init; }
     public required float[] SlMultipliers { get; init; }
+    /// <summary>
+    /// Hindsight SL multipliers computed after trade closes using MAE.
+    /// -1 = no hindsight data (trade didn't close). Use SlMultipliers as fallback.
+    /// </summary>
+    public required float[] HindsightSlMultipliers { get; init; }
+    /// <summary>
+    /// Whether agent had position at each timestep (for close signal training).
+    /// </summary>
+    public required bool[] HadPositions { get; init; }
     public required int EpisodeId { get; init; }
     public int Length => States.Length;
 }
@@ -86,6 +95,8 @@ internal class SequentialPpoDataset
                 var oldVals = new float[seqLen];
                 var tpMults = new float[seqLen];
                 var slMults = new float[seqLen];
+                var hindsightSlMults = new float[seqLen];
+                var hadPositions = new bool[seqLen];
                 
                 for (var j = 0; j < seqLen; j++)
                 {
@@ -98,6 +109,8 @@ internal class SequentialPpoDataset
                     oldVals[j] = oldValues[origIdx];
                     tpMults[j] = exp.TpMultiplier;
                     slMults[j] = exp.SlMultiplier;
+                    hindsightSlMults[j] = exp.HindsightSlMultiplier;
+                    hadPositions[j] = exp.HadPosition;
                 }
                 
                 sequences.Add(new PpoSequence
@@ -110,6 +123,8 @@ internal class SequentialPpoDataset
                     OldValues = oldVals,
                     TpMultipliers = tpMults,
                     SlMultipliers = slMults,
+                    HindsightSlMultipliers = hindsightSlMults,
+                    HadPositions = hadPositions,
                     EpisodeId = episodeGroup.Key
                 });
             }

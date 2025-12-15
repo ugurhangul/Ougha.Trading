@@ -5,15 +5,22 @@ using static TorchSharp.torch.nn;
 namespace Ougha.Trading.RL.Models;
 
 /// <summary>
-/// Actor-Critic Network for PPO.
+/// Actor-Critic Network for PPO with Price Prediction.
+/// Predicts price movement direction and magnitude, derives actions from predictions.
 /// Enhanced architecture: MLP+LayerNorm body, cross-timeframe attention,
 /// stateful LSTM temporal memory (persisted across timesteps), separate value body.
+/// 
+/// Outputs:
+/// - PricePrediction: Predicted % price change (Tanh * 5%)
+/// - SlMultiplier: ATR-based stop loss multiplier [0,1] -> [0.5, 3.0]
+/// - CloseSignal: When to exit position [0,1]
+/// - Value: State value for critic
 /// 
 /// Supports two modes:
 /// - Full mode (~10M params): For final training with good hyperparameters
 /// - Debug mode (~600K params): For fast hyperparameter tuning (16x faster)
 /// </summary>
-public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Tensor Value, Tensor TpSlParams)>
+public sealed class ActorCriticModel : Module<Tensor[], (Tensor PricePrediction, Tensor Value, Tensor SlMultiplier, Tensor CloseSignal)>
 {
     private readonly Module<Tensor, Tensor> _cnnM1;
     private readonly Module<Tensor, Tensor> _cnnM5;
@@ -40,9 +47,11 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     // Key: symbolId, Value: (h_n, c_n) hidden state tuple
     private readonly Dictionary<int, (Tensor h, Tensor c)> _lstmHiddenStates = new();
 
-    private readonly Sequential _actorHead;
-    private readonly Sequential _criticHead;
-    private readonly Sequential _tpSlHead;
+    // Price prediction heads - replaces discrete action approach
+    private readonly Sequential _pricePredictionHead;  // Predicts % price change
+    private readonly Sequential _slHead;               // SL ATR multiplier
+    private readonly Sequential _closeHead;            // Close signal
+    private readonly Sequential _criticHead;           // State value
 
     // Model dimensions - configurable based on debug mode
     private readonly int _timeframeEmbedDim;
@@ -142,12 +151,33 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
         }
         _valueBody = Sequential(valueModules);
 
-        _actorHead = Sequential(
+        // Price Prediction Head: predicts % price change
+        // Tanh * 0.05 = output range [-5%, +5%] covering most intraday moves
+        _pricePredictionHead = Sequential(
             Linear(_lstmHiddenDim, _headDim),
             LayerNorm([_headDim]),
             ReLU(),
             Dropout(dropout),
-            Linear(_headDim, numActions)
+            Linear(_headDim, 1),
+            Tanh()  // Bounded to [-1, 1], scaled by 0.05 in forward()
+        );
+
+        // SL Head: outputs SL ATR multiplier [0,1] -> mapped to [0.5, 3.0] ATR
+        _slHead = Sequential(
+            Linear(_lstmHiddenDim, _headDim),
+            LayerNorm([_headDim]),
+            ReLU(),
+            Linear(_headDim, 1),
+            Sigmoid()
+        );
+
+        // Close Head: signals when to exit position [0,1]
+        _closeHead = Sequential(
+            Linear(_lstmHiddenDim, _headDim),
+            LayerNorm([_headDim]),
+            ReLU(),
+            Linear(_headDim, 1),
+            Sigmoid()
         );
 
         // Critic head takes from separate value body
@@ -158,13 +188,6 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
             Linear(_headDim, 1)
         );
 
-        _tpSlHead = Sequential(
-            Linear(_lstmHiddenDim, _headDim),
-            LayerNorm([_headDim]),
-            ReLU(),
-            Linear(_headDim, 2),
-            Sigmoid()
-        );
         
         RegisterComponents();
 
@@ -185,10 +208,10 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
             }
         }
 
-        var actorParams = _actorHead.parameters().ToArray();
-        if (actorParams.Length > 0)
+        var pricePredParams = _pricePredictionHead.parameters().ToArray();
+        if (pricePredParams.Length > 0)
         {
-            var lastWeight = actorParams[^2];
+            var lastWeight = pricePredParams[^2];
             if (lastWeight.dim() >= 2)
             {
                 init.orthogonal_(lastWeight, gain: 0.01);
@@ -215,7 +238,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     /// The LSTM hidden states are persisted across forward calls for each symbol,
     /// allowing the network to learn temporal patterns across trading decisions.
     /// </summary>
-    public override (Tensor ActionLogits, Tensor Value, Tensor TpSlParams) forward(Tensor[] inputs)
+    public override (Tensor PricePrediction, Tensor Value, Tensor SlMultiplier, Tensor CloseSignal) forward(Tensor[] inputs)
     {
         var packedTf = inputs[0];  // [B, 5, W, F]
         var symbolId = inputs[1];  // [B, 1]
@@ -260,7 +283,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
 
         var combined = cat([fusedTf, featEmbed], dim: 1);
         
-        // Actor path: shared body -> LSTM -> actor head
+        // Actor path: shared body -> LSTM -> prediction heads
         var hidden = _sharedBody.forward(combined);
         
         // LSTM temporal processing with STATEFUL hidden states
@@ -319,14 +342,19 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
         
         hidden = _lstmLayerNorm.forward(hidden);
         
-        var actionLogits = _actorHead.forward(hidden);
-        var tpSl = _tpSlHead.forward(hidden);
+        // Price prediction head: Tanh output scaled to [-5%, +5%] range
+        var pricePredRaw = _pricePredictionHead.forward(hidden);  // [-1, 1]
+        var pricePrediction = pricePredRaw * 0.05f;  // [-0.05, 0.05] = [-5%, +5%]
+        
+        // SL and Close heads (already Sigmoid bounded [0, 1])
+        var slMultiplier = _slHead.forward(hidden);
+        var closeSignal = _closeHead.forward(hidden);
         
         // Critic path: separate value body -> critic head (reduces gradient interference)
         var valueHidden = _valueBody.forward(combined);
         var value = _criticHead.forward(valueHidden);
         
-        return (actionLogits, value, tpSl);
+        return (pricePrediction, value, slMultiplier, closeSignal);
     }
     
     /// <summary>
@@ -337,7 +365,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     /// <param name="h">Optional LSTM hidden state from previous timestep</param>
     /// <param name="c">Optional LSTM cell state from previous timestep</param>
     /// <returns>Outputs plus updated hidden state for next timestep</returns>
-    public (Tensor ActionLogits, Tensor Value, Tensor TpSlParams, Tensor H, Tensor C) ForwardWithState(
+    public (Tensor PricePrediction, Tensor Value, Tensor SlMultiplier, Tensor CloseSignal, Tensor H, Tensor C) ForwardWithState(
         Tensor[] inputs, 
         Tensor? h = null,
         Tensor? c = null)
@@ -385,7 +413,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
 
         var combined = cat([fusedTf, featEmbed], dim: 1);
         
-        // Actor path: shared body -> LSTM -> actor head
+        // Actor path: shared body -> LSTM -> prediction heads
         var hidden = _sharedBody.forward(combined);
         
         // LSTM temporal processing with EXPLICIT hidden state
@@ -413,14 +441,19 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
         
         hidden = _lstmLayerNorm.forward(hidden);
         
-        var actionLogits = _actorHead.forward(hidden);
-        var tpSl = _tpSlHead.forward(hidden);
+        // Price prediction head: Tanh output scaled to [-5%, +5%] range
+        var pricePredRaw = _pricePredictionHead.forward(hidden);  // [-1, 1]
+        var pricePrediction = pricePredRaw * 0.05f;  // [-0.05, 0.05] = [-5%, +5%]
+        
+        // SL and Close heads
+        var slMultiplier = _slHead.forward(hidden);
+        var closeSignal = _closeHead.forward(hidden);
         
         // Critic path: separate value body -> critic head
         var valueHidden = _valueBody.forward(combined);
         var value = _criticHead.forward(valueHidden);
         
-        return (actionLogits, value, tpSl, h_n, c_n);
+        return (pricePrediction, value, slMultiplier, closeSignal, h_n, c_n);
     }
     
     /// <summary>
@@ -431,8 +464,8 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
     /// <param name="packedTf">Packed timeframes [SeqLen, 5, W, F]</param>
     /// <param name="symbolIds">Symbol IDs [SeqLen, 1]</param>
     /// <param name="packedFeats">Packed features [SeqLen, FeatureCount]</param>
-    /// <returns>Logits, Values, TpSl for entire sequence</returns>
-    public (Tensor ActionLogits, Tensor Values, Tensor TpSlParams) ForwardSequenceBatch(
+    /// <returns>PricePrediction, Values, SlMultiplier, CloseSignal for entire sequence</returns>
+    public (Tensor PricePrediction, Tensor Values, Tensor SlMultiplier, Tensor CloseSignal) ForwardSequenceBatch(
         Tensor packedTf,
         Tensor symbolIds, 
         Tensor packedFeats)
@@ -477,7 +510,7 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
 
         var combined = cat([fusedTf, featEmbed], dim: 1);  // [SeqLen, InputDim]
         
-        // Actor path: shared body -> LSTM -> actor head
+        // Actor path: shared body -> LSTM -> prediction heads
         var hidden = _sharedBody.forward(combined);  // [SeqLen, HiddenDim]
         
         // KEY OPTIMIZATION: Use LSTM native sequence processing
@@ -491,14 +524,19 @@ public sealed class ActorCriticModel : Module<Tensor[], (Tensor ActionLogits, Te
         hidden = lstmOut.squeeze(0);
         hidden = _lstmLayerNorm.forward(hidden);
         
-        var actionLogits = _actorHead.forward(hidden);
-        var tpSl = _tpSlHead.forward(hidden);
+        // Price prediction head: Tanh output scaled to [-5%, +5%] range
+        var pricePredRaw = _pricePredictionHead.forward(hidden);  // [-1, 1]
+        var pricePrediction = pricePredRaw * 0.05f;  // [-0.05, 0.05] = [-5%, +5%]
+        
+        // SL and Close heads
+        var slMultiplier = _slHead.forward(hidden);
+        var closeSignal = _closeHead.forward(hidden);
         
         // Critic path: separate value body -> critic head
         var valueHidden = _valueBody.forward(combined);
         var values = _criticHead.forward(valueHidden);
         
-        return (actionLogits, values, tpSl);
+        return (pricePrediction, values, slMultiplier, closeSignal);
     }
 
     /// <summary>

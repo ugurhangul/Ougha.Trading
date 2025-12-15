@@ -46,6 +46,11 @@ public class PpoAgent : IAgent
     private const int WINDOW_SIZE = 20;
     private const int NUM_FEATURES = 45;
     private const int GAE_CHUNK_SIZE = 1024; // 4x larger for fewer forward passes
+    
+    // Price prediction thresholds (consistent across all methods)
+    private const float TRADE_THRESHOLD = 0.0005f;  // 0.05% minimum predicted move
+    private const float EXPLORATION_RATE = 0.15f;    // 15% random actions during training
+    private readonly Random _random = new();
     private readonly long[] _symbolBuffer = new long[MAX_INFERENCE_BATCH];
 
     private readonly float[]? _packedTfBuffer;
@@ -121,19 +126,45 @@ public class PpoAgent : IAgent
 
     public int Act(AgentInput input, bool training = true)
     {
+        // Epsilon-greedy exploration during training
+        if (training && _random.NextDouble() < EXPLORATION_RATE)
+        {
+            _lastLogProb = -1.0f;  // Mark as exploration action
+            return _random.Next(0, 4);  // Random action 0-3
+        }
+        
         _inferenceNet.eval();
         using (no_grad())
         {
             var tensors = PrepareInputTensors([input]);
-            var (logits, _, _) = _inferenceNet.forward(tensors);
+            var (pricePred, _, slMult, closeSignal) = _inferenceNet.forward(tensors);
             
-            var probs = nn.functional.softmax(logits, dim: 1);
-            var dist = distributions.Categorical(probs);
-            var action = dist.sample();
+            // Derive action from price prediction
+            var predValue = pricePred.item<float>();
+            var closeValue = closeSignal.item<float>();
             
-            _lastLogProb = dist.log_prob(action).item<float>();
+            int action;
+            if (closeValue > 0.5f)
+            {
+                action = 3;  // CLOSE
+            }
+            else if (predValue > TRADE_THRESHOLD)
+            {
+                action = 1;  // BUY (predicted UP)
+            }
+            else if (predValue < -TRADE_THRESHOLD)
+            {
+                action = 2;  // SELL (predicted DOWN)
+            }
+            else
+            {
+                action = 0;  // HOLD
+            }
             
-            return (int)action.item<long>();
+            // Store prediction magnitude as "log prob" (higher = more confident)
+            _lastLogProb = -Math.Abs(predValue);
+            
+            return action;
         }
     }
     
@@ -147,69 +178,70 @@ public class PpoAgent : IAgent
     {
         var count = inputs.Length;
         
+        var actions = new int[count];
+        var tpSlMults = new float[count, 2];
+        var logProbs = new float[count];
+        
         _inferenceNet.eval();
         using (no_grad())
         using (NewDisposeScope())
         {
             var tensors = PrepareInputTensors(inputs);
-            var (logits, _, tpSl) = _inferenceNet.forward(tensors);
+            var (pricePred, _, slMult, closeSignal) = _inferenceNet.forward(tensors);
 
-            // Sanitize logits to prevent NaN/Inf issues
-            var sanitizedLogits = nan_to_num(logits, nan: 0.0, posinf: 10.0, neginf: -10.0);
-            var clampedLogits = clamp(sanitizedLogits, -20.0f, 20.0f);
-            
-            // Apply action masking: mask CLOSE (action 3) when no position held
-            if (hasPositions != null)
-            {
-                // Create mask array: 0 for valid, large negative for invalid CLOSE actions
-                var maskArray = new float[count];
-                for (var i = 0; i < count; i++)
-                {
-                    if (!hasPositions[i])
-                    {
-                        maskArray[i] = -1e10f;  // Makes CLOSE probability ~0
-                    }
-                }
-                // Create tensor on correct device and add to CLOSE column
-                using var maskTensor = tensor(maskArray, device: _device);
-                var closeColumn = clampedLogits.narrow(1, 3, 1).squeeze(1);  // Get column 3
-                closeColumn.add_(maskTensor);  // In-place add
-            }
-
-            // Use logits-based Categorical (more numerically stable than probs-based)
-            var dist = distributions.Categorical(logits: clampedLogits);
-            
-            // Track actual policy entropy (not the coefficient)
-            _lastPolicyEntropy = dist.entropy().mean().item<float>();
-            
-            // Use sample() with explicit fallback for edge cases
-            Tensor actionsTensor;
-            try
-            {
-                actionsTensor = dist.sample();
-            }
-            catch
-            {
-                actionsTensor = clampedLogits.argmax(dim: 1);
-            }
-            var logProbsTensor = dist.log_prob(actionsTensor);
-
-            // Copy data to managed arrays before tensors are disposed
-            var actions = new int[count];
-            var tpSlMults = new float[count, 2];
-            var logProbs = new float[count];
-            
-            var actionsData = actionsTensor.cpu().data<long>().ToArray();
-            var logProbsData = logProbsTensor.cpu().data<float>().ToArray();
-            var tpSlData = tpSl.cpu().data<float>().ToArray();
+            // Extract predictions to CPU
+            var predData = pricePred.cpu().data<float>().ToArray();
+            var slData = slMult.cpu().data<float>().ToArray();
+            var closeData = closeSignal.cpu().data<float>().ToArray();
             
             for (var i = 0; i < count; i++)
             {
-                actions[i] = (int)actionsData[i];
-                logProbs[i] = logProbsData[i];
-                tpSlMults[i, 0] = tpSlData[i * 2];
-                tpSlMults[i, 1] = tpSlData[i * 2 + 1];
+                var predValue = predData[i];
+                var closeValue = closeData[i];
+                var hasPosition = hasPositions?[i] ?? false;
+                
+                int action;
+                
+                // Epsilon-greedy exploration during training
+                if (training && _random.NextDouble() < EXPLORATION_RATE)
+                {
+                    action = _random.Next(0, 4);  // Random action
+                    logProbs[i] = -1.0f;  // Mark as exploration
+                }
+                else
+                {
+                    // Derive action from prediction using consistent threshold
+                    if (hasPosition && closeValue > 0.5f)
+                    {
+                        action = 3;  // CLOSE signal when holding
+                    }
+                    else if (predValue > TRADE_THRESHOLD)
+                    {
+                        action = 1;  // BUY (predicted UP)
+                    }
+                    else if (predValue < -TRADE_THRESHOLD)
+                    {
+                        action = 2;  // SELL (predicted DOWN)
+                    }
+                    else
+                    {
+                        action = 0;  // HOLD
+                    }
+                    
+                    // Log prob based on prediction magnitude
+                    logProbs[i] = -Math.Abs(predValue);
+                }
+                
+                actions[i] = action;
+                
+                // TP multiplier: minimum 0.3 to ensure meaningful TP distance
+                var tpMult = (float)Math.Max(0.3, Math.Min(1.0, Math.Abs(predData[i]) / 0.03));
+                tpSlMults[i, 0] = tpMult;
+                tpSlMults[i, 1] = Math.Max(0.3f, slData[i]);  // Minimum SL multiplier too
             }
+            
+            // Track prediction variance for diagnostics
+            _lastPolicyEntropy = (float)predData.Select(p => Math.Abs(p)).Average();
             
             // Explicitly dispose tensors
             foreach (var t in tensors) t.Dispose();
@@ -261,7 +293,9 @@ public class PpoAgent : IAgent
         bool[] dones,
         float[] logProbs,
         float[] tpMultipliers,
-        float[] slMultipliers)
+        float[] slMultipliers,
+        float[]? hindsightSlMultipliers = null,
+        bool[]? hadPositions = null)
     {
         var count = states.Length;
         var usePreallocated = count <= MAX_INFERENCE_BATCH;
@@ -282,6 +316,8 @@ public class PpoAgent : IAgent
                 LogProb = logProbs[i],
                 TpMultiplier = tpMultipliers[i],
                 SlMultiplier = slMultipliers[i],
+                HindsightSlMultiplier = hindsightSlMultipliers?[i] ?? -1f,
+                HadPosition = hadPositions?[i] ?? false,
                 EpisodeId = _rolloutBuffer.CurrentEpisodeId,
                 SequenceIndex = seqIdx,
                 SymbolIdx = states[i].SymbolId  // Use actual symbol ID, not loop index
@@ -379,52 +415,93 @@ public class PpoAgent : IAgent
                             var returnsArr = tensor(sequence.Returns, dtype: ScalarType.Float32, device: _device);
                             var advantagesArr = tensor(sequence.Advantages, dtype: ScalarType.Float32, device: _device);
                             var seqOldValues = tensor(sequence.OldValues, dtype: ScalarType.Float32, device: _device);
-                            var targetTpMults = tensor(sequence.TpMultipliers, dtype: ScalarType.Float32, device: _device);
-                            var targetSlMults = tensor(sequence.SlMultipliers, dtype: ScalarType.Float32, device: _device);
+                            // Note: TpMultipliers not currently used for learning (formula-based)
                             
                             // Normalize advantages for this sequence
                             var normalizedAdvs = (advantagesArr - advantagesArr.mean()) / (advantagesArr.std() + 1e-8f);
                             
                             // OPTIMIZED: Process entire sequence in ONE forward pass
-                            // Uses ForwardSequenceBatch which processes [SeqLen, ...] tensors natively
                             var stateTensors = PrepareInputTensors(sequence.States);
                             
-                            var (logitsTensor, valuesTensor, tpSlTensor) = _model.ForwardSequenceBatch(
+                            var (pricePred, valuesTensor, slPred, closePred) = _model.ForwardSequenceBatch(
                                 stateTensors[0], stateTensors[1], stateTensors[2]);
                             
                             // Clean up input tensors
                             foreach (var st in stateTensors) st.Dispose();
                             
-                            var probs = nn.functional.softmax(logitsTensor, dim: 1);
-                            var dist = distributions.Categorical(probs);
-                            var newLogProbs = dist.log_prob(actions);
-                            var entropy = dist.entropy().mean();
+                            // Price Prediction Loss: train toward direction based on ACTUAL ACTION + outcome
+                            // BUY (action=1) with positive advantage → target +1%
+                            // BUY (action=1) with negative advantage → target -1% (should have done opposite)
+                            // SELL (action=2) with positive advantage → target -1% (prediction should be negative)
+                            // SELL (action=2) with negative advantage → target +1%
+                            // HOLD/CLOSE → target 0 (no directional signal)
+                            var predSqueezed = pricePred.squeeze();
                             
-                            var ratio = (newLogProbs - oldLogProbs).exp();
-                            var surr1 = ratio * normalizedAdvs;
-                            var surr2 = clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * normalizedAdvs;
-                            var actorLoss = -min(surr1, surr2).mean();
+                            // Action direction: +1 for BUY, -1 for SELL, 0 for HOLD/CLOSE
+                            var buyMask = (actions == 1).to_type(ScalarType.Float32);
+                            var sellMask = (actions == 2).to_type(ScalarType.Float32);
+                            var actionDirection = buyMask - sellMask;  // +1, -1, or 0
+                            
+                            // If advantage positive, reinforce the action direction
+                            // If advantage negative, train toward opposite direction
+                            var targetPred = actionDirection * normalizedAdvs.sign() * 0.01f;
+                            
+                            // Only weight loss for trade actions (not HOLD/CLOSE)
+                            var tradeMaskPred = (buyMask + sellMask);  // 1 for trades, 0 for HOLD/CLOSE
+                            var predError = (predSqueezed - targetPred).pow(2) * (normalizedAdvs.abs() + 0.1f);
+                            var predictionLoss = (predError * tradeMaskPred).sum() / (tradeMaskPred.sum() + 1e-8f);
 
+                            // Value loss (unchanged)
                             var valuesSqueezed = valuesTensor.squeeze();
                             var valueClipped = seqOldValues + clamp(valuesSqueezed - seqOldValues, -_clipEpsilon, _clipEpsilon);
                             var valueLoss1 = (valuesSqueezed - returnsArr).pow(2);
                             var valueLoss2 = (valueClipped - returnsArr).pow(2);
                             var valueLoss = 0.5f * max(valueLoss1, valueLoss2).mean();
                             
-                            // TP/SL loss - train on ALL trades (not just positive advantage)
-                            var predTp = tpSlTensor.select(1, 0);
-                            var predSl = tpSlTensor.select(1, 1);
+                            // SL loss: learn optimal SL multiplier from HINDSIGHT targets
+                            // Use hindsight SL when available (>0), otherwise fallback to stored prediction
+                            var hindsightSl = sequence.HindsightSlMultipliers;
+                            var targetSl = new float[sequence.Length];
+                            var hasHindsight = new float[sequence.Length];
+                            for (var k = 0; k < sequence.Length; k++)
+                            {
+                                if (hindsightSl[k] > 0f)
+                                {
+                                    targetSl[k] = hindsightSl[k];
+                                    hasHindsight[k] = 1f;
+                                }
+                                else
+                                {
+                                    targetSl[k] = sequence.SlMultipliers[k];
+                                    hasHindsight[k] = 0f;
+                                }
+                            }
+                            var targetSlTensor = tensor(targetSl, dtype: ScalarType.Float32, device: _device);
+                            var hasHindsightTensor = tensor(hasHindsight, dtype: ScalarType.Float32, device: _device);
+                            
+                            var slSqueezed = slPred.squeeze();
                             var tradeMask = (actions != 0).to_type(ScalarType.Float32);
                             
-                            var tpError = (predTp - targetTpMults).pow(2) * tradeMask;
-                            var slError = (predSl - targetSlMults).pow(2) * tradeMask;
-                            var tpSlLoss = (tpError.sum() + slError.sum()) / (tradeMask.sum() + 1e-8f);
+                            // Weight SL loss: 3x weight for experiences with hindsight targets
+                            var slWeights = hasHindsightTensor * 2f + 1f;  // 1.0 normal, 3.0 hindsight
+                            var slError = (slSqueezed - targetSlTensor).pow(2) * tradeMask * slWeights;
+                            var slLoss = slError.sum() / (tradeMask.sum() + 1e-8f);
                             
-                            var loss = actorLoss + _valueCoef * valueLoss + _tpSlCoef * tpSlLoss - _entropyCoef * entropy;
+                            // Close signal loss: only train when agent HAD a position
+                            var closeSqueezed = closePred.squeeze();
+                            var closeTarget = (actions == 3).to_type(ScalarType.Float32);
+                            var hadPosMask = tensor(sequence.HadPositions.Select(p => p ? 1f : 0f).ToArray(), ScalarType.Float32, _device);
+                            var closeError = (closeSqueezed - closeTarget).pow(2) * hadPosMask;
+                            var closeLoss = closeError.sum() / (hadPosMask.sum() + 1e-8f);
                             
-                            // Proper approximate KL divergence: 0.5 * E[(log π_old - log π_new)^2]
-                            var approxKl = 0.5f * (oldLogProbs - newLogProbs).pow(2).mean().item<float>();
-                            _lastKlDivergence = approxKl;
+                            // Exploration bonus: encourage diverse predictions
+                            var predVariance = predSqueezed.var();
+                            var explorationBonus = predVariance;  // Higher variance = more exploration
+                            
+                            var loss = predictionLoss + _valueCoef * valueLoss + _tpSlCoef * (slLoss + closeLoss) - _entropyCoef * explorationBonus;
+                            
+                            // Track metrics (predictionLoss used for training diagnostics)
+                            _lastKlDivergence = predictionLoss.item<float>();  // Approximate: higher = worse
                             _lastValueLoss = valueLoss.item<float>();
                             
                             _optimizer.zero_grad();
@@ -469,11 +546,11 @@ public class PpoAgent : IAgent
         {
             var allStateTensors = PrepareInputTensors(dataset.States);
             var allActions = tensor(dataset.Actions, dtype: ScalarType.Int64, device: _device);
-            var allLogProbs = tensor(dataset.LogProbs, dtype: ScalarType.Float32, device: _device);
             var allReturns = tensor(dataset.Returns, dtype: ScalarType.Float32, device: _device);
             var allAdvantages = tensor(dataset.Advantages, dtype: ScalarType.Float32, device: _device);
-            var allTpMults = tensor(dataset.TpMultipliers, dtype: ScalarType.Float32, device: _device);
             var allSlMults = tensor(dataset.SlMultipliers, dtype: ScalarType.Float32, device: _device);
+            var allHindsightSl = tensor(dataset.HindsightSlMultipliers, dtype: ScalarType.Float32, device: _device);
+            var allHadPositions = tensor(dataset.HadPositions.Select(p => p ? 1f : 0f).ToArray(), ScalarType.Float32, _device);
             var allOldValues = tensor(dataset.OldValues, dtype: ScalarType.Float32, device: _device);
 
             for (var epoch = 0; epoch < _updateEpochs; epoch++)
@@ -489,26 +566,26 @@ public class PpoAgent : IAgent
                             stateTensors[t] = allStateTensors[t].index_select(0, batchIndices);
                         
                         var actions = allActions.index_select(0, batchIndices);
-                        var oldLogProbs = allLogProbs.index_select(0, batchIndices);
                         var returnsTensor = allReturns.index_select(0, batchIndices);
                         var advs = allAdvantages.index_select(0, batchIndices);
-                        var targetTpMults = allTpMults.index_select(0, batchIndices);
-                        var targetSlMults = allSlMults.index_select(0, batchIndices);
+                        var slMultsBatch = allSlMults.index_select(0, batchIndices);
+                        var hindsightSlBatch = allHindsightSl.index_select(0, batchIndices);
+                        var hadPosMask = allHadPositions.index_select(0, batchIndices);
                         var oldValuesBatch = allOldValues.index_select(0, batchIndices);
 
                         var normalizedAdvs = (advs - advs.mean()) / (advs.std() + 1e-8f);
                         
-                        var (logits, values, tpSlPred) = _model.forward(stateTensors);
+                        var (pricePred, values, slPred, closePred) = _model.forward(stateTensors);
 
-                        var probs = nn.functional.softmax(logits, dim: 1);
-                        var dist = distributions.Categorical(probs);
-                        var newLogProbs = dist.log_prob(actions);
-                        var entropy = dist.entropy().mean();
-                        
-                        var ratio = (newLogProbs - oldLogProbs).exp();
-                        var surr1 = ratio * normalizedAdvs;
-                        var surr2 = clamp(ratio, 1.0f - _clipEpsilon, 1.0f + _clipEpsilon) * normalizedAdvs;
-                        var actorLoss = -min(surr1, surr2).mean();
+                        // Price Prediction Loss: action-aware (same as sequence-based)
+                        var predSqueezed = pricePred.squeeze();
+                        var buyMask = (actions == 1).to_type(ScalarType.Float32);
+                        var sellMask = (actions == 2).to_type(ScalarType.Float32);
+                        var actionDirection = buyMask - sellMask;
+                        var targetPred = actionDirection * normalizedAdvs.sign() * 0.01f;
+                        var tradeMaskPred = buyMask + sellMask;
+                        var predError = (predSqueezed - targetPred).pow(2) * (normalizedAdvs.abs() + 0.1f);
+                        var predictionLoss = (predError * tradeMaskPred).sum() / (tradeMaskPred.sum() + 1e-8f);
 
                         var valuesSqueezed = values.squeeze();
                         var valueClipped = oldValuesBatch + clamp(valuesSqueezed - oldValuesBatch, -_clipEpsilon, _clipEpsilon);
@@ -516,21 +593,27 @@ public class PpoAgent : IAgent
                         var valueLoss2 = (valueClipped - returnsTensor).pow(2);
                         var valueLoss = 0.5f * max(valueLoss1, valueLoss2).mean();
                         
-                        // TP/SL loss - train on ALL trades (not just positive advantage)
-                        var predTp = tpSlPred.select(1, 0);
-                        var predSl = tpSlPred.select(1, 1);
-                        
+                        // SL loss with HINDSIGHT targets (same as sequence-based)
+                        var slSqueezed = slPred.squeeze();
                         var tradeMask = (actions != 0).to_type(ScalarType.Float32);
+                        var hasHindsight = (hindsightSlBatch > 0).to_type(ScalarType.Float32);
+                        var targetSl = where(hindsightSlBatch > 0, hindsightSlBatch, slMultsBatch);
+                        var slWeights = hasHindsight * 2f + 1f;
+                        var slError = (slSqueezed - targetSl).pow(2) * tradeMask * slWeights;
+                        var slLoss = slError.sum() / (tradeMask.sum() + 1e-8f);
                         
-                        var tpError = (predTp - targetTpMults).pow(2) * tradeMask;
-                        var slError = (predSl - targetSlMults).pow(2) * tradeMask;
-                        var tpSlLoss = (tpError.sum() + slError.sum()) / (tradeMask.sum() + 1e-8f);
+                        // Close signal loss: only train when agent HAD a position
+                        var closeSqueezed = closePred.squeeze();
+                        var closeTarget = (actions == 3).to_type(ScalarType.Float32);
+                        var closeError = (closeSqueezed - closeTarget).pow(2) * hadPosMask;
+                        var closeLoss = closeError.sum() / (hadPosMask.sum() + 1e-8f);
                         
-                        var loss = actorLoss + _valueCoef * valueLoss + _tpSlCoef * tpSlLoss - _entropyCoef * entropy;
+                        // Exploration bonus
+                        var predVariance = predSqueezed.var();
                         
-                        // Proper approximate KL divergence (same as sequence training)
-                        var approxKl = 0.5f * (oldLogProbs - newLogProbs).pow(2).mean().item<float>();
-                        _lastKlDivergence = approxKl;
+                        var loss = predictionLoss + _valueCoef * valueLoss + _tpSlCoef * (slLoss + closeLoss) - _entropyCoef * predVariance;
+                        
+                        _lastKlDivergence = predictionLoss.item<float>();
                         _lastValueLoss = valueLoss.item<float>();
                         
                         _optimizer.zero_grad();
@@ -589,7 +672,7 @@ public class PpoAgent : IAgent
                     }
                     
                     var tensors = PrepareInputTensors(chunk);
-                    var (_, v, _) = _model.forward(tensors);
+                    var (_, v, _, _) = _model.forward(tensors);
                     // Squeeze on GPU first, then transfer once
                     var vSqueezeData = v.squeeze().cpu().data<float>().ToArray();
                     Array.Copy(vSqueezeData, 0, values, i, len);
@@ -604,7 +687,7 @@ public class PpoAgent : IAgent
                 using (NewDisposeScope())
                 {
                     var tensors = PrepareInputTensors([rollouts[T - 1].NextState!]);
-                    var (_, v, _) = _model.forward(tensors);
+                    var (_, v, _, _) = _model.forward(tensors);
                     values[T] = v.item<float>();
                     foreach (var t in tensors) t.Dispose();
                 }

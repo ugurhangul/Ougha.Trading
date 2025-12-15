@@ -3,21 +3,17 @@ using Ougha.Trading.Core.Models;
 namespace Ougha.Trading.RL;
 
 /// <summary>
-/// Improved reward calculator with volatility normalization and balanced scaling.
-/// Designed for multi-symbol RL trading with stable learning signals.
+/// Simplified reward calculator for price prediction strategy.
+/// Components: R-multiple (primary), MDD penalty (risk), prediction accuracy (optional).
 /// </summary>
 public class RewardCalculator
 {
     private readonly RewardConfig _config;
     private readonly EpisodeMetrics _episodeMetrics;
     
-    // Per-symbol state tracking (CRITICAL: must not share state across symbols)
-    private readonly Dictionary<string, double> _previousUnrealizedPnlBySymbol = new();
-    private readonly Dictionary<string, double> _previousEquityBySymbol = new();
-    private readonly Dictionary<string, double> _flatStartPriceBySymbol = new();
-    private readonly Dictionary<string, int> _flatTicksBySymbol = new();
-    private readonly Dictionary<string, double> _flatPreviousPriceBySymbol = new();
-    private readonly Dictionary<string, int> _flatDirectionTicksBySymbol = new();
+    // Prediction tracking for accuracy reward
+    private readonly Dictionary<string, float> _entryPredictionBySymbol = new();
+    private readonly Dictionary<string, double> _entryPriceBySymbol = new();
 
     public RewardCalculator(RewardConfig? config = null)
     {
@@ -33,390 +29,164 @@ public class RewardCalculator
     public void ResetEpisode()
     {
         _episodeMetrics.Reset();
-        _previousUnrealizedPnlBySymbol.Clear();
-        _previousEquityBySymbol.Clear();
-        _flatStartPriceBySymbol.Clear();
-        _flatTicksBySymbol.Clear();
-        _flatPreviousPriceBySymbol.Clear();
-        _flatDirectionTicksBySymbol.Clear();
+        _entryPredictionBySymbol.Clear();
+        _entryPriceBySymbol.Clear();
     }
 
     /// <summary>
-    /// Calculate PF and Sharpe based reward bonus.
+    /// Store prediction at trade entry for accuracy calculation on close.
     /// </summary>
-    private float CalculatePfSharpeReward()
+    public void RecordEntryPrediction(string symbol, float prediction, double entryPrice)
     {
-        var reward = 0f;
-
-        if (_episodeMetrics.TradeCount >= _config.MinTradesForPf)
-        {
-            var pf = _episodeMetrics.CalculateProfitFactor();
-            var pfCapped = Math.Min(pf, _config.PfCap);
-
-            if (pfCapped >= _config.MinPfThreshold)
-            {
-                // Progressive reward: more PF = more reward
-                reward += (float)(pfCapped - 1.0) * _config.ProfitFactorWeight;
-            }
-            else if (pfCapped < 1.0)
-            {
-                // Below breakeven gets penalty
-                reward -= (float)(1.0 - pfCapped) * _config.ProfitFactorWeight;
-            }
-        }
-
-        if (_episodeMetrics.TradeCount >= _config.MinTradesForSharpe)
-        {
-            var sharpe = _episodeMetrics.CalculateSharpeRatio(_config.AnnualizationFactor);
-            var sharpeCapped = Math.Clamp(sharpe, -_config.SharpeCap, _config.SharpeCap);
-            
-            // Linear reward/penalty based on Sharpe
-            reward += (float)sharpeCapped * _config.SharpeRatioWeight;
-        }
-
-        return reward;
+        _entryPredictionBySymbol[symbol] = prediction;
+        _entryPriceBySymbol[symbol] = entryPrice;
     }
 
     /// <summary>
-    /// Calculate MDD penalty with progressive scaling.
+    /// Simplified reward calculation for price prediction strategy.
     /// </summary>
-    private float CalculateMddPenalty(double mddPercent)
-    {
-        if (mddPercent <= _config.MddThreshold)
-            return 0f;
-
-        // Progressive penalty: exponential beyond threshold
-        var excessMdd = mddPercent - _config.MddThreshold;
-        var penalty = (float)(excessMdd * excessMdd * _config.MddPenaltyWeight / 100.0 * _config.MddPenaltyScale);
-        return penalty;
-    }
-
-    // NOTE: Per-symbol state is now tracked in dictionaries above
-    
-    /// <summary>
-    /// Calculate reward with optional ATR-based volatility normalization.
-    /// </summary>
+    /// <param name="symbol">Symbol for per-symbol tracking</param>
     /// <param name="tradeClosed">Whether a trade was closed this tick</param>
     /// <param name="tradeProfit">Profit from closed trade (absolute)</param>
-    /// <param name="holdingTicks">How long the position was held</param>
     /// <param name="hasPosition">Whether currently holding a position</param>
     /// <param name="unrealizedPnl">Current unrealized PnL percentage</param>
-    /// <param name="peakUnrealizedPnl">Peak unrealized PnL this trade</param>
-    /// <param name="initialBalance">Starting balance for episode</param>
     /// <param name="maxDrawdownPct">Current max drawdown percentage</param>
-    /// <param name="currentEquity">Current equity</param>
-    /// <param name="positionDirection">1=long, -1=short, 0=flat</param>
-    /// <param name="priceChange">Price change since last tick</param>
-    /// <param name="symbolAtr">ATR for volatility normalization (optional)</param>
-    /// <param name="slDistance">Stop loss distance for R:R calculation (optional)</param>
-    /// <param name="symbolInfo">Symbol info for point-based normalization (optional)</param>
-    /// <param name="currentPrice">Current symbol price for opportunity cost calculation</param>
+    /// <param name="slDistance">Stop loss distance for R:R calculation</param>
+    /// <param name="symbolInfo">Symbol info for point-based normalization</param>
+    /// <param name="volume">Position volume for R-multiple calculation</param>
+    /// <param name="closePrice">Close price for prediction accuracy</param>
+    /// <param name="closeReason">How the trade was closed (Manual, TP, SL)</param>
     public float Calculate(
-        string symbol,  // CRITICAL: Must be passed for per-symbol state tracking
+        string symbol,
         bool tradeClosed,
         double tradeProfit,
-        int holdingTicks,
         bool hasPosition,
         double unrealizedPnl,
-        double peakUnrealizedPnl,
-        double initialBalance,
         double maxDrawdownPct,
-        double currentEquity = 0, 
-        int positionDirection = 0, 
-        double priceChange = 0,
-        double symbolAtr = 0,
         double slDistance = 0,
         SymbolInfo? symbolInfo = null,
-        double currentPrice = 0,
-        double volume = 0)  // Position volume for R-multiple calculation
+        double volume = 0,
+        double closePrice = 0,
+        CloseReason closeReason = CloseReason.Unknown)
     {
         var reward = 0f;
 
         if (tradeClosed)
         {
             _episodeMetrics.UpdateTrade(tradeProfit);
-        }
-
-        var mddPenalty = CalculateMddPenalty(maxDrawdownPct);
-
-        if (tradeClosed)
-        {
-            reward += CalculateClosedTradeReward(tradeProfit, holdingTicks, slDistance, symbolInfo, volume);
-            reward += CalculatePfSharpeReward();
-            reward -= mddPenalty;
+            
+            // 1. R-MULTIPLE: Primary reward signal (symbol-agnostic)
+            reward += CalculateRMultipleReward(tradeProfit, slDistance, symbolInfo, volume);
+            
+            // 2. PREDICTION ACCURACY: Reward for correct price direction prediction
+            reward += CalculatePredictionAccuracyReward(symbol, closePrice, tradeProfit);
+            
+            // 3. CLOSE BONUS: Only for manual close actions (not SL/TP)
+            if (closeReason == CloseReason.Manual && tradeProfit > 0)
+            {
+                reward += _config.ManualCloseBonus;
+            }
+            
+            // Clear entry tracking
+            _entryPredictionBySymbol.Remove(symbol);
+            _entryPriceBySymbol.Remove(symbol);
         }
         else if (hasPosition)
         {
-            reward += CalculateOpenPositionReward(
-                symbol, unrealizedPnl, peakUnrealizedPnl, initialBalance, 
-                currentEquity, positionDirection, priceChange, holdingTicks, symbolAtr);
-            reward -= mddPenalty;
+            // Minimal shaping: just sign of unrealized PnL
+            // This provides directional feedback without overwhelming R-multiple signal
+            reward = (float)(Math.Sign(unrealizedPnl) * _config.PositionHoldingSignal);
         }
-        else
+        // No penalty for flat periods - prediction model learns when to enter
+        
+        // 4. MDD PENALTY: Risk constraint (applied to all states)
+        if (maxDrawdownPct > _config.MddThreshold)
         {
-            // Opportunity cost model: only penalize if good setup was missed
-            if (_config.UseOpportunityCostModel && symbolAtr > 0)
-            {
-                var symbolPoint = symbolInfo?.Point ?? 0.00001;
-                // Use actual price, not equity, for opportunity cost tracking
-                reward -= CalculateOpportunityCostPenalty(symbol, currentPrice > 0 ? currentPrice : 1.0, symbolAtr, symbolPoint);
-            }
-            else
-            {
-                reward -= _config.FlatPenalty;
-            }
-            // Removed MDD penalty for flat periods - don't penalize agent for past losses when not trading
-            _previousUnrealizedPnlBySymbol[symbol] = 0;
+            var excessMdd = maxDrawdownPct - _config.MddThreshold;
+            reward -= (float)(excessMdd * excessMdd * _config.MddPenaltyWeight / 100.0);
         }
 
-        // Normalize reward for stable learning
+        // Optional normalization
         if (_config.NormalizeRewards)
         {
-            reward = NormalizeReward(reward);
+            reward = (float)Math.Tanh(reward / _config.RewardNormalizationScale);
         }
 
         return reward;
     }
 
     /// <summary>
-    /// Calculate reward component for a closed trade.
+    /// Calculate R-multiple based reward (primary signal).
+    /// R-multiple = profit / risk taken - same 2R win means same reward for any symbol.
     /// </summary>
-    private float CalculateClosedTradeReward(
+    private float CalculateRMultipleReward(
         double tradeProfit, 
-        int holdingTicks, 
         double slDistance,
         SymbolInfo? symbolInfo,
         double volume)
     {
-        var reward = 0f;
-        
-        // Early close penalty
-        if (holdingTicks < _config.MinHoldingTicks)
-        {
-            var earlyFactor = 1.0f - ((float)holdingTicks / _config.MinHoldingTicks);
-            reward -= _config.EarlyClosePenalty * earlyFactor;
-        }
-
-        // Profit-based reward using R-multiple (symbol-agnostic)
-        // R-multiple = profit / risk taken - same 2R win means same reward for any symbol
         if (slDistance > 0 && symbolInfo != null && volume > 0)
         {
             // Calculate ACTUAL risk using symbol-specific values
-            // Risk = (SL distance in points) * TickValue * Volume
             var slPoints = slDistance / symbolInfo.Point;
             var riskInDollars = slPoints * symbolInfo.TickValue * volume;
             
             if (riskInDollars > 0)
             {
                 var rMultiple = (float)(tradeProfit / riskInDollars);
-                // Primary reward signal - clamped to prevent extreme values
-                reward += Math.Clamp(rMultiple, -3f, 5f) * _config.RiskRewardScale;
+                // Clamp to prevent extreme values
+                return Math.Clamp(rMultiple, -3f, 5f) * _config.RMultipleScale;
             }
         }
-        else
-        {
-            // Fallback: use profit directly with modest scaling
-            // This ensures we still get signal even without SL data
-            reward += Math.Clamp((float)tradeProfit * 0.1f, -2f, 3f) * _config.RiskRewardScale;
-        }
-
-        // Win/loss bonus (symmetric)
-        if (tradeProfit > 0)
-        {
-            reward += _config.WinBonus;
-            
-            // Quick profit bonus
-            if (holdingTicks >= _config.MinHoldingTicks && holdingTicks < _config.QuickProfitTicks)
-            {
-                var quickFactor = 1.0f - ((float)(holdingTicks - _config.MinHoldingTicks) / 
-                    (_config.QuickProfitTicks - _config.MinHoldingTicks));
-                reward += _config.QuickProfitBonus * quickFactor;
-            }
-        }
-        else
-        {
-            reward -= _config.LossPenalty;
-        }
-
-        return reward;
+        
+        // Fallback: use raw profit with modest scaling
+        return Math.Clamp((float)tradeProfit * 0.1f, -2f, 3f) * _config.RMultipleScale;
     }
 
     /// <summary>
-    /// Calculate reward component for an open position (shaping signal).
-    /// Designed to let agent EXPLORE holding - longer profitable holds = more cumulative reward.
-    /// Price changes are normalized by ATR for fair multi-symbol comparison.
+    /// Calculate prediction accuracy reward.
+    /// Compares predicted price direction with actual price movement.
     /// </summary>
-    private float CalculateOpenPositionReward(
-        string symbol,
-        double unrealizedPnl,
-        double peakUnrealizedPnl,
-        double initialBalance,
-        double currentEquity,
-        int positionDirection,
-        double priceChange,
-        int holdingTicks,
-        double symbolAtr)
+    private float CalculatePredictionAccuracyReward(string symbol, double closePrice, double tradeProfit)
     {
-        var reward = 0f;
-        
-        // No holding penalties - let the agent explore freely
-        // Only very extreme holding (>MaxHoldingTicks) gets tiny penalty
-        if (holdingTicks > _config.MaxHoldingTicks)
-        {
-            var excessTicks = holdingTicks - _config.MaxHoldingTicks;
-            reward -= 0.00001f * (excessTicks / 1000f);  // Negligible penalty
-        }
-        
-        // EXPLORATION INCENTIVE: Decaying bonus for holding profitable positions
-        // Decays over time to encourage eventual profit-taking rather than indefinite holding
-        // NOTE: unrealizedPnl is already a decimal percentage (0.01 = 1%)
-        if (unrealizedPnl > 0)
-        {
-            // Exponential decay: bonus diminishes over ~240 minutes (extended for day trading)
-            var holdingMinutes = holdingTicks / 60f;
-            var decayFactor = (float)Math.Exp(-holdingMinutes / 240f);  // Extended decay for day trading
-            reward += _config.HoldingBonus * decayFactor;
+        if (!_config.UsePredictionAccuracyReward)
+            return 0f;
             
-            // Removed additional profit accumulation - already covered by unrealized PnL shaping
-        }
-
-        // Unrealized PnL shaping - strong signal that being in profit is good
-        // NOTE: unrealizedPnl is already a decimal percentage (0.01 = 1%)
-        var unrealizedReward = (float)unrealizedPnl * 100f * _config.UnrealizedPnlScale;
-        reward += unrealizedReward * 0.1f;  // Reduced from 0.25 to prevent reward hacking
-
-        // Direction quality: reward when price moves in position direction
-        // Normalize by ATR so EURUSD micro-moves are equivalent to BTCUSD larger moves
-        if (positionDirection != 0 && priceChange != 0)
-        {
-            var effectiveAtr = symbolAtr > 0 ? symbolAtr : _config.DefaultAtr;
-            var normalizedPriceChange = priceChange / effectiveAtr;  // Now in ATR units
-            var directionReward = (float)(normalizedPriceChange * positionDirection) * _config.PositionQualityScale;
-            reward += Math.Clamp(directionReward, -0.1f, 0.1f);  // Bounded
-        }
-
-        // Equity momentum: reward when equity is increasing
-        var previousEquity = _previousEquityBySymbol.GetValueOrDefault(symbol, 0);
-        if (currentEquity > 0 && previousEquity > 0)
-        {
-            var equityChange = (currentEquity - previousEquity) / initialBalance * 100;
-            reward += (float)Math.Clamp(equityChange * _config.EquityMomentumScale, -0.5f, 0.5f);
-        }
-
-        // PnL delta: reward for improvement since last step
-        var previousUnrealizedPnl = _previousUnrealizedPnlBySymbol.GetValueOrDefault(symbol, 0);
-        var pnlDelta = unrealizedPnl - previousUnrealizedPnl;
-        if (pnlDelta > 0)
-        {
-            reward += (float)(pnlDelta * 100f) * _config.PnlDeltaScale;
-        }
-        else if (pnlDelta < 0)
-        {
-            reward += (float)(pnlDelta * 100f) * _config.PnlDeltaScale * 0.5f;  // Asymmetric
-        }
-
-        // Drawdown from peak penalty
-        // NOTE: peakUnrealizedPnl and unrealizedPnl are decimal percentages
-        var dd = Math.Max(0, peakUnrealizedPnl - unrealizedPnl);
-        if (dd > _config.DrawdownThreshold)
-        {
-            reward -= _config.DrawdownPenalty * (float)(dd / _config.DrawdownThreshold);
-        }
-
-        _previousUnrealizedPnlBySymbol[symbol] = unrealizedPnl;
-        _previousEquityBySymbol[symbol] = currentEquity > 0 ? currentEquity : previousEquity;
+        var entryPrice = _entryPriceBySymbol.GetValueOrDefault(symbol, 0);
+        var prediction = _entryPredictionBySymbol.GetValueOrDefault(symbol, 0);
         
-        return reward;
-    }
-
-    /// <summary>
-    /// Normalize reward to bounded range for stable learning.
-    /// </summary>
-    private float NormalizeReward(float reward)
-    {
-        var scaled = reward / _config.RewardNormalizationScale;
+        if (entryPrice <= 0 || Math.Abs(prediction) < 0.0001f)
+            return 0f;
         
-        if (_config.UseTanhNormalization)
+        // Actual price move as percentage
+        var actualMove = (closePrice - entryPrice) / entryPrice;
+        
+        // Check if prediction direction matched actual move
+        var predictionDirection = Math.Sign(prediction);
+        var actualDirection = Math.Sign(actualMove);
+        
+        if (predictionDirection == actualDirection)
         {
-            // Smooth bounded output using tanh: (-1, 1)
-            return (float)Math.Tanh(scaled);
+            // Correct direction - reward scales with prediction confidence that matched
+            var confidence = Math.Min(Math.Abs(prediction) / 0.01f, 1f);  // Normalize to 0-1
+            return _config.PredictionAccuracyBonus * confidence;
         }
         else
         {
-            // Hard clamp: [-1, 1]
-            return Math.Clamp(scaled, -1f, 1f);
+            // Wrong direction - small penalty
+            return -_config.PredictionWrongPenalty;
         }
     }
-    // NOTE: Per-symbol flat tracking is now in dictionaries above
-    
-    /// <summary>
-    /// Calculate opportunity cost penalty based on missed price movement.
-    /// Only penalizes when the agent missed a SUSTAINED move (momentum), not just spikes.
-    /// Uses ATR for volatility normalization and requires directional consistency.
-    /// </summary>
-    private float CalculateOpportunityCostPenalty(string symbol, double currentPrice, double atr, double symbolPoint)
-    {
-        var flatStartPrice = _flatStartPriceBySymbol.GetValueOrDefault(symbol, 0);
-        var flatPreviousPrice = _flatPreviousPriceBySymbol.GetValueOrDefault(symbol, 0);
-        var flatTicks = _flatTicksBySymbol.GetValueOrDefault(symbol, 0);
-        var flatDirectionTicks = _flatDirectionTicksBySymbol.GetValueOrDefault(symbol, 0);
-        
-        if (flatStartPrice <= 0)
-        {
-            _flatStartPriceBySymbol[symbol] = currentPrice;
-            _flatPreviousPriceBySymbol[symbol] = currentPrice;
-            _flatTicksBySymbol[symbol] = 0;
-            _flatDirectionTicksBySymbol[symbol] = 0;
-            return 0;
-        }
-        
-        flatTicks++;
-        _flatTicksBySymbol[symbol] = flatTicks;
-        var priceMove = Math.Abs(currentPrice - flatStartPrice);
-        
-        // Track directional consistency (momentum requirement)
-        var tickDirection = Math.Sign(currentPrice - flatPreviousPrice);
-        var overallDirection = Math.Sign(currentPrice - flatStartPrice);
-        
-        if (tickDirection == overallDirection && tickDirection != 0)
-        {
-            flatDirectionTicks++;
-        }
-        else if (tickDirection == -overallDirection)
-        {
-            flatDirectionTicks = Math.Max(0, flatDirectionTicks - 2);  // Faster reset on reversal
-        }
-        _flatDirectionTicksBySymbol[symbol] = flatDirectionTicks;
-        
-        _flatPreviousPriceBySymbol[symbol] = currentPrice;
-        
-        // Normalize price move by ATR (volatility-relative)
-        var atrThreshold = atr * _config.OpportunityThresholdAtr;
-        
-        // Only penalize if move was SUSTAINED (not just a spike)
-        // Require at least 10 ticks of consistent direction movement
-        var hasmomentum = flatDirectionTicks >= 10;
-        
-        if (priceMove > atrThreshold && hasmomentum)
-        {
-            // Use ATR-normalized missed opportunity (independent of symbol price scale)
-            var missedAtrMultiple = (float)(priceMove / atr);
-            var penalty = _config.MissedOpportunityPenalty * Math.Min(missedAtrMultiple, 3f);
-            
-            // Reset tracking after penalty applied
-            _flatStartPriceBySymbol[symbol] = currentPrice;
-            _flatDirectionTicksBySymbol[symbol] = 0;
-            return penalty;
-        }
-        
-        // Very small time decay after 120 ticks of inactivity (increased from 60)
-        if (flatTicks > 120)
-        {
-            return 0.00005f * (flatTicks - 120);  // Even smaller penalty
-        }
-        
-        // DENSE REWARD: Small positive reward for patient waiting when no opportunity
-        // This reduces the 84% zero-reward problem by providing continuous signal
-        return -0.0001f;  // Tiny reward for waiting (net positive after normalization offset)
-    }
+}
+
+/// <summary>
+/// How the trade was closed.
+/// </summary>
+public enum CloseReason
+{
+    Unknown = 0,
+    Manual = 1,   // Agent closed via CLOSE action
+    TakeProfit = 2,
+    StopLoss = 3,
+    EndOfEpisode = 4
 }

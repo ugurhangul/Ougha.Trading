@@ -50,4 +50,17 @@ public class Experience
     /// Symbol index for multi-symbol environments.
     /// </summary>
     public int SymbolIdx { get; set; }
+    
+    /// <summary>
+    /// Optimal SL multiplier computed in hindsight after trade closes.
+    /// Calculated as MAE * 1.15 / ATR (slightly beyond worst drawdown).
+    /// -1 = not computed (no trade closed for this experience).
+    /// </summary>
+    public float HindsightSlMultiplier { get; set; } = -1f;
+    
+    /// <summary>
+    /// Whether the agent had an open position at the time of this experience.
+    /// Used to weight close signal training (only meaningful when holding).
+    /// </summary>
+    public bool HadPosition { get; set; }
 }

@@ -1,227 +1,75 @@
 namespace Ougha.Trading.RL;
 
 /// <summary>
-/// Configuration for the improved reward function.
-/// Designed for multi-symbol trading with volatility normalization.
+/// Simplified reward configuration for price prediction strategy.
+/// Only 4 reward components: R-multiple, MDD, prediction accuracy, close bonus.
 /// </summary>
 public class RewardConfig
 {
     // ========================
-    // VOLATILITY NORMALIZATION
+    // R-MULTIPLE (PRIMARY SIGNAL)
     // ========================
     /// <summary>
-    /// If true, profits are normalized by ATR for fair multi-symbol comparison.
-    /// A 1% move in BTCUSD and 0.1% in EURUSD can have equal reward if ATR-normalized.
+    /// Scale for R-multiple reward. R-multiple = profit / risk.
+    /// This is the main learning signal - higher = stronger feedback.
     /// </summary>
-    public bool UseVolatilityNormalization { get; set; } = true;
-    
-    /// <summary>
-    /// Default ATR for fallback when ATR data is unavailable.
-    /// </summary>
-    public double DefaultAtr { get; set; } = 0.001;
+    public float RMultipleScale { get; set; } = 5f;
 
     // ========================
-    // REALIZED PROFIT REWARDS
+    // PREDICTION ACCURACY
     // ========================
     /// <summary>
-    /// Scale for realized profit rewards. Lower values = more stable learning.
+    /// Enable prediction accuracy reward component.
     /// </summary>
-    public float RealizedProfitScale { get; set; } = 10f;  // Normalized from 50
+    public bool UsePredictionAccuracyReward { get; set; } = true;
     
     /// <summary>
-    /// Bonus for winning trades (profit > 0). Increased to provide stronger positive signal.
+    /// Bonus when predicted price direction matched actual move.
     /// </summary>
-    public float WinBonus { get; set; } = 3.0f;  // Win bonus: strong positive signal for profitable trades
+    public float PredictionAccuracyBonus { get; set; } = 1.0f;
     
     /// <summary>
-    /// Penalty for losing trades. Symmetric with WinBonus for balanced risk.
+    /// Penalty when predicted price direction was wrong.
     /// </summary>
-    public float LossPenalty { get; set; } = 0.3f;  // Very low: let profit signal dominate, not punishment
-    
-    /// <summary>
-    /// Risk-adjusted reward: profit / SL distance. Rewards good R:R trades.
-    /// </summary>
-    public float RiskRewardScale { get; set; } = 5f;  // Normalized: R-multiple capped at ±5, so max ±25
+    public float PredictionWrongPenalty { get; set; } = 0.5f;
 
     // ========================
-    // UNREALIZED PNL (SHAPING)
+    // CLOSE ACTION
     // ========================
     /// <summary>
-    /// Scale for unrealized PnL shaping. Provides dense signal during trades.
+    /// Bonus for profitable manual close (agent CLOSE action, not TP/SL).
     /// </summary>
-    public float UnrealizedPnlScale { get; set; } = 0.5f;  // Reduced: let trade outcome dominate, not per-tick noise
-    
-    /// <summary>
-    /// Scale for PnL delta (improvement since last step). Encourages progress.
-    /// </summary>
-    public float PnlDeltaScale { get; set; } = 0f;  // Disabled - tick-by-tick PnL changes are noise
-    
-    /// <summary>
-    /// Penalty for drawdown from peak unrealized PnL.
-    /// </summary>
-    public float DrawdownPenalty { get; set; } = 0.0001f;  // Reduced further - don't punish normal volatility
-    
-    /// <summary>
-    /// Threshold before drawdown penalty kicks in.
-    /// </summary>
-    public float DrawdownThreshold { get; set; } = 0.15f;  // 15% threshold - allow room to breathe
+    public float ManualCloseBonus { get; set; } = 0.5f;
 
     // ========================
-    // POSITION MANAGEMENT
+    // POSITION HOLDING
     // ========================
     /// <summary>
-    /// Per-tick penalty for holding a position. Discourages overly long trades.
+    /// Minimal per-tick signal when holding position.
+    /// Just direction: +0.001 if profitable, -0.001 if losing.
     /// </summary>
-    public float HoldingTimePenalty { get; set; } = 0f;  // Disabled - let agent explore freely
-    
-    /// <summary>
-    /// Per-tick bonus for holding a profitable position. Encourages exploring longer holds.
-    /// </summary>
-    public float HoldingBonus { get; set; } = 0.05f;  // Strong per-tick bonus for holding profitable positions
-    
-    /// <summary>
-    /// Minimum ticks threshold for early close penalty (soft guidance, not enforcement).
-    /// </summary>
-    public int MinHoldingTicks { get; set; } = 300;  // 5 minutes - soft threshold only
-    
-    /// <summary>
-    /// Penalty for closing too early. Set to 0 to let agent explore freely.
-    /// </summary>
-    public float EarlyClosePenalty { get; set; } = 0f;  // Disabled - let agent discover holding value naturally
-    
-    /// <summary>
-    /// Maximum holding ticks before increasing penalty.
-    /// </summary>
-    public int MaxHoldingTicks { get; set; } = 43200;  // 12 hours - very long to allow exploration
-    
-    /// <summary>
-    /// Ticks for quick profit bonus eligibility.
-    /// </summary>
-    public int QuickProfitTicks { get; set; } = 600;  // 10 minutes at S1 granularity
-    
-    /// <summary>
-    /// Bonus for quick profitable trades.
-    /// </summary>
-    public float QuickProfitBonus { get; set; } = 0.0001f;  // Disabled - was encouraging early closes
-
-    // ========================
-    // OPPORTUNITY COST MODEL
-    // ========================
-    /// <summary>
-    /// Enable opportunity cost model instead of flat penalty.
-    /// Only penalizes when agent misses significant price moves.
-    /// </summary>
-    public bool UseOpportunityCostModel { get; set; } = true;
-    
-    /// <summary>
-    /// Penalty when agent is flat but market moved significantly.
-    /// Reduced to prevent overwhelming negative reward bias.
-    /// </summary>
-    public float MissedOpportunityPenalty { get; set; } = 0f;  // Disabled - was causing too many negative rewards
-    
-    /// <summary>
-    /// ATR multiplier threshold: price move > this * ATR = missed opportunity.
-    /// </summary>
-    public float OpportunityThresholdAtr { get; set; } = 0.5f;  // Lowered from 1.0 - trigger on smaller moves
-    
-    /// <summary>
-    /// Legacy flat penalty (used when UseOpportunityCostModel is false).
-    /// </summary>
-    public float FlatPenalty { get; set; } = 0.001f;  // Reduced from 0.01 - less harsh
-
-    // ========================
-    // DIRECTION QUALITY
-    // ========================
-    /// <summary>
-    /// Scale for rewarding correct direction (price moves in position direction).
-    /// </summary>
-    public float PositionQualityScale { get; set; } = 5f;  // Normalized from 100
-    
-    /// <summary>
-    /// Scale for equity momentum (equity increasing).
-    /// </summary>
-    public float EquityMomentumScale { get; set; } = 2f;  // Normalized from 15
-    
-    /// <summary>
-    /// Scale for equity change percentage.
-    /// </summary>
-    public float EquityChangeScale { get; set; } = 5f;  // Normalized from 50
-
-    // ========================
-    // EPISODE-LEVEL METRICS
-    // ========================
-    /// <summary>
-    /// Weight for profit factor bonus/penalty.
-    /// </summary>
-    public float ProfitFactorWeight { get; set; } = 2f;  // Normalized from 10
-    
-    /// <summary>
-    /// Weight for Sharpe ratio bonus/penalty.
-    /// </summary>
-    public float SharpeRatioWeight { get; set; } = 2f;  // Normalized from 10
-    
-    /// <summary>
-    /// Minimum trades before PF is calculated.
-    /// </summary>
-    public int MinTradesForPf { get; set; } = 3;  // Increased from 2
-    
-    /// <summary>
-    /// Minimum trades before Sharpe is calculated.
-    /// </summary>
-    public int MinTradesForSharpe { get; set; } = 5;  // Increased from 3
-    
-    /// <summary>
-    /// Cap for profit factor (prevents outlier rewards).
-    /// </summary>
-    public float PfCap { get; set; } = 50f;  // Reduced from 10
-    
-    /// <summary>
-    /// Cap for Sharpe ratio.
-    /// </summary>
-    public float SharpeCap { get; set; } = 30f;  // Reduced from 5
-    
-    /// <summary>
-    /// Minimum PF threshold for positive reward.
-    /// </summary>
-    public float MinPfThreshold { get; set; } = 1.5f;  // Reduced from 2
-    
-    /// <summary>
-    /// Annualization factor for Sharpe (252 trading days).
-    /// </summary>
-    public float AnnualizationFactor { get; set; } = 252f;
+    public float PositionHoldingSignal { get; set; } = 0.001f;
 
     // ========================
     // MAX DRAWDOWN PENALTY
     // ========================
     /// <summary>
+    /// Threshold before MDD penalty kicks in (percentage).
+    /// </summary>
+    public float MddThreshold { get; set; } = 5f;
+    
+    /// <summary>
     /// Weight for max drawdown penalty.
     /// </summary>
-    public float MddPenaltyWeight { get; set; } = 5f;  // Normalized from 25
-    
-    /// <summary>
-    /// Threshold before MDD penalty kicks in (percentage).
-    /// Increased for day trading where 5% drawdowns are normal.
-    /// </summary>
-    public float MddThreshold { get; set; } = 5f;  // Tightened from 10% for stricter risk management
-    
-    /// <summary>
-    /// Scale multiplier for MDD penalty.
-    /// </summary>
-    public float MddPenaltyScale { get; set; } = 1.5f;  // Reduced from 2
+    public float MddPenaltyWeight { get; set; } = 5f;
 
     // ========================
     // NORMALIZATION
     // ========================
     /// <summary>
-    /// Scale for reward normalization. Higher = less clipping.
+    /// Scale for reward normalization (tanh).
     /// </summary>
-    public float RewardNormalizationScale { get; set; } = 10f;  // Reduced to match normalized reward magnitudes
-    
-    /// <summary>
-    /// If true, normalize rewards to bounded range using tanh (smooth gradients).
-    /// If false, use clamp (hard cutoff).
-    /// </summary>
-    public bool UseTanhNormalization { get; set; } = true;  // Enabled for smoother gradients
+    public float RewardNormalizationScale { get; set; } = 10f;
     
     /// <summary>
     /// Enable/disable reward normalization.

@@ -34,6 +34,12 @@ public class PortfolioTradingEnvironment
 
     private readonly Dictionary<string, (float TpMult, float SlMult)> _lastTpSlMultipliers;
     
+    // Hindsight SL: Track price path for optimal SL calculation after trade closes
+    private readonly Dictionary<string, double> _positionEntryPrice = new();
+    private readonly Dictionary<string, double> _maxAdverseExcursion = new();   // MAE as % of entry
+    private readonly Dictionary<string, double> _maxFavorableExcursion = new(); // MFE as % of entry
+    private readonly Dictionary<string, double> _positionAtr = new();           // ATR at entry time
+    
     // DXY Index service for USD strength features
     private readonly DxyIndexService _dxyService;
     
@@ -103,6 +109,11 @@ public class PortfolioTradingEnvironment
             _lastClosedTimeframes[symbol] = new List<string>();
             _lastActionBySymbol[symbol] = 0;
             _lastTpSlMultipliers[symbol] = (0.5f, 0.5f);
+            // Initialize hindsight tracking
+            _positionEntryPrice[symbol] = 0;
+            _maxAdverseExcursion[symbol] = 0;
+            _maxFavorableExcursion[symbol] = 0;
+            _positionAtr[symbol] = 0;
         }
 
         _reusableRewards = new float[config.Symbols.Length];
@@ -249,19 +260,17 @@ public class PortfolioTradingEnvironment
                 var symbolInfo = _executor.GetSymbolInfo(closeInfo.Symbol);
 
                 var closeReward = _rewardCalculator.Calculate(
-                    symbol: closeInfo.Symbol,  // CRITICAL: per-symbol state tracking
+                    symbol: closeInfo.Symbol,
                     tradeClosed: true,
                     tradeProfit: closeInfo.Profit,
-                    holdingTicks: closeInfo.HoldingTicks,
                     hasPosition: false,
                     unrealizedPnl: 0,
-                    peakUnrealizedPnl: _peakUnrealizedPnls.GetValueOrDefault(closeInfo.Symbol),
-                    initialBalance: _initialBalance,
                     maxDrawdownPct: maxDrawdownPct,
-                    symbolAtr: symbolAtr,
                     slDistance: closeInfo.SlDistance,
                     symbolInfo: symbolInfo,
-                    volume: closeInfo.Volume);
+                    volume: closeInfo.Volume,
+                    closePrice: _executor.GetBid(closeInfo.Symbol),
+                    closeReason: MapExitReason(closeInfo.ExitReason));
 
                 _reusableRewards[symbolIndex] += closeReward;
                 _positionOpenTicks[closeInfo.Symbol] = 0;
@@ -575,6 +584,13 @@ public class PortfolioTradingEnvironment
                     _lastExecutedAction[symbol] = action;
                     _lastExecutedTick[symbol] = _currentTick;
                     
+                    // Initialize hindsight SL tracking for this position
+                    var entryPrice = entryType.Value == TradeType.Buy ? ask : bid;
+                    _positionEntryPrice[symbol] = entryPrice;
+                    _maxAdverseExcursion[symbol] = 0;
+                    _maxFavorableExcursion[symbol] = 0;
+                    _positionAtr[symbol] = atr;
+                    
                     // Entry quality bonus: reward entries that align with recent momentum
                     // BUY when price rising = good entry, SELL when price falling = good entry
                     var candlePriceChange = candle.Close - candle.Open;
@@ -611,6 +627,24 @@ public class PortfolioTradingEnvironment
 
         if (unrealized > _peakUnrealizedPnls.GetValueOrDefault(symbol))
             _peakUnrealizedPnls[symbol] = unrealized;
+        
+        // Update MAE/MFE for hindsight SL calculation
+        if (pos != null && _positionEntryPrice.GetValueOrDefault(symbol) > 0)
+        {
+            var entry = _positionEntryPrice[symbol];
+            var current = pos.Type == TradeType.Buy 
+                ? _executor.GetBid(symbol)  // Bid for closing longs
+                : _executor.GetAsk(symbol); // Ask for closing shorts
+            var direction = pos.Type == TradeType.Buy ? 1 : -1;
+            
+            // Excursion as percentage of entry price
+            var priceMove = (current - entry) / entry * direction;
+            
+            if (priceMove > 0)
+                _maxFavorableExcursion[symbol] = Math.Max(_maxFavorableExcursion[symbol], priceMove);
+            else
+                _maxAdverseExcursion[symbol] = Math.Max(_maxAdverseExcursion[symbol], Math.Abs(priceMove));
+        }
 
         double maxDrawdownPct = 0;
         if (_peakEquity > 0)
@@ -625,20 +659,19 @@ public class PortfolioTradingEnvironment
         // Get position direction and price change for shaping rewards
         var posDirection = pos?.Type == TradeType.Buy ? 1 : (pos?.Type == TradeType.Sell ? -1 : 0);
         var currentPrice = _executor.GetBid(symbol);
-        var lastCandle = _executor.GetLastKnownCandle(symbol);
-        var priceChange = lastCandle != null ? currentPrice - lastCandle.Close : 0;
 
         var reward = _rewardCalculator.Calculate(
-            symbol: symbol,  // CRITICAL: per-symbol state tracking
-            tradeClosed, tradeProfit, holdingTicks,
-            pos != null, unrealized, _peakUnrealizedPnls.GetValueOrDefault(symbol),
-            _initialBalance, maxDrawdownPct,
-            currentEquity: _executor.GetEquity(),
-            positionDirection: posDirection,
-            priceChange: priceChange,
-            symbolAtr: symbolAtr,
+            symbol: symbol,
+            tradeClosed: tradeClosed,
+            tradeProfit: tradeProfit,
+            hasPosition: pos != null,
+            unrealizedPnl: unrealized,
+            maxDrawdownPct: maxDrawdownPct,
+            slDistance: 0,
             symbolInfo: symbolInfo,
-            currentPrice: currentPrice);  // Pass actual price for opportunity cost
+            volume: pos?.Volume ?? 0,
+            closePrice: currentPrice,
+            closeReason: CloseReason.Unknown);
 
         return (reward, tradeClosed);
     }
@@ -654,6 +687,64 @@ public class PortfolioTradingEnvironment
         {
             _lastTpSlMultipliers[_config.Symbols[i]] = (tpSlMultipliers[i, 0], tpSlMultipliers[i, 1]);
         }
+    }
+
+    /// <summary>
+    /// Compute optimal SL multiplier based on hindsight (MAE tracking).
+    /// Call this when a trade closes to get the training target.
+    /// Returns -1 if no tracking data available.
+    /// </summary>
+    public float GetHindsightSlMultiplier(string symbol)
+    {
+        var mae = _maxAdverseExcursion.GetValueOrDefault(symbol, 0);
+        var atr = _positionAtr.GetValueOrDefault(symbol, 0);
+        var entry = _positionEntryPrice.GetValueOrDefault(symbol, 0);
+        
+        if (mae <= 0 || atr <= 0 || entry <= 0)
+            return -1f;  // No valid data
+        
+        // Convert MAE percentage to price distance
+        var maePrice = entry * mae;
+        
+        // Optimal SL = MAE + 15% buffer (to not get stopped out on winning trades)
+        var optimalSlDistance = maePrice * 1.15;
+        
+        // Convert to ATR multiplier: SL distance / ATR
+        var optimalSlAtrMult = optimalSlDistance / atr;
+        
+        // Normalize to [0,1] range: formula is (mult - 0.5) / 2.5
+        // Where 0.5 ATR -> 0, 3.0 ATR -> 1
+        var hindsightSlMult = (float)((optimalSlAtrMult - 0.5) / 2.5);
+        hindsightSlMult = Math.Clamp(hindsightSlMult, 0.1f, 1.0f);
+        
+        return hindsightSlMult;
+    }
+    
+    /// <summary>
+    /// Clear hindsight tracking for a symbol (call after trade closes).
+    /// </summary>
+    public void ClearHindsightTracking(string symbol)
+    {
+        _positionEntryPrice[symbol] = 0;
+        _maxAdverseExcursion[symbol] = 0;
+        _maxFavorableExcursion[symbol] = 0;
+        _positionAtr[symbol] = 0;
+    }
+    
+    /// <summary>
+    /// Map ExitReason to CloseReason for reward calculation.
+    /// </summary>
+    private static CloseReason MapExitReason(Backtesting.ExitReason exitReason)
+    {
+        return exitReason switch
+        {
+            Backtesting.ExitReason.Manual => CloseReason.Manual,
+            Backtesting.ExitReason.Signal => CloseReason.Manual,
+            Backtesting.ExitReason.TakeProfit => CloseReason.TakeProfit,
+            Backtesting.ExitReason.StopLoss => CloseReason.StopLoss,
+            Backtesting.ExitReason.EndOfBacktest => CloseReason.EndOfEpisode,
+            _ => CloseReason.Unknown
+        };
     }
 
     private double CalculateAtr(string symbol)
@@ -837,6 +928,11 @@ public class PortfolioTradingEnvironment
             _lastTpSlMultipliers[symbol] = (0.5f, 0.5f);
             _lastExecutedAction.Remove(symbol);
             _lastExecutedTick.Remove(symbol);
+            // Reset hindsight SL tracking
+            _positionEntryPrice[symbol] = 0;
+            _maxAdverseExcursion[symbol] = 0;
+            _maxFavorableExcursion[symbol] = 0;
+            _positionAtr[symbol] = 0;
         }
         
         // Reset DXY service

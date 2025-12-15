@@ -28,6 +28,8 @@ public interface IAgent : IDisposable
     /// <summary>
     /// Add a batch of experiences with log probabilities and TP/SL multipliers for PPO training.
     /// </summary>
+    /// <param name="hindsightSlMultipliers">Optional hindsight SL targets computed from MAE after trade closes.</param>
+    /// <param name="hadPositions">Whether agent had position at each experience (for close signal training).</param>
     void AddExperienceBatchWithLogProbs(
         AgentInput[] states,
         int[] actions,
@@ -36,7 +38,9 @@ public interface IAgent : IDisposable
         bool[] dones,
         float[] logProbs,
         float[] tpMultipliers,
-        float[] slMultipliers);
+        float[] slMultipliers,
+        float[]? hindsightSlMultipliers = null,
+        bool[]? hadPositions = null);
 
     /// <summary>
     /// Perform a training step (optimization).
