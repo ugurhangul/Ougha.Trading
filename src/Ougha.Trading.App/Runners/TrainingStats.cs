@@ -248,6 +248,43 @@ public class TrainingStats
         ? TimeSpan.FromSeconds(_totalHoldingTimeSeconds / _tradesClosed)
         : TimeSpan.Zero;
     
+    // Prediction accuracy tracking for supervised learning
+    private int _correctPredictions;
+    private int _totalPredictions;
+    private double _totalPredictionError;  // Sum of |actual - predicted|
+    
+    public int CorrectPredictions { get => _correctPredictions; set => _correctPredictions = value; }
+    public int TotalPredictions { get => _totalPredictions; set => _totalPredictions = value; }
+    public double TotalPredictionError { get => _totalPredictionError; set => _totalPredictionError = value; }
+    
+    /// <summary>
+    /// Prediction accuracy: % of trades where predicted direction matched actual price movement.
+    /// </summary>
+    public double PredictionAccuracy => _totalPredictions > 0 ? (double)_correctPredictions / _totalPredictions * 100 : 0;
+    
+    /// <summary>
+    /// Average prediction error (MAE of predicted vs actual price change).
+    /// </summary>
+    public double AvgPredictionError => _totalPredictions > 0 ? _totalPredictionError / _totalPredictions : 0;
+    
+    /// <summary>
+    /// Record a prediction outcome when a trade closes.
+    /// </summary>
+    public void RecordPrediction(float predicted, float actual)
+    {
+        lock (_lock)
+        {
+            _totalPredictions++;
+            _totalPredictionError += Math.Abs(actual - predicted);
+            
+            // Direction accuracy: did sign match?
+            if (Math.Sign(predicted) == Math.Sign(actual) && Math.Abs(predicted) > 0.0001f)
+            {
+                _correctPredictions++;
+            }
+        }
+    }
+    
     // Rolling window aggregates - computed from all symbol rolling windows
     public int RollingTrades
     {

@@ -25,6 +25,11 @@ public class PpoSequence
     /// Whether agent had position at each timestep (for close signal training).
     /// </summary>
     public required bool[] HadPositions { get; init; }
+    /// <summary>
+    /// Actual price changes when trades closed (for supervised prediction).
+    /// -999 = no trade closed.
+    /// </summary>
+    public required float[] ActualPriceChanges { get; init; }
     public required int EpisodeId { get; init; }
     public int Length => States.Length;
 }
@@ -97,6 +102,7 @@ internal class SequentialPpoDataset
                 var slMults = new float[seqLen];
                 var hindsightSlMults = new float[seqLen];
                 var hadPositions = new bool[seqLen];
+                var actualPriceChanges = new float[seqLen];
                 
                 for (var j = 0; j < seqLen; j++)
                 {
@@ -111,6 +117,7 @@ internal class SequentialPpoDataset
                     slMults[j] = exp.SlMultiplier;
                     hindsightSlMults[j] = exp.HindsightSlMultiplier;
                     hadPositions[j] = exp.HadPosition;
+                    actualPriceChanges[j] = exp.ActualPriceChange;
                 }
                 
                 sequences.Add(new PpoSequence
@@ -125,6 +132,7 @@ internal class SequentialPpoDataset
                     SlMultipliers = slMults,
                     HindsightSlMultipliers = hindsightSlMults,
                     HadPositions = hadPositions,
+                    ActualPriceChanges = actualPriceChanges,
                     EpisodeId = episodeGroup.Key
                 });
             }

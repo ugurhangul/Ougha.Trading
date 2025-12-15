@@ -39,6 +39,8 @@ public class PortfolioTradingEnvironment
     private readonly Dictionary<string, double> _maxAdverseExcursion = new();   // MAE as % of entry
     private readonly Dictionary<string, double> _maxFavorableExcursion = new(); // MFE as % of entry
     private readonly Dictionary<string, double> _positionAtr = new();           // ATR at entry time
+    private readonly Dictionary<string, float> _actualPriceChange = new();      // Price change when trade closed (for supervised learning)
+    private readonly Dictionary<string, float> _entryPrediction = new();        // Model's prediction at trade entry
     
     // DXY Index service for USD strength features
     private readonly DxyIndexService _dxyService;
@@ -275,6 +277,31 @@ public class PortfolioTradingEnvironment
                 _reusableRewards[symbolIndex] += closeReward;
                 _positionOpenTicks[closeInfo.Symbol] = 0;
                 _peakUnrealizedPnls[closeInfo.Symbol] = 0;
+                
+                // Compute actual price change for supervised prediction training
+                // Use PROFIT SIGN to determine actual direction, not current price (which may have bounced)
+                // This ensures prediction accuracy aligns with trade outcome
+                var entryPrice = _positionEntryPrice.GetValueOrDefault(closeInfo.Symbol, 0);
+                if (entryPrice > 0)
+                {
+                    // Profit > 0 means price moved in predicted direction
+                    // Profit < 0 means price moved against prediction
+                    // Scale by approximate percentage (using SL distance as reference)
+                    var approxMovePercent = closeInfo.SlDistance > 0 
+                        ? closeInfo.Profit / (closeInfo.SlDistance * closeInfo.Volume) 
+                        : closeInfo.Profit / entryPrice;
+                    
+                    // Get entry prediction sign to determine direction
+                    var entryPred = _entryPrediction.GetValueOrDefault(closeInfo.Symbol, 0f);
+                    
+                    // For LONG trades (positive prediction), profit > 0 means price went UP
+                    // For SHORT trades (negative prediction), profit > 0 means price went DOWN
+                    // So actual direction = sign(prediction) * sign(profit)
+                    var actualDirection = Math.Sign(entryPred) * Math.Sign(closeInfo.Profit);
+                    var priceChange = (float)(actualDirection * Math.Abs(approxMovePercent) * 0.01);
+                    
+                    _actualPriceChange[closeInfo.Symbol] = priceChange;
+                }
             }
         }
 
@@ -367,10 +394,16 @@ public class PortfolioTradingEnvironment
 
         // Market hours awareness: force close positions before weekend to avoid gap risk
         // Friday 21:00 UTC is when most forex markets close
+        // Skip for crypto symbols (trade 24/7)
         if (currentTime.DayOfWeek == DayOfWeek.Friday && currentTime.Hour >= 21)
         {
             foreach (var symbol in _config.Symbols)
             {
+                // Crypto trades 24/7, no weekend gap risk
+                var symbolInfo = _executor.GetSymbolInfo(symbol);
+                if (symbolInfo?.Category == SymbolCategory.Crypto)
+                    continue;
+                    
                 var pos = _executor.GetPosition(symbol);
                 if (pos != null)
                 {
@@ -729,6 +762,35 @@ public class PortfolioTradingEnvironment
         _maxAdverseExcursion[symbol] = 0;
         _maxFavorableExcursion[symbol] = 0;
         _positionAtr[symbol] = 0;
+        _actualPriceChange[symbol] = -999f;  // Reset to sentinel
+        _entryPrediction[symbol] = 0f;       // Clear entry prediction
+    }
+    
+    /// <summary>
+    /// Get the actual price change from the last closed trade for this symbol.
+    /// Returns -999 if no trade closed.
+    /// </summary>
+    public float GetActualPriceChange(string symbol)
+    {
+        return _actualPriceChange.GetValueOrDefault(symbol, -999f);
+    }
+    
+    /// <summary>
+    /// Store the model's prediction at trade entry.
+    /// Call this when opening a new position.
+    /// </summary>
+    public void SetEntryPrediction(string symbol, float prediction)
+    {
+        _entryPrediction[symbol] = prediction;
+    }
+    
+    /// <summary>
+    /// Get the entry prediction for computing accuracy.
+    /// Returns 0 if no prediction stored.
+    /// </summary>
+    public float GetEntryPrediction(string symbol)
+    {
+        return _entryPrediction.GetValueOrDefault(symbol, 0f);
     }
     
     /// <summary>

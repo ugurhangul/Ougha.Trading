@@ -63,4 +63,17 @@ public class Experience
     /// Used to weight close signal training (only meaningful when holding).
     /// </summary>
     public bool HadPosition { get; set; }
+    
+    /// <summary>
+    /// Model's price prediction at trade entry (percentage move).
+    /// Used for supervised prediction loss calculation.
+    /// </summary>
+    public float EntryPrediction { get; set; }
+    
+    /// <summary>
+    /// Actual price change when trade closed (percentage: (close-entry)/entry).
+    /// -999 = no trade closed (sentinel value).
+    /// Used as target for supervised prediction training.
+    /// </summary>
+    public float ActualPriceChange { get; set; } = -999f;
 }

@@ -79,7 +79,7 @@ public static class TrainingDisplay
         );
         
         return new Panel(table)
-            .Header("[bold cyan]Multi-Symbol RL Training[/]")
+            .Header("[bold cyan]Supervised Pred + RL SL Training[/]")
             .Border(BoxBorder.Double)
             .BorderColor(Color.Cyan1);
     }
@@ -102,9 +102,10 @@ public static class TrainingDisplay
         
         if (stats.IsPpoAgent)
         {
-            // Show both entropy coefficient and actual policy entropy
-            table.AddRow("[dim]EntCoef:[/]", $"[magenta]{stats.EntropyCoefficient,12:F4}[/]");
-            table.AddRow("[dim]PolEnt:[/]", $"[cyan]{stats.PolicyEntropy,12:F4}[/]");  // Max ~1.39 for 4 actions
+            // Show prediction accuracy for supervised learning
+            var predAccStyle = stats.PredictionAccuracy > 55 ? "green" : stats.PredictionAccuracy > 50 ? "yellow" : "red";
+            table.AddRow("[dim]PredAcc:[/]", $"[{predAccStyle}]{stats.PredictionAccuracy,10:F1}%[/]");
+            table.AddRow("[dim]PredMAE:[/]", $"[cyan]{stats.AvgPredictionError * 100,10:F3}%[/]");  // Show as percentage
         }
         else
         {
@@ -247,8 +248,11 @@ public static class TrainingDisplay
         table.AddRow("[dim]WinRate:[/]", hasData ? $"[{wrStyle}]{rollingWr,12:F1}%[/]" : "[dim]          -[/]");
         table.AddRow("[dim]PF:[/]", hasData ? $"[{pfStyle}]{rollingPf,12:F2}[/]" : "[dim]          -[/]");
         table.AddRow("[dim]AvgTrade:[/]", hasData ? $"[{avgProfitStyle}]${rollingAvgProfit,11:N2}[/]" : "[dim]          -[/]");
-        table.AddRow("[dim]AvgHold:[/]", hasData ? $"[cyan]{avgHoldStr,12}[/]" : "[dim]          -[/]");
-        table.AddRow("[dim]Excl:[/]", "[dim]Exploration[/]");
+        
+        // Prediction stats
+        var predAccStyle = stats.PredictionAccuracy > 55 ? "green" : stats.PredictionAccuracy > 50 ? "yellow" : "red";
+        table.AddRow("[dim]PredAcc:[/]", stats.TotalPredictions > 0 ? $"[{predAccStyle}]{stats.PredictionAccuracy,10:F1}%[/]" : "[dim]          -[/]");
+        table.AddRow("[dim]Preds:[/]", $"[dim]{stats.TotalPredictions,12:N0}[/]");
         
         return new Panel(table)
             .Header("[bold aqua]Rolling[/]")

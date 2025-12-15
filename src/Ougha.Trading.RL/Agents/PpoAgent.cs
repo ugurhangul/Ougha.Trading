@@ -49,7 +49,7 @@ public class PpoAgent : IAgent
     
     // Price prediction thresholds (consistent across all methods)
     private const float TRADE_THRESHOLD = 0.0005f;  // 0.05% minimum predicted move
-    private const float EXPLORATION_RATE = 0.15f;    // 15% random actions during training
+    private const float EXPLORATION_RATE = 0.10f;   // 10% random trades to bootstrap supervised learning
     private readonly Random _random = new();
     private readonly long[] _symbolBuffer = new long[MAX_INFERENCE_BATCH];
 
@@ -58,6 +58,10 @@ public class PpoAgent : IAgent
     
     // Pre-allocated Experience array for buffering
     private readonly Experience[] _experienceBuffer = new Experience[MAX_INFERENCE_BATCH];
+    
+    // Last predictions for accuracy tracking
+    private float[] _lastPredictions = [];
+    public float[] LastPredictions => _lastPredictions;
  
     public PpoAgent(int batchSize = 256,
         int rolloutHorizon = 8192,
@@ -74,10 +78,10 @@ public class PpoAgent : IAgent
         _gaeLambda = gaeLambda;
         _clipEpsilon = clipEpsilon;
         _valueCoef = 0.5f;
-        _tpSlCoef = 0.1f;  // TP/SL loss weight
-        _entropyCoef = 0.60f;  // High initial for exploration (raised from 0.30)
-        _minEntropyCoef = 0.50f;  // Higher floor (raised from 0.20) - prevents policy collapse
-        _updateEpochs = 6;  // Increased from 4 for better sample utilization
+        _tpSlCoef = 0.3f;  // Increased from 0.1 for better SL learning
+        _entropyCoef = 0.05f;  // Reduced from 0.60 for policy convergence
+        _minEntropyCoef = 0.01f;  // Reduced from 0.50
+        _updateEpochs = 6;
         
         // LR Scheduling - linear decay over expected training
         _initialLr = learningRate;
@@ -242,6 +246,7 @@ public class PpoAgent : IAgent
             
             // Track prediction variance for diagnostics
             _lastPolicyEntropy = (float)predData.Select(p => Math.Abs(p)).Average();
+            _lastPredictions = predData;  // Store for accuracy tracking
             
             // Explicitly dispose tensors
             foreach (var t in tensors) t.Dispose();
@@ -295,7 +300,8 @@ public class PpoAgent : IAgent
         float[] tpMultipliers,
         float[] slMultipliers,
         float[]? hindsightSlMultipliers = null,
-        bool[]? hadPositions = null)
+        bool[]? hadPositions = null,
+        float[]? actualPriceChanges = null)
     {
         var count = states.Length;
         var usePreallocated = count <= MAX_INFERENCE_BATCH;
@@ -318,6 +324,7 @@ public class PpoAgent : IAgent
                 SlMultiplier = slMultipliers[i],
                 HindsightSlMultiplier = hindsightSlMultipliers?[i] ?? -1f,
                 HadPosition = hadPositions?[i] ?? false,
+                ActualPriceChange = actualPriceChanges?[i] ?? -999f,
                 EpisodeId = _rolloutBuffer.CurrentEpisodeId,
                 SequenceIndex = seqIdx,
                 SymbolIdx = states[i].SymbolId  // Use actual symbol ID, not loop index
@@ -429,27 +436,22 @@ public class PpoAgent : IAgent
                             // Clean up input tensors
                             foreach (var st in stateTensors) st.Dispose();
                             
-                            // Price Prediction Loss: train toward direction based on ACTUAL ACTION + outcome
-                            // BUY (action=1) with positive advantage → target +1%
-                            // BUY (action=1) with negative advantage → target -1% (should have done opposite)
-                            // SELL (action=2) with positive advantage → target -1% (prediction should be negative)
-                            // SELL (action=2) with negative advantage → target +1%
-                            // HOLD/CLOSE → target 0 (no directional signal)
+                            // ============================================
+                            // SUPERVISED PREDICTION LOSS (new approach)
+                            // ============================================
+                            // Train prediction head on ACTUAL price changes, not advantage-based targets
+                            // This decouples prediction learning from RL value estimation
                             var predSqueezed = pricePred.squeeze();
                             
-                            // Action direction: +1 for BUY, -1 for SELL, 0 for HOLD/CLOSE
-                            var buyMask = (actions == 1).to_type(ScalarType.Float32);
-                            var sellMask = (actions == 2).to_type(ScalarType.Float32);
-                            var actionDirection = buyMask - sellMask;  // +1, -1, or 0
+                            // Get actual price changes from closed trades
+                            var actualChanges = tensor(sequence.ActualPriceChanges, ScalarType.Float32, _device);
                             
-                            // If advantage positive, reinforce the action direction
-                            // If advantage negative, train toward opposite direction
-                            var targetPred = actionDirection * normalizedAdvs.sign() * 0.01f;
+                            // Mask: only train on experiences where a trade closed (sentinel = -999)
+                            var hasActualData = (actualChanges > -900f).to_type(ScalarType.Float32);
                             
-                            // Only weight loss for trade actions (not HOLD/CLOSE)
-                            var tradeMaskPred = (buyMask + sellMask);  // 1 for trades, 0 for HOLD/CLOSE
-                            var predError = (predSqueezed - targetPred).pow(2) * (normalizedAdvs.abs() + 0.1f);
-                            var predictionLoss = (predError * tradeMaskPred).sum() / (tradeMaskPred.sum() + 1e-8f);
+                            // Supervised MSE loss on actual price movements
+                            var predError = (predSqueezed - actualChanges).pow(2) * hasActualData;
+                            var predictionLoss = predError.sum() / (hasActualData.sum() + 1e-8f);
 
                             // Value loss (unchanged)
                             var valuesSqueezed = valuesTensor.squeeze();
@@ -551,6 +553,7 @@ public class PpoAgent : IAgent
             var allSlMults = tensor(dataset.SlMultipliers, dtype: ScalarType.Float32, device: _device);
             var allHindsightSl = tensor(dataset.HindsightSlMultipliers, dtype: ScalarType.Float32, device: _device);
             var allHadPositions = tensor(dataset.HadPositions.Select(p => p ? 1f : 0f).ToArray(), ScalarType.Float32, _device);
+            var allActualPriceChanges = tensor(dataset.ActualPriceChanges, dtype: ScalarType.Float32, device: _device);
             var allOldValues = tensor(dataset.OldValues, dtype: ScalarType.Float32, device: _device);
 
             for (var epoch = 0; epoch < _updateEpochs; epoch++)
@@ -577,15 +580,12 @@ public class PpoAgent : IAgent
                         
                         var (pricePred, values, slPred, closePred) = _model.forward(stateTensors);
 
-                        // Price Prediction Loss: action-aware (same as sequence-based)
+                        // SUPERVISED PREDICTION LOSS (same as sequence-based)
                         var predSqueezed = pricePred.squeeze();
-                        var buyMask = (actions == 1).to_type(ScalarType.Float32);
-                        var sellMask = (actions == 2).to_type(ScalarType.Float32);
-                        var actionDirection = buyMask - sellMask;
-                        var targetPred = actionDirection * normalizedAdvs.sign() * 0.01f;
-                        var tradeMaskPred = buyMask + sellMask;
-                        var predError = (predSqueezed - targetPred).pow(2) * (normalizedAdvs.abs() + 0.1f);
-                        var predictionLoss = (predError * tradeMaskPred).sum() / (tradeMaskPred.sum() + 1e-8f);
+                        var actualChanges = allActualPriceChanges.index_select(0, batchIndices);
+                        var hasActualData = (actualChanges > -900f).to_type(ScalarType.Float32);
+                        var predError = (predSqueezed - actualChanges).pow(2) * hasActualData;
+                        var predictionLoss = predError.sum() / (hasActualData.sum() + 1e-8f);
 
                         var valuesSqueezed = values.squeeze();
                         var valueClipped = oldValuesBatch + clamp(valuesSqueezed - oldValuesBatch, -_clipEpsilon, _clipEpsilon);

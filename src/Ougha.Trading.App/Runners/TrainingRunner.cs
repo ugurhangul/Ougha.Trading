@@ -295,6 +295,20 @@ public static class TrainingRunner
                                 stats.ActionTimeMs = actionTimer.Elapsed.TotalMilliseconds;
 
                                 env.SetTpSlMultipliersBatch(tpSlMults);
+                                
+                                // Store entry predictions for accuracy tracking when trades open
+                                var predictions = (agent as PpoAgent)?.LastPredictions;
+                                if (predictions != null && predictions.Length == symbols.Count)
+                                {
+                                    for (var i = 0; i < actions.Length; i++)
+                                    {
+                                        // If opening a new trade (BUY=1 or SELL=2) and didn't have position
+                                        if ((actions[i] == 1 || actions[i] == 2) && !currentPositions[i])
+                                        {
+                                            env.SetEntryPrediction(symbols[i], predictions[i]);
+                                        }
+                                    }
+                                }
 
                                 if (actions.Length > 0)
                                 {
@@ -350,6 +364,7 @@ public static class TrainingRunner
                                 var tpMults = new float[stateInputs.Length];
                                 var slMults = new float[stateInputs.Length];
                                 var hindsightSlMults = new float[stateInputs.Length];
+                                var actualPriceChanges = new float[stateInputs.Length];
                                 for (var i = 0; i < stateInputs.Length; i++)
                                 {
                                     tpMults[i] = tpSlMults[i, 0];
@@ -359,14 +374,22 @@ public static class TrainingRunner
                                     // Only populated for symbols where a trade was closed
                                     var symbol = symbols[i];
                                     hindsightSlMults[i] = env.GetHindsightSlMultiplier(symbol);
+                                    actualPriceChanges[i] = env.GetActualPriceChange(symbol);
+                                    
+                                    // Record prediction accuracy when a trade closed
+                                    if (actualPriceChanges[i] > -900f)  // Trade closed
+                                    {
+                                        var entryPred = env.GetEntryPrediction(symbol);
+                                        stats.RecordPrediction(entryPred, actualPriceChanges[i]);
+                                    }
                                     
                                     // Clear tracking after retrieving (ready for next trade)
                                     if (hindsightSlMults[i] > 0)
                                         env.ClearHindsightTracking(symbol);
                                 }
 
-                                // Add experience with accumulated M1 rewards, hindsight SL, and position state
-                                agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs, tpMults, slMults, hindsightSlMults, currentPositions);
+                                // Add experience with accumulated M1 rewards, hindsight SL, position state, and actual price change
+                                agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs, tpMults, slMults, hindsightSlMults, currentPositions, actualPriceChanges);
 
                                 for (var i = 0; i < stateInputs.Length; i++)
                                 {
@@ -589,11 +612,12 @@ public static class TrainingRunner
 
                             agent.DecayEpsilon();
                             
-                            // Check for entropy reset every 50 episodes if PPO (more frequent for earlier intervention)
-                            if (ep % 50 == 0 && agent is PpoAgent ppoAgent)
+                            // Check for entropy reset every 200 episodes (less frequent for supervised mode)
+                            // Higher threshold since prediction-based actions are expected to be skewed
+                            if (ep % 200 == 0 && agent is PpoAgent ppoAgent)
                             {
                                 var actionCountsArr = stats.GetActionCountsAsArray();
-                                if (ppoAgent.CheckAndResetEntropy(actionCountsArr, skewThreshold: 0.55f))  // Reduced from 0.70 for earlier intervention
+                                if (ppoAgent.CheckAndResetEntropy(actionCountsArr, skewThreshold: 0.85f))  // High threshold for supervised
                                 {
                                     Log.Information("[TrainingRunner] Entropy reset triggered at episode {Episode}", ep);
                                     stats.EntropyResetCount++;
@@ -734,7 +758,7 @@ public static class TrainingRunner
         return new PpoAgent(
             batchSize: 256, // Increased for RTX 3090
             rolloutHorizon: 2048, // Reduced from 4096 for fresher samples
-            gamma: 0.99f,
+            gamma: 0.95f,  // Reduced from 0.99 for day trading (shorter horizon)
             learningRate: 3e-4f,
             useCuda: budget.Hardware.GpuAvailable,
             newsFeatureSize: newsFeatureSize,

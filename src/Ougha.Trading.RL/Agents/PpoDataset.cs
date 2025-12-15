@@ -13,6 +13,7 @@ internal class PpoDataset
     public readonly float[] SlMultipliers;
     public readonly float[] HindsightSlMultipliers;  // Optimal SL from MAE tracking
     public readonly bool[] HadPositions;  // Whether agent had position (for close signal)
+    public readonly float[] ActualPriceChanges;  // Actual price change for supervised prediction
     public readonly float[] OldValues;  // For value function clipping
     
     public PpoDataset(Experience[] rollouts, float[] advantages, float[] returns, float[]? oldValues = null)
@@ -25,6 +26,7 @@ internal class PpoDataset
         SlMultipliers = new float[n];
         HindsightSlMultipliers = new float[n];
         HadPositions = new bool[n];
+        ActualPriceChanges = new float[n];
         Advantages = advantages;
         Returns = returns;
         OldValues = oldValues ?? new float[n];  // Zero if not provided
@@ -38,6 +40,7 @@ internal class PpoDataset
             SlMultipliers[i] = rollouts[i].SlMultiplier;
             HindsightSlMultipliers[i] = rollouts[i].HindsightSlMultiplier;
             HadPositions[i] = rollouts[i].HadPosition;
+            ActualPriceChanges[i] = rollouts[i].ActualPriceChange;
         }
     }
 }

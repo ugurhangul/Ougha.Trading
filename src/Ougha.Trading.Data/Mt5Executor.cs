@@ -98,9 +98,37 @@ public class Mt5Executor : IOrderExecutor, ISymbolInfoProvider, IDisposable
                 (string)info.currency_base,
                 (string)info.currency_profit,
                 (int)info.digits,
-                (double)info.volume_min
+                (double)info.volume_min,
+                DetectCategory(symbol)
             );
         }
+    }
+    
+    private static SymbolCategory DetectCategory(string symbol)
+    {
+        var s = symbol.ToUpperInvariant();
+        
+        // Crypto
+        if (s.Contains("BTC") || s.Contains("ETH") || s.Contains("XRP") || 
+            s.Contains("LTC") || s.Contains("DOGE") || s.Contains("SOL") ||
+            s.Contains("ADA") || s.Contains("CRYPTO"))
+            return SymbolCategory.Crypto;
+            
+        // Indices
+        if (s.Contains("US30") || s.Contains("US500") || s.Contains("NAS") ||
+            s.Contains("DAX") || s.Contains("FTSE") || s.Contains("NDX") ||
+            s.Contains("SPX") || s.Contains("DJI") || s.Contains("UK100") ||
+            s.Contains("DE40") || s.Contains("JP225"))
+            return SymbolCategory.Indices;
+            
+        // Commodities
+        if (s.Contains("XAUUSD") || s.Contains("GOLD") || s.Contains("SILVER") ||
+            s.Contains("XAGUSD") || s.Contains("OIL") || s.Contains("BRENT") ||
+            s.Contains("WTI") || s.Contains("NATGAS"))
+            return SymbolCategory.Commodities;
+            
+        // Default to Forex
+        return SymbolCategory.Forex;
     }
 
     public async Task<OrderResult> ExecuteAsync(
