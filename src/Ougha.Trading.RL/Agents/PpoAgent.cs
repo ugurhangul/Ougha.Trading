@@ -79,8 +79,8 @@ public class PpoAgent : IAgent
         _clipEpsilon = clipEpsilon;
         _valueCoef = 0.5f;
         _tpSlCoef = 0.3f;  // Increased from 0.1 for better SL learning
-        _entropyCoef = 0.05f;  // Reduced from 0.60 for policy convergence
-        _minEntropyCoef = 0.01f;  // Reduced from 0.50
+        _entropyCoef = 0.20f;  // Increased from 0.05 for better exploration early in training
+        _minEntropyCoef = 0.02f;  // Slightly higher floor to prevent full collapse
         _updateEpochs = 6;
         
         // LR Scheduling - linear decay over expected training
@@ -303,18 +303,44 @@ public class PpoAgent : IAgent
         float[] slMultipliers,
         float[]? hindsightSlMultipliers = null,
         bool[]? hadPositions = null,
-        float[]? actualPriceChanges = null)
+        float[]? actualPriceChanges = null,
+        bool[]? validDataMask = null)
     {
         var count = states.Length;
         var usePreallocated = count <= MAX_INFERENCE_BATCH;
         
-        // Use pre-allocated buffer when batch size allows
-        var experiences = usePreallocated ? _experienceBuffer : new Experience[count];
-        
+        // Count valid experiences (skip symbols without price data)
+        var validCount = 0;
         for (var i = 0; i < count; i++)
         {
+            if (validDataMask == null || validDataMask[i])
+                validCount++;
+        }
+        
+        // Skip if no valid data
+        if (validCount == 0)
+            return;
+        
+        // Use pre-allocated buffer when batch size allows, otherwise allocate new
+        Experience[] experiences;
+        if (usePreallocated && validCount <= MAX_INFERENCE_BATCH)
+        {
+            experiences = _experienceBuffer;
+        }
+        else
+        {
+            experiences = new Experience[validCount];
+        }
+        
+        var writeIdx = 0;
+        for (var i = 0; i < count; i++)
+        {
+            // Skip symbols without valid price data
+            if (validDataMask != null && !validDataMask[i])
+                continue;
+            
             var seqIdx = _rolloutBuffer.GetNextSequenceIndex();
-            experiences[i] = new Experience
+            experiences[writeIdx] = new Experience
             {
                 State = states[i],
                 Action = actions[i],
@@ -331,12 +357,13 @@ public class PpoAgent : IAgent
                 SequenceIndex = seqIdx,
                 SymbolIdx = states[i].SymbolId  // Use actual symbol ID, not loop index
             };
+            writeIdx++;
         }
         
         // Pass a span/slice if using pre-allocated buffer with smaller batch
-        if (usePreallocated && count < MAX_INFERENCE_BATCH)
+        if (usePreallocated && validCount < MAX_INFERENCE_BATCH)
         {
-            _rolloutBuffer.AddExperienceBatch(new ArraySegment<Experience>(experiences, 0, count));
+            _rolloutBuffer.AddExperienceBatch(new ArraySegment<Experience>(experiences, 0, validCount));
         }
         else
         {
@@ -865,13 +892,25 @@ public class PpoAgent : IAgent
                     continue;
                 }
                 
+                // Check dimensions and copy with bounds safety
+                var tfRows = tfData.GetLength(0);
+                var tfCols = tfData.GetLength(1);
+                
                 for (var row = 0; row < WINDOW_SIZE; row++)
                 {
                     var rowOffset = batchOffset + row * NUM_FEATURES;
                     for (var col = 0; col < NUM_FEATURES; col++)
                     {
-                        var val = tfData[row, col];
-                        tfPackedBuffer[rowOffset + col] = float.IsFinite(val) ? val : 0f;
+                        // Safe access with bounds check
+                        if (row < tfRows && col < tfCols)
+                        {
+                            var val = tfData[row, col];
+                            tfPackedBuffer[rowOffset + col] = float.IsFinite(val) ? val : 0f;
+                        }
+                        else
+                        {
+                            tfPackedBuffer[rowOffset + col] = 0f;  // Zero-pad if out of bounds
+                        }
                     }
                 }
             }
@@ -928,8 +967,16 @@ public class PpoAgent : IAgent
     /// If source is smaller than expectedLen, remaining slots are zeroed.
     /// If source is larger, only first expectedLen elements are copied.
     /// </summary>
-    private static void CopyFeaturesWithPadding(float[] dest, int destOffset, float[] source, int expectedLen)
+    private static void CopyFeaturesWithPadding(float[] dest, int destOffset, float[]? source, int expectedLen)
     {
+        // Handle null source by zero-filling
+        if (source == null || source.Length == 0)
+        {
+            for (var i = 0; i < expectedLen; i++)
+                dest[destOffset + i] = 0f;
+            return;
+        }
+        
         var copyLen = Math.Min(source.Length, expectedLen);
         
         // Copy available data

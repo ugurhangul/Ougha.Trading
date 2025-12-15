@@ -31,6 +31,7 @@ public interface IAgent : IDisposable
     /// <param name="hindsightSlMultipliers">Optional hindsight SL targets computed from MAE after trade closes.</param>
     /// <param name="hadPositions">Whether agent had position at each experience (for close signal training).</param>
     /// <param name="actualPriceChanges">Actual price changes from closed trades (for supervised prediction).</param>
+    /// <param name="validDataMask">Optional mask to filter out experiences from symbols without valid price data.</param>
     void AddExperienceBatchWithLogProbs(
         AgentInput[] states,
         int[] actions,
@@ -42,7 +43,8 @@ public interface IAgent : IDisposable
         float[] slMultipliers,
         float[]? hindsightSlMultipliers = null,
         bool[]? hadPositions = null,
-        float[]? actualPriceChanges = null);
+        float[]? actualPriceChanges = null,
+        bool[]? validDataMask = null);
 
     /// <summary>
     /// Perform a training step (optimization).

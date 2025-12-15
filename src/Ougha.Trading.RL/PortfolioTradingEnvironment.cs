@@ -824,6 +824,88 @@ public class PortfolioTradingEnvironment
     }
 
     /// <summary>
+    /// Check if symbol has valid price data for trading decisions.
+    /// Returns false if:
+    /// - No current bid/ask price (market closed or no data)
+    /// - Price is zero or invalid
+    /// - Weekend/holiday for forex pairs
+    /// </summary>
+    public bool HasValidPriceData(string symbol)
+    {
+        var bid = _executor.GetBid(symbol);
+        var ask = _executor.GetAsk(symbol);
+        
+        // No valid price
+        if (bid <= 0 || ask <= 0 || double.IsNaN(bid) || double.IsNaN(ask))
+            return false;
+        
+        // Check for weekend on forex pairs (crypto trades 24/7)
+        var timestamp = _executor.CurrentTime;
+        if (IsForexPair(symbol) && IsWeekend(timestamp))
+            return false;
+        
+        // Check if we have enough candle data for feature computation
+        var candles = _mtfAggregators[symbol].GetCandles("M1", 10);
+        if (candles.Count < 5)
+            return false;
+        
+        return true;
+    }
+    
+    /// <summary>
+    /// Get valid data mask for all symbols (true = has valid data, can trade).
+    /// Use this for action masking to force HOLD on symbols without data.
+    /// </summary>
+    public bool[] GetValidDataMask()
+    {
+        return _config.Symbols.Select(HasValidPriceData).ToArray();
+    }
+    
+    /// <summary>
+    /// Check if symbol is a forex pair (trades only during market hours).
+    /// Crypto pairs like BTCUSD trade 24/7.
+    /// </summary>
+    private static bool IsForexPair(string symbol)
+    {
+        // Crypto pairs that trade 24/7
+        var cryptoSymbols = new[] { "BTCUSD", "BTCJPY", "BTCEUR", "ETHUSD", "ETHBTC", "LTCUSD",
+            "BTCXAG", "BTCXAU", "BTCZAR", "BTCAUD", "BTCCNH" };
+        
+        foreach (var crypto in cryptoSymbols)
+        {
+            if (symbol.Equals(crypto, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+        
+        // All others are forex/stock/commodities that close on weekends
+        return true;
+    }
+    
+    /// <summary>
+    /// Check if timestamp falls on weekend (Saturday after close or Sunday before open).
+    /// Forex market closes Friday 22:00 UTC and opens Sunday 22:00 UTC.
+    /// </summary>
+    private static bool IsWeekend(DateTime timestamp)
+    {
+        var utc = timestamp.ToUniversalTime();
+        
+        // Saturday all day
+        if (utc.DayOfWeek == DayOfWeek.Saturday)
+            return true;
+        
+        // Sunday before 22:00 UTC
+        if (utc.DayOfWeek == DayOfWeek.Sunday && utc.Hour < 22)
+            return true;
+        
+        // Friday after 22:00 UTC
+        if (utc.DayOfWeek == DayOfWeek.Friday && utc.Hour >= 22)
+            return true;
+        
+        return false;
+    }
+
+
+    /// <summary>
     /// Build structured AgentInput for each symbol.
     /// This is the recommended method for the new ONNX agent interface.
     /// </summary>

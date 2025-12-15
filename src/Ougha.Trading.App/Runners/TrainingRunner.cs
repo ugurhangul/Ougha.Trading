@@ -287,9 +287,24 @@ public static class TrainingRunner
                                 // Get position state for action masking (prevents CLOSE when no position)
                                 var currentPositions = symbols.Select(s => env.Executor.GetPosition(s) != null).ToArray();
                                 
+                                // Get valid data mask to exclude symbols without price data (weekends, missing data)
+                                var validDataMask = env.GetValidDataMask();
+                                stats.ValidSymbolsCount = validDataMask.Count(v => v);
+                                stats.TotalSymbolsCount = validDataMask.Length;
+                                
                                 // Get action at M1 decision point (with action masking)
                                 actionTimer.Restart();
                                 var (actions, tpSlMults, logProbs) = agent.ActBatchWithTpSlAndLogProbs(stateInputs, training: true, hasPositions: currentPositions);
+                                
+                                // Force HOLD on symbols without valid price data (don't pollute training)
+                                for (var i = 0; i < actions.Length; i++)
+                                {
+                                    if (!validDataMask[i])
+                                    {
+                                        actions[i] = 0; // Force HOLD
+                                    }
+                                }
+                                
                                 foreach (var a in actions) stats.RecordAction(a);
                                 actionTimer.Stop();
                                 stats.ActionTimeMs = actionTimer.Elapsed.TotalMilliseconds;
@@ -389,7 +404,8 @@ public static class TrainingRunner
                                 }
 
                                 // Add experience with accumulated M1 rewards, hindsight SL, position state, and actual price change
-                                agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs, tpMults, slMults, hindsightSlMults, currentPositions, actualPriceChanges);
+                                // Pass validDataMask to skip experiences from symbols without price data
+                                agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs, tpMults, slMults, hindsightSlMults, currentPositions, actualPriceChanges, validDataMask);
 
                                 for (var i = 0; i < stateInputs.Length; i++)
                                 {

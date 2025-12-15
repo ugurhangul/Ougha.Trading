@@ -278,10 +278,16 @@ public class TrainingStats
             _totalPredictionError += Math.Abs(actual - predicted);
             
             // Direction accuracy: did sign match?
-            if (Math.Sign(predicted) == Math.Sign(actual) && Math.Abs(predicted) > 0.0001f)
+            // Only count if both prediction and actual are meaningful (not near-zero)
+            const float MinThreshold = 0.0001f;
+            if (Math.Abs(predicted) > MinThreshold && Math.Abs(actual) > MinThreshold)
             {
-                _correctPredictions++;
+                if (Math.Sign(predicted) == Math.Sign(actual))
+                {
+                    _correctPredictions++;
+                }
             }
+            // If actual is near-zero (price didn't move), don't count it either way
         }
     }
     
@@ -414,4 +420,9 @@ public class TrainingStats
     // Error tracking without console output
     public string? LastError { get; set; }
     public int EntropyResetCount { get; set; }
+    
+    // Valid data tracking (symbols with price data)
+    public int ValidSymbolsCount { get; set; }
+    public int TotalSymbolsCount { get; set; }
+    public double ValidSymbolsPercent => TotalSymbolsCount > 0 ? (double)ValidSymbolsCount / TotalSymbolsCount * 100 : 0;
 }

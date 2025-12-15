@@ -112,6 +112,12 @@ public static class TrainingDisplay
             table.AddRow("[dim]Epsilon:[/]", $"[magenta]{stats.Epsilon,12:F4}[/]");
             table.AddRow("", "");  // Empty row for alignment
         }
+        
+        // Show valid data symbols (important for weekends/missing data)
+        var validPct = stats.ValidSymbolsPercent;
+        var validStyle = validPct > 80 ? "green" : validPct > 50 ? "yellow" : "red";
+        table.AddRow("[dim]Valid:[/]", $"[{validStyle}]{stats.ValidSymbolsCount}/{stats.TotalSymbolsCount} ({validPct:F0}%)[/]");
+        
         table.AddRow("[dim]Equity:[/]", $"[{pnlStyle}]${stats.Equity,12:N2}[/]");
         
         return new Panel(table)
