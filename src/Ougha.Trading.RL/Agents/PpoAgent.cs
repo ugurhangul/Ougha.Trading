@@ -46,7 +46,7 @@ public class PpoAgent : IAgent
     private const int MAX_INFERENCE_BATCH = 64;
     private const int WINDOW_SIZE = 50;
     private const int NUM_FEATURES = 45;
-    private const int GAE_CHUNK_SIZE = 1024; // 4x larger for fewer forward passes
+    private const int GAE_CHUNK_SIZE = 4096; // OPTIMIZATION H1: 4x larger for better GPU utilization
     
     // Price prediction thresholds (consistent across all methods)
     private const float TRADE_THRESHOLD = 0.0002f;  // 0.02% minimum predicted move - lower for more trading
@@ -63,6 +63,9 @@ public class PpoAgent : IAgent
     // Last predictions for accuracy tracking
     private float[] _lastPredictions = [];
     public float[] LastPredictions => _lastPredictions;
+    
+    // OPTIMIZATION M3: Lazy inference network sync
+    private bool _inferenceNetDirty = true;
  
     public PpoAgent(int batchSize = 256,
         int rolloutHorizon = 8192,
@@ -117,8 +120,15 @@ public class PpoAgent : IAgent
         _packedFeatBuffer = new float[MAX_INFERENCE_BATCH * totalFeatures];
     }
 
+    /// <summary>
+    /// OPTIMIZATION M3: Lazy sync - only copy weights when dirty flag is set.
+    /// Called automatically before inference when needed.
+    /// </summary>
     public void SyncInferenceNetwork()
     {
+        if (!_inferenceNetDirty)
+            return;
+            
         using (no_grad())
         {
              var stateDict = _model.state_dict();
@@ -128,7 +138,18 @@ public class PpoAgent : IAgent
         // Reset LSTM hidden states - cached states may be invalid after weight sync
         // The model's internal state dict changed, so old cached tensors could be stale
         _inferenceNet.ResetAllHiddenStates();
+        _inferenceNetDirty = false;
     }
+    
+    /// <summary>
+    /// Mark inference network as dirty (needs resync before inference).
+    /// Called after training updates.
+    /// </summary>
+    private void MarkInferenceNetworkDirty()
+    {
+        _inferenceNetDirty = true;
+    }
+
 
     public int Act(AgentInput input, bool training = true)
     {
@@ -138,6 +159,9 @@ public class PpoAgent : IAgent
             _lastLogProb = -1.0f;  // Mark as exploration action
             return _random.Next(0, 4);  // Random action 0-3
         }
+        
+        // OPTIMIZATION M3: Lazy sync - only syncs if dirty
+        SyncInferenceNetwork();
         
         _inferenceNet.eval();
         using (no_grad())
@@ -184,6 +208,9 @@ public class PpoAgent : IAgent
         var actions = new int[count];
         var tpSlMults = new float[count, 2];
         var logProbs = new float[count];
+        
+        // OPTIMIZATION M3: Lazy sync - only syncs if dirty
+        SyncInferenceNetwork();
         
         _inferenceNet.eval();
         using (no_grad())
@@ -589,7 +616,8 @@ public class PpoAgent : IAgent
             }
         }
 
-        SyncInferenceNetwork();
+        // OPTIMIZATION M3: Mark dirty instead of immediate sync
+        MarkInferenceNetworkDirty();
         return steps > 0 ? totalLoss / steps : 0;
     }
     
@@ -697,7 +725,8 @@ public class PpoAgent : IAgent
             foreach (var t in allStateTensors) t.Dispose();
         }
 
-        SyncInferenceNetwork();
+        // OPTIMIZATION M3: Mark dirty instead of immediate sync
+        MarkInferenceNetworkDirty();
         return steps > 0 ? totalLoss / steps : 0;
     }
 

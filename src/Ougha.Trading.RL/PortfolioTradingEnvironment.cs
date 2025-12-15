@@ -53,6 +53,24 @@ public class PortfolioTradingEnvironment
     
     // Portfolio exposure service
     private readonly PortfolioExposureService _exposureService;
+    
+    // OPTIMIZATION C3: Cached ATR to avoid recomputation every call
+    private readonly Dictionary<string, double> _cachedAtr = new();
+    private readonly Dictionary<string, int> _atrLastM1Minute = new();
+    
+    // OPTIMIZATION C4: Pre-allocated arrays for ATR calculation (avoid LINQ allocations)
+    private readonly double[] _atrHighBuffer = new double[50];
+    private readonly double[] _atrLowBuffer = new double[50];
+    private readonly double[] _atrCloseBuffer = new double[50];
+    
+    // OPTIMIZATION C2: Cached shared features for BuildAgentInputs (computed once per step)
+    private float[]? _cachedSharedDxy;
+    private float[]? _cachedSharedNews;
+    private float[]? _cachedSharedCorrelation;
+    private float[]? _cachedSharedExposure;
+    private float[]? _cachedSharedTimeFeatures;
+    private Dictionary<string, double>? _cachedPrices;
+    private int _cachedFeaturesM1Minute = -1;
 
     private int _currentTick;
     private double _peakEquity;
@@ -724,18 +742,50 @@ public class PortfolioTradingEnvironment
         };
     }
 
+    /// <summary>
+    /// Get cached ATR value, only recomputing when M1 candle closes.
+    /// OPTIMIZATION C3: Reduces ATR calculations by 60x.
+    /// </summary>
     private double CalculateAtr(string symbol)
     {
+        // FIX: Don't use cache when _lastM1Minute is -1 (no M1 candles yet)
+        // Check if cached value is still valid (same M1 minute and valid minute)
+        if (_lastM1Minute >= 0
+            && _atrLastM1Minute.TryGetValue(symbol, out var lastMinute) 
+            && lastMinute == _lastM1Minute 
+            && _cachedAtr.TryGetValue(symbol, out var cached)
+            && cached > 0)  // Ensure we have a valid cached value
+        {
+            return cached;
+        }
+        
         var history = _mtfAggregators[symbol].GetCandles("M1", 50);
         if (history.Count < 15)
             return 0;
 
-        var h = history.Select(c => c.High).ToArray();
-        var l = history.Select(c => c.Low).ToArray();
-        var c = history.Select(c => c.Close).ToArray();
+        // OPTIMIZATION C4: Use pre-allocated buffers instead of LINQ ToArray()
+        var count = Math.Min(history.Count, 50);
+        for (var i = 0; i < count; i++)
+        {
+            _atrHighBuffer[i] = history[i].High;
+            _atrLowBuffer[i] = history[i].Low;
+            _atrCloseBuffer[i] = history[i].Close;
+        }
 
-        var atrSeries = Technicals.Atr(h, l, c, 14);
-        return atrSeries[^1];
+        var atrSeries = Technicals.Atr(
+            _atrHighBuffer.AsSpan(0, count).ToArray(), 
+            _atrLowBuffer.AsSpan(0, count).ToArray(), 
+            _atrCloseBuffer.AsSpan(0, count).ToArray(), 14);
+        var atrValue = atrSeries[^1];
+        
+        // Only cache if we have a valid M1 minute
+        if (_lastM1Minute >= 0)
+        {
+            _cachedAtr[symbol] = atrValue;
+            _atrLastM1Minute[symbol] = _lastM1Minute;
+        }
+        
+        return atrValue;
     }
 
     /// <summary>
@@ -833,25 +883,109 @@ public class PortfolioTradingEnvironment
 
     /// <summary>
     /// Build structured AgentInput for each symbol.
-    /// This is the recommended method for the new ONNX agent interface.
+    /// OPTIMIZATION C2: Compute shared features ONCE, then reuse for all symbols.
     /// </summary>
     public AgentInput[] BuildAgentInputs()
     {
         var inputs = new AgentInput[_config.Symbols.Length];
+        
+        // OPTIMIZATION C2: Compute shared features ONCE per M1 candle
+        // These features are the same for all symbols, so computing them once saves 90%
+        RefreshSharedFeaturesIfNeeded();
 
         for (var i = 0; i < _config.Symbols.Length; i++)
         {
             var symbol = _config.Symbols[i];
-            inputs[i] = BuildAgentInputForSymbol(symbol);
+            inputs[i] = BuildAgentInputForSymbolOptimized(symbol);
         }
 
         return inputs;
     }
+    
+    /// <summary>
+    /// Refresh shared features cache if M1 minute changed.
+    /// OPTIMIZATION C2: Avoids recomputing same data for each symbol.
+    /// </summary>
+    private void RefreshSharedFeaturesIfNeeded()
+    {
+        // FIX: Always compute on first call (_cachedFeaturesM1Minute starts at -1)
+        // Also ensure we recompute when minute changes
+        var needsRefresh = _cachedSharedDxy == null 
+                          || _cachedFeaturesM1Minute != _lastM1Minute
+                          || _cachedFeaturesM1Minute == -1;
+        
+        if (!needsRefresh)
+            return;
+            
+        _cachedFeaturesM1Minute = _lastM1Minute;
+        
+        // Build price dictionary ONCE
+        _cachedPrices ??= new Dictionary<string, double>(_config.Symbols.Length);
+        _cachedPrices.Clear();
+        foreach (var sym in _config.Symbols)
+        {
+            var price = _executor.GetBid(sym);
+            if (price > 0)
+                _cachedPrices[sym] = price;
+        }
+        
+        // Compute shared features ONCE - set to null first to ensure we don't use stale data
+        _cachedSharedDxy = null;
+        _cachedSharedNews = null;
+        _cachedSharedCorrelation = null;
+        _cachedSharedExposure = null;
+        
+        try
+        {
+            if (_cachedPrices.Count > 0)
+                _cachedSharedDxy = _dxyService.BuildDxyFeatures(_cachedPrices, _executor.CurrentTime);
+        }
+        catch (Exception ex) { Log.Debug(ex, "DXY calculation error"); }
+        
+        try
+        {
+            _cachedSharedNews = _newsService.BuildNewsFeatures(_executor.CurrentTime, _config.Symbols);
+        }
+        catch (Exception ex) { Log.Debug(ex, "News feature calculation error"); }
+        
+        try
+        {
+            if (_cachedPrices.Count > 0)
+                _cachedSharedCorrelation = _correlationService.BuildCorrelationFeatures(_cachedPrices, _config.Symbols);
+        }
+        catch (Exception ex) { Log.Debug(ex, "Correlation calculation error"); }
+        
+        try
+        {
+            var positions = _executor.GetPositions().ToList();
+            var equity = _executor.GetEquity();
+            var freeMargin = _executor.GetFreeMargin();
+            var usedMargin = equity - freeMargin;
+            _cachedSharedExposure = _exposureService.BuildExposureFeatures(positions, equity, freeMargin, usedMargin, _config.Symbols.Length * 2);
+        }
+        catch (Exception ex) { Log.Debug(ex, "Exposure calculation error"); }
+        
+        _cachedSharedTimeFeatures = MultiTimeframeStateBuilder.BuildTimeFeatures(_executor.CurrentTime);
+    }
+
+
 
     /// <summary>
     /// Build structured AgentInput for a single symbol.
+    /// DEPRECATED: Use BuildAgentInputForSymbolOptimized via BuildAgentInputs() for better performance.
     /// </summary>
     private AgentInput BuildAgentInputForSymbol(string symbol)
+    {
+        // Fallback to ensure shared features are computed
+        RefreshSharedFeaturesIfNeeded();
+        return BuildAgentInputForSymbolOptimized(symbol);
+    }
+    
+    /// <summary>
+    /// OPTIMIZED: Build AgentInput using cached shared features.
+    /// OPTIMIZATION C2: Shared features (DXY, correlation, etc.) are computed once per step.
+    /// </summary>
+    private AgentInput BuildAgentInputForSymbolOptimized(string symbol)
     {
         var mtfBuilder = _mtfBuilders[symbol];
         var mtfAggregator = _mtfAggregators[symbol];
@@ -903,73 +1037,20 @@ public class PortfolioTradingEnvironment
 
         var closedTfs = _lastClosedTimeframes.GetValueOrDefault(symbol) ?? new List<string>();
         
-        // Build DXY features from current prices
-        float[]? dxyFeatures = null;
-        try
-        {
-            var currentPrices = new Dictionary<string, double>();
-            foreach (var sym in _config.Symbols)
-            {
-                var price = _executor.GetBid(sym);
-                if (price > 0)
-                    currentPrices[sym] = price;
-            }
-            if (currentPrices.Count > 0)
-                dxyFeatures = _dxyService.BuildDxyFeatures(currentPrices, _executor.CurrentTime);
-        }
-        catch (Exception ex) { Log.Debug(ex, "DXY calculation error for {Symbol}", symbol); }
-        
-        // Build news features for economic events
-        float[]? newsFeatures = null;
-        try
-        {
-            newsFeatures = _newsService.BuildNewsFeatures(_executor.CurrentTime, _config.Symbols);
-        }
-        catch (Exception ex) { Log.Debug(ex, "News feature calculation error"); }
-        
-        // Build correlation features
-        float[]? correlationFeatures = null;
-        try
-        {
-            var currentPrices = new Dictionary<string, double>();
-            foreach (var sym in _config.Symbols)
-            {
-                var price = _executor.GetBid(sym);
-                if (price > 0)
-                    currentPrices[sym] = price;
-            }
-            if (currentPrices.Count > 0)
-                correlationFeatures = _correlationService.BuildCorrelationFeatures(currentPrices, _config.Symbols);
-        }
-        catch (Exception ex) { Log.Debug(ex, "Correlation calculation error"); }
-        
-        // Build portfolio exposure features
-        float[]? portfolioExposure = null;
-        try
-        {
-            var positions = _executor.GetPositions().ToList();
-            var equity = _executor.GetEquity();
-            var freeMargin = _executor.GetFreeMargin();
-            var usedMargin = equity - freeMargin;
-            portfolioExposure = _exposureService.BuildExposureFeatures(positions, equity, freeMargin, usedMargin, _config.Symbols.Length * 2);
-        }
-        catch (Exception ex) { Log.Debug(ex, "Exposure calculation error"); }
-
-        // Build time-of-day features for session awareness
-        var timeFeatures = MultiTimeframeStateBuilder.BuildTimeFeatures(_executor.CurrentTime);
-
+        // OPTIMIZATION C2: Use cached shared features instead of recomputing
         return mtfBuilder.BuildAgentInput(
             symbol: symbol,
             portfolioFeatures: portfolioFeatures,
             riskState: riskState,
             closedTimeframes: closedTfs,
-            newsFeatures: newsFeatures,
-            correlationFeatures: correlationFeatures,
-            portfolioExposure: portfolioExposure,
-            dxyFeatures: dxyFeatures,
-            timeFeatures: timeFeatures
+            newsFeatures: _cachedSharedNews,
+            correlationFeatures: _cachedSharedCorrelation,
+            portfolioExposure: _cachedSharedExposure,
+            dxyFeatures: _cachedSharedDxy,
+            timeFeatures: _cachedSharedTimeFeatures
         );
     }
+
 
     public Task<float[]> ResetAsync()
     {
@@ -1016,6 +1097,17 @@ public class PortfolioTradingEnvironment
         
         // Reset exposure service
         _exposureService.Reset();
+        
+        // OPTIMIZATION: Reset cached values
+        _cachedAtr.Clear();
+        _atrLastM1Minute.Clear();
+        _cachedFeaturesM1Minute = -1;
+        _cachedSharedDxy = null;
+        _cachedSharedNews = null;
+        _cachedSharedCorrelation = null;
+        _cachedSharedExposure = null;
+        _cachedSharedTimeFeatures = null;
+        _cachedPrices?.Clear();
 
         return Task.FromResult(new float[StateSize]);
     }

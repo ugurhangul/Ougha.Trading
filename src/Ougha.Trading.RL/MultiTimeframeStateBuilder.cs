@@ -170,7 +170,7 @@ public class MultiTimeframeStateBuilder
 
     /// <summary>
     /// Compute confluence features across timeframes.
-    /// Features include trend alignment, volatility regime, RSI confluence, etc.
+    /// OPTIMIZATION H4: Uses direct array access instead of LINQ to reduce allocations.
     /// </summary>
     public float[] ComputeConfluenceFeatures()
     {
@@ -179,83 +179,155 @@ public class MultiTimeframeStateBuilder
 
         var confluence = new float[10];
 
-        var availableTfs = Timeframes
-            .Where(tf => _lastCandleTimes[tf] > DateTime.MinValue)
-            .ToList();
+        // OPTIMIZATION H4: Count available timeframes directly without LINQ
+        var availableCount = 0;
+        Span<bool> available = stackalloc bool[Timeframes.Length];
+        for (var i = 0; i < Timeframes.Length; i++)
+        {
+            available[i] = _lastCandleTimes[Timeframes[i]] > DateTime.MinValue;
+            if (available[i]) availableCount++;
+        }
 
-        if (availableTfs.Count < 2)
+        if (availableCount < 2)
         {
             _cachedConfluence = confluence;
             _confluenceDirty = false;
             return confluence;
         }
 
-        var sma7Idx = 4;
-        var sma21Idx = 6;
-        var rsi14Idx = 29;
-        var macdHistIdx = 33;
-        var volRegimeIdx = 39;
+        const int sma7Idx = 4;
+        const int sma21Idx = 6;
+        const int rsi14Idx = 29;
+        const int macdHistIdx = 33;
+        const int volRegimeIdx = 39;
 
-        var trends = new List<int>();
-        var volRegimes = new List<float>();
-        var rsis = new List<float>();
-        var macdHists = new List<float>();
+        // OPTIMIZATION H4: Use pre-sized arrays instead of List<T>
+        Span<int> trends = stackalloc int[6];
+        Span<float> volRegimes = stackalloc float[6];
+        Span<float> rsis = stackalloc float[6];
+        Span<float> macdHists = stackalloc float[6];
+        var trendCount = 0;
+        var volCount = 0;
+        var rsiCount = 0;
+        var macdCount = 0;
 
-        foreach (var tf in availableTfs)
+        var lastRow = _windowSize - 1;
+
+        for (var i = 0; i < Timeframes.Length; i++)
         {
-            var buffer = _featureBuffers[tf];
-            var lastRow = _windowSize - 1;
+            if (!available[i]) continue;
+            
+            var buffer = _featureBuffers[Timeframes[i]];
 
             if (lastRow >= 0 && lastRow < buffer.GetLength(0))
             {
                 var sma7 = buffer[lastRow, Math.Min(sma7Idx, _nFeatures - 1)];
                 var sma21 = buffer[lastRow, Math.Min(sma21Idx, _nFeatures - 1)];
-                trends.Add(sma7 > sma21 ? 1 : (sma7 < sma21 ? -1 : 0));
+                trends[trendCount++] = sma7 > sma21 ? 1 : (sma7 < sma21 ? -1 : 0);
 
                 if (volRegimeIdx < _nFeatures)
-                    volRegimes.Add(buffer[lastRow, volRegimeIdx]);
+                    volRegimes[volCount++] = buffer[lastRow, volRegimeIdx];
 
                 if (rsi14Idx < _nFeatures)
-                    rsis.Add(buffer[lastRow, rsi14Idx]);
+                    rsis[rsiCount++] = buffer[lastRow, rsi14Idx];
 
                 if (macdHistIdx < _nFeatures)
-                    macdHists.Add(buffer[lastRow, macdHistIdx]);
+                    macdHists[macdCount++] = buffer[lastRow, macdHistIdx];
             }
         }
 
-        if (trends.Count > 0)
-            confluence[0] = trends.Sum() / (float)trends.Count;
+        // OPTIMIZATION H4: Inline aggregations instead of LINQ
+        if (trendCount > 0)
+        {
+            var sum = 0;
+            for (var i = 0; i < trendCount; i++) sum += trends[i];
+            confluence[0] = sum / (float)trendCount;
+        }
 
-        if (trends.Count > 1)
-            confluence[1] = trends.All(t => t > 0) || trends.All(t => t < 0) ? 1f : 0f;
+        if (trendCount > 1)
+        {
+            var allPos = true;
+            var allNeg = true;
+            for (var i = 0; i < trendCount; i++)
+            {
+                if (trends[i] <= 0) allPos = false;
+                if (trends[i] >= 0) allNeg = false;
+            }
+            confluence[1] = (allPos || allNeg) ? 1f : 0f;
+        }
 
-        if (volRegimes.Count > 0)
-            confluence[2] = volRegimes.Average();
+        if (volCount > 0)
+        {
+            var sum = 0f;
+            for (var i = 0; i < volCount; i++) sum += volRegimes[i];
+            confluence[2] = sum / volCount;
+        }
 
-        if (volRegimes.Count > 1)
-            confluence[3] = volRegimes.All(v => v > 0.5f) || volRegimes.All(v => v <= 0.5f) ? 1f : 0f;
+        if (volCount > 1)
+        {
+            var allHigh = true;
+            var allLow = true;
+            for (var i = 0; i < volCount; i++)
+            {
+                if (volRegimes[i] <= 0.5f) allHigh = false;
+                if (volRegimes[i] > 0.5f) allLow = false;
+            }
+            confluence[3] = (allHigh || allLow) ? 1f : 0f;
+        }
 
-        if (rsis.Count > 0)
-            confluence[4] = rsis.Average() / 100f;
+        if (rsiCount > 0)
+        {
+            var sum = 0f;
+            for (var i = 0; i < rsiCount; i++) sum += rsis[i];
+            confluence[4] = (sum / rsiCount) / 100f;
+        }
 
-        if (rsis.Count > 1)
-            confluence[5] = (rsis.Max() - rsis.Min()) / 100f;
+        if (rsiCount > 1)
+        {
+            var min = rsis[0];
+            var max = rsis[0];
+            for (var i = 1; i < rsiCount; i++)
+            {
+                if (rsis[i] < min) min = rsis[i];
+                if (rsis[i] > max) max = rsis[i];
+            }
+            confluence[5] = (max - min) / 100f;
+        }
 
-        if (macdHists.Count > 0)
-            confluence[6] = macdHists.Average();
+        if (macdCount > 0)
+        {
+            var sum = 0f;
+            for (var i = 0; i < macdCount; i++) sum += macdHists[i];
+            confluence[6] = sum / macdCount;
+        }
 
-        if (macdHists.Count > 1)
-            confluence[7] = macdHists.All(m => m > 0) || macdHists.All(m => m < 0) ? 1f : 0f;
+        if (macdCount > 1)
+        {
+            var allPos = true;
+            var allNeg = true;
+            for (var i = 0; i < macdCount; i++)
+            {
+                if (macdHists[i] <= 0) allPos = false;
+                if (macdHists[i] >= 0) allNeg = false;
+            }
+            confluence[7] = (allPos || allNeg) ? 1f : 0f;
+        }
 
-        confluence[8] = availableTfs.Count / (float)Timeframes.Length;
+        confluence[8] = availableCount / (float)Timeframes.Length;
 
-        if (trends.Count > 0)
-            confluence[9] = trends.Count(t => t > 0) / (float)trends.Count;
+        if (trendCount > 0)
+        {
+            var posCount = 0;
+            for (var i = 0; i < trendCount; i++)
+                if (trends[i] > 0) posCount++;
+            confluence[9] = posCount / (float)trendCount;
+        }
 
         _cachedConfluence = confluence;
         _confluenceDirty = false;
         return confluence;
     }
+
 
     /// <summary>
     /// Build a complete AgentInput from current state.
