@@ -103,7 +103,6 @@ public static class TrainingRunner
         AnsiConsole.MarkupLine($"[grey]Found {totalCandles:N0} total S1 candles in date range[/]");
 
         var chunkConfig = new ChunkConfig(
-            ChunkDays: budget.ChunkDays,
             PrefetchChunks: budget.ChunkPrefetchCount,
             HistoryBufferDays: budget.ChunkHistoryBufferDays,
             EpisodeDays: episodeDays
@@ -112,7 +111,7 @@ public static class TrainingRunner
         using var chunkProvider = new ChunkBasedDataProvider(
             dbLoader, symbols, startDate, endDate, chunkConfig);
 
-        AnsiConsole.MarkupLine($"[bold cyan]Chunk-based loading enabled: {chunkProvider.TotalChunks} chunks of {budget.ChunkDays} days each[/]");
+        AnsiConsole.MarkupLine($"[bold cyan]Chunk-based loading enabled: {chunkProvider.TotalChunks} chunks of {episodeDays} days each (1 episode per chunk)[/]");
         AnsiConsole.MarkupLine($"[grey]Prefetch buffer: {budget.ChunkPrefetchCount} chunks, History buffer: {budget.ChunkHistoryBufferDays} days[/]");
 
         chunkProvider.StartPrefetching();
@@ -339,7 +338,9 @@ public static class TrainingRunner
                                 
                                 // Update entropy stats BEFORE logging so logged values are current
                                 stats.EntropyCoefficient = GetEntropyCoefficient(agent);
-                                stats.PolicyEntropy = GetPolicyEntropy(agent);
+                                stats.PredictionStd = GetPredictionStd(agent);
+                                stats.ActionEntropy = GetActionEntropy(agent);
+                                stats.PolicyEntropy = stats.PredictionStd;  // Backwards compat
                                 
                                 // Log actions for analysis (every 10 steps to reduce overhead)
                                 if (step % 10 == 0 && actionLoggingEnabled)
@@ -403,9 +404,15 @@ public static class TrainingRunner
                                         env.ClearHindsightTracking(symbol);
                                 }
 
-                                // Add experience with accumulated M1 rewards, hindsight SL, position state, and actual price change
+                                // Get current prices for M1-level dense supervision
+                                var currentPrices = env.GetCurrentPrices();
+
+                                // Add experience with accumulated M1 rewards, hindsight SL, position state, actual price change, and current prices
                                 // Pass validDataMask to skip experiences from symbols without price data
-                                agent.AddExperienceBatchWithLogProbs(stateInputs, actions, rewards, nextStates, doneFlags, logProbs, tpMults, slMults, hindsightSlMults, currentPositions, actualPriceChanges, validDataMask);
+                                agent.AddExperienceBatchWithLogProbs(
+                                    stateInputs, actions, rewards, nextStates, doneFlags, 
+                                    logProbs, tpMults, slMults, hindsightSlMults, currentPositions, 
+                                    actualPriceChanges, validDataMask, currentPrices, symbols.ToArray());
 
                                 for (var i = 0; i < stateInputs.Length; i++)
                                 {
@@ -726,14 +733,28 @@ public static class TrainingRunner
         return 0f;
     }
     
-    private static float GetPolicyEntropy(IAgent agent)
+    private static float GetPredictionStd(IAgent agent)
     {
         if (agent is PpoAgent ppo)
         {
-            return ppo.GetPolicyEntropy();
+            return ppo.GetPredictionStd();
         }
-
         return 0f;
+    }
+    
+    private static float GetActionEntropy(IAgent agent)
+    {
+        if (agent is PpoAgent ppo)
+        {
+            return ppo.GetActionEntropy();
+        }
+        return 0f;
+    }
+    
+    // Backwards compatible - kept for action logger
+    private static float GetPolicyEntropy(IAgent agent)
+    {
+        return GetPredictionStd(agent);
     }
 
     private static int GetBufferSize(IAgent agent)

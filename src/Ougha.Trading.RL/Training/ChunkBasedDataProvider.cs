@@ -138,18 +138,31 @@ public class ChunkBasedDataProvider : IDisposable
 
     private async Task ProduceChunksAsync(Channel<DataChunk> channel, CancellationToken ct)
     {
+        var epoch = 0;
+        
         try
         {
-            foreach (var (chunkStart, chunkEnd) in _chunkBoundaries)
+            // Cycle through chunks infinitely - consumer decides when to stop
+            while (!ct.IsCancellationRequested)
             {
-                if (ct.IsCancellationRequested)
-                    break;
+                epoch++;
+                Log.Debug("[ChunkBasedDataProvider] Starting epoch {Epoch} with {ChunkCount} chunks", epoch, _chunkBoundaries.Count);
+                
+                foreach (var (chunkStart, chunkEnd) in _chunkBoundaries)
+                {
+                    if (ct.IsCancellationRequested)
+                        break;
 
-                var historyStart = chunkStart.AddDays(-_config.HistoryBufferDays);
-                var chunk = await LoadChunkAsync(historyStart, chunkStart, chunkEnd);
+                    var historyStart = chunkStart.AddDays(-_config.HistoryBufferDays);
+                    var chunk = await LoadChunkAsync(historyStart, chunkStart, chunkEnd);
 
-                await channel.Writer.WriteAsync(chunk, ct);
+                    await channel.Writer.WriteAsync(chunk, ct);
+                }
             }
+        }
+        catch (OperationCanceledException)
+        {
+            Log.Debug("[ChunkBasedDataProvider] Producer cancelled after {Epochs} epochs", epoch);
         }
         finally
         {

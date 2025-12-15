@@ -32,6 +32,8 @@ public interface IAgent : IDisposable
     /// <param name="hadPositions">Whether agent had position at each experience (for close signal training).</param>
     /// <param name="actualPriceChanges">Actual price changes from closed trades (for supervised prediction).</param>
     /// <param name="validDataMask">Optional mask to filter out experiences from symbols without valid price data.</param>
+    /// <param name="currentPrices">Current bid prices at each timestep for M1-level dense supervision.</param>
+    /// <param name="symbols">Symbol names for each experience.</param>
     void AddExperienceBatchWithLogProbs(
         AgentInput[] states,
         int[] actions,
@@ -44,7 +46,9 @@ public interface IAgent : IDisposable
         float[]? hindsightSlMultipliers = null,
         bool[]? hadPositions = null,
         float[]? actualPriceChanges = null,
-        bool[]? validDataMask = null);
+        bool[]? validDataMask = null,
+        double[]? currentPrices = null,
+        string[]? symbols = null);
 
     /// <summary>
     /// Perform a training step (optimization).

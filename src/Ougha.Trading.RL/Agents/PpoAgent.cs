@@ -40,16 +40,17 @@ public class PpoAgent : IAgent
     // Training metrics for diagnostics
     private float _lastValueLoss;
     private float _lastKlDivergence;
-    private float _lastPolicyEntropy;  // Actual policy entropy from distribution (not the coefficient)
+    private float _lastPredictionStd;  // Std dev of predictions (NOT action entropy)
+    private float _lastActionEntropy;  // Actual action distribution entropy (max ~1.39 for 4 actions)
 
     private const int MAX_INFERENCE_BATCH = 64;
-    private const int WINDOW_SIZE = 20;
+    private const int WINDOW_SIZE = 50;
     private const int NUM_FEATURES = 45;
     private const int GAE_CHUNK_SIZE = 1024; // 4x larger for fewer forward passes
     
     // Price prediction thresholds (consistent across all methods)
-    private const float TRADE_THRESHOLD = 0.0005f;  // 0.05% minimum predicted move
-    private const float EXPLORATION_RATE = 0.10f;   // 10% random trades to bootstrap supervised learning
+    private const float TRADE_THRESHOLD = 0.0002f;  // 0.02% minimum predicted move - lower for more trading
+    private const float EXPLORATION_RATE = 0.10f;   // 10% random trades (reduced from 20% - too much was hurting)
     private readonly Random _random = new();
     private readonly long[] _symbolBuffer = new long[MAX_INFERENCE_BATCH];
 
@@ -79,8 +80,8 @@ public class PpoAgent : IAgent
         _clipEpsilon = clipEpsilon;
         _valueCoef = 0.5f;
         _tpSlCoef = 0.3f;  // Increased from 0.1 for better SL learning
-        _entropyCoef = 0.20f;  // Increased from 0.05 for better exploration early in training
-        _minEntropyCoef = 0.02f;  // Slightly higher floor to prevent full collapse
+        _entropyCoef = 0.50f;  // High initial value to prevent early policy collapse
+        _minEntropyCoef = 0.10f;  // Much higher floor - never let entropy fully collapse
         _updateEpochs = 6;
         
         // LR Scheduling - linear decay over expected training
@@ -108,10 +109,11 @@ public class PpoAgent : IAgent
         _newsFeatureSize = newsFeatureSize;
         _zeroNews = new float[newsFeatureSize];
         
-        // totalFeatures = 5 + 10 + 5 + 9 + newsFeatureSize + 20 + 12 + 8 (DxyFeatures)
-        var totalFeatures = 5 + 10 + 5 + 9 + _newsFeatureSize + 20 + 12 + 8;
+        // totalFeatures = TriggerLen(6) + ConfluenceLen(10) + PortfolioLen(5) + RiskLen(9) 
+        //               + newsFeatureSize + CorrelationLen(20) + ExposureLen(12) + DxyLen(8)
+        var totalFeatures = 6 + 10 + 5 + 9 + _newsFeatureSize + 20 + 12 + 8;
         
-        _packedTfBuffer = new float[MAX_INFERENCE_BATCH * 5 * WINDOW_SIZE * NUM_FEATURES];
+        _packedTfBuffer = new float[MAX_INFERENCE_BATCH * 6 * WINDOW_SIZE * NUM_FEATURES];  // 6 timeframes: M1, M5, M15, H1, H4, D1
         _packedFeatBuffer = new float[MAX_INFERENCE_BATCH * totalFeatures];
     }
 
@@ -148,11 +150,8 @@ public class PpoAgent : IAgent
             var closeValue = closeSignal.item<float>();
             
             int action;
-            if (closeValue > 0.5f)
-            {
-                action = 3;  // CLOSE
-            }
-            else if (predValue > TRADE_THRESHOLD)
+            // Derive action from price prediction only (no close signal)
+            if (predValue > TRADE_THRESHOLD)
             {
                 action = 1;  // BUY (predicted UP)
             }
@@ -209,17 +208,13 @@ public class PpoAgent : IAgent
                 // Epsilon-greedy exploration during training
                 if (training && _random.NextDouble() < EXPLORATION_RATE)
                 {
-                    action = _random.Next(0, 4);  // Random action
+                    action = _random.Next(0, 3);  // Random action 0-2 (HOLD/BUY/SELL only)
                     logProbs[i] = -1.0f;  // Mark as exploration
                 }
                 else
                 {
-                    // Derive action from prediction using consistent threshold
-                    if (hasPosition && closeValue > 0.5f)
-                    {
-                        action = 3;  // CLOSE signal when holding
-                    }
-                    else if (predValue > TRADE_THRESHOLD)
+                    // Derive action from prediction only (no close signal)
+                    if (predValue > TRADE_THRESHOLD)
                     {
                         action = 1;  // BUY (predicted UP)
                     }
@@ -238,17 +233,22 @@ public class PpoAgent : IAgent
                 
                 actions[i] = action;
                 
-                // TP multiplier: minimum 0.3 to ensure meaningful TP distance
-                var tpMult = (float)Math.Max(0.3, Math.Min(1.0, Math.Abs(predData[i]) / 0.03));
+                // TP multiplier: minimum 0.5 to ensure meaningful TP distance
+                var tpMult = (float)Math.Max(0.5, Math.Min(1.0, Math.Abs(predData[i]) / 0.02));
                 tpSlMults[i, 0] = tpMult;
-                tpSlMults[i, 1] = Math.Max(0.3f, slData[i]);  // Minimum SL multiplier too
+                tpSlMults[i, 1] = Math.Max(0.5f, slData[i]);  // Higher minimum SL multiplier
             }
             
             // Track prediction variance for diagnostics - std dev is proxy for policy uncertainty
             // Higher std = more varied predictions = more exploration
             var predStd = predData.Length > 1 ? (float)Math.Sqrt(predData.Select(p => Math.Pow(p - predData.Average(), 2)).Average()) : 0f;
-            _lastPolicyEntropy = predStd;  // Prediction spread (higher = more exploratory)
+            _lastPredictionStd = predStd;  // Prediction spread (NOT action entropy)
             _lastPredictions = predData;  // Store for accuracy tracking
+            
+            // Compute actual action distribution entropy (3 actions now)
+            var actionCounts = new int[3];
+            foreach (var a in actions) actionCounts[a]++;
+            _lastActionEntropy = ComputeEntropy(actionCounts, actions.Length);
             
             // Explicitly dispose tensors
             foreach (var t in tensors) t.Dispose();
@@ -304,7 +304,9 @@ public class PpoAgent : IAgent
         float[]? hindsightSlMultipliers = null,
         bool[]? hadPositions = null,
         float[]? actualPriceChanges = null,
-        bool[]? validDataMask = null)
+        bool[]? validDataMask = null,
+        double[]? currentPrices = null,
+        string[]? symbols = null)
     {
         var count = states.Length;
         var usePreallocated = count <= MAX_INFERENCE_BATCH;
@@ -355,7 +357,9 @@ public class PpoAgent : IAgent
                 ActualPriceChange = actualPriceChanges?[i] ?? -999f,
                 EpisodeId = _rolloutBuffer.CurrentEpisodeId,
                 SequenceIndex = seqIdx,
-                SymbolIdx = states[i].SymbolId  // Use actual symbol ID, not loop index
+                SymbolIdx = states[i].SymbolId,  // Use actual symbol ID, not loop index
+                CurrentPrice = currentPrices?[i] ?? 0,  // For M1-level dense supervision
+                Symbol = symbols?[i] ?? ""  // Symbol name for tracking
             };
             writeIdx++;
         }
@@ -464,23 +468,39 @@ public class PpoAgent : IAgent
                             
                             // Clean up input tensors
                             foreach (var st in stateTensors) st.Dispose();
-                            
                             // ============================================
-                            // SUPERVISED PREDICTION LOSS (new approach)
+                            // SUPERVISED PREDICTION LOSS (DENSE + SPARSE)
                             // ============================================
-                            // Train prediction head on ACTUAL price changes, not advantage-based targets
-                            // This decouples prediction learning from RL value estimation
+                            // DENSE: M1-level price change between consecutive experiences
+                            // SPARSE: Actual price change from trade entry to close (heavier weight)
                             var predSqueezed = pricePred.squeeze();
                             
-                            // Get actual price changes from closed trades
+                            // Dense M1-level targets: compute from CurrentPrice differences
+                            var m1PriceChanges = new float[sequence.Length];
+                            for (var k = 1; k < sequence.Length; k++)
+                            {
+                                var prevPrice = sequence.CurrentPrices[k - 1];
+                                var currPrice = sequence.CurrentPrices[k];
+                                if (prevPrice > 0 && currPrice > 0)
+                                    m1PriceChanges[k] = (float)((currPrice - prevPrice) / prevPrice);
+                            }
+                            var m1Targets = tensor(m1PriceChanges, ScalarType.Float32, _device);
+                            var hasM1Data = tensor(
+                                Enumerable.Range(0, sequence.Length).Select(j => j > 0 && sequence.CurrentPrices[j] > 0 ? 1f : 0f).ToArray(), 
+                                ScalarType.Float32, _device);
+                            
+                            // Dense loss (lower weight - M1 is noisy, 0.1x weight)
+                            var m1Error = (predSqueezed - m1Targets).pow(2) * hasM1Data;
+                            var m1Loss = m1Error.sum() / (hasM1Data.sum() + 1e-8f);
+                            
+                            // Sparse trade-close targets (higher weight - ground truth, 1.0x weight)
                             var actualChanges = tensor(sequence.ActualPriceChanges, ScalarType.Float32, _device);
-                            
-                            // Mask: only train on experiences where a trade closed (sentinel = -999)
                             var hasActualData = (actualChanges > -900f).to_type(ScalarType.Float32);
+                            var tradeCloseError = (predSqueezed - actualChanges).pow(2) * hasActualData;
+                            var tradeCloseLoss = tradeCloseError.sum() / (hasActualData.sum() + 1e-8f);
                             
-                            // Supervised MSE loss on actual price movements
-                            var predError = (predSqueezed - actualChanges).pow(2) * hasActualData;
-                            var predictionLoss = predError.sum() / (hasActualData.sum() + 1e-8f);
+                            // Combined: heavier weight on trade close (ground truth), lighter on M1 (noisy)
+                            var predictionLoss = 0.1f * m1Loss + 1.0f * tradeCloseLoss;
 
                             // Value loss (unchanged)
                             var valuesSqueezed = valuesTensor.squeeze();
@@ -525,17 +545,28 @@ public class PpoAgent : IAgent
                             var closeError = (closeSqueezed - closeTarget).pow(2) * hadPosMask;
                             var closeLoss = closeError.sum() / (hadPosMask.sum() + 1e-8f);
                             
-                            // Exploration bonus: encourage diverse predictions
+                            // PREDICTION DIVERSITY LOSS: Strong penalty for collapsed predictions
+                            // This is critical to prevent the model from outputting near-identical values
                             var predVariance = predSqueezed.var();
-                            var explorationBonus = predVariance;  // Higher variance = more exploration
+                            var predMean = predSqueezed.mean().abs();
                             
-                            var loss = predictionLoss + _valueCoef * valueLoss + _tpSlCoef * (slLoss + closeLoss) - _entropyCoef * explorationBonus;
+                            // Target: predictions should have variance > 0.001 (0.03 std dev)
+                            // Penalty for low variance (collapsed predictions)
+                            var minVariance = 0.001f;  // Raised from 0.0001
+                            var variancePenalty = max(tensor(0f, device: _device), minVariance - predVariance);
+                            
+                            // Bonus for high variance (diverse predictions) + penalty for low variance
+                            var diversityLoss = variancePenalty * 500f;  // 500x penalty (was 100x)
+                            var explorationBonus = predVariance * 10f;    // 10x stronger bonus (was 5x)
+                            
+                            var loss = predictionLoss + _valueCoef * valueLoss + _tpSlCoef * (slLoss + closeLoss) 
+                                      + diversityLoss - _entropyCoef * explorationBonus;
                             
                             // Track metrics for training diagnostics
                             // Use prediction variance as proxy for KL - high variance means predictions changing a lot
                             _lastKlDivergence = predVariance.item<float>();
                             _lastValueLoss = valueLoss.item<float>();
-                            _lastPolicyEntropy = (float)Math.Sqrt(predVariance.item<float>());  // Std dev for display
+                            _lastPredictionStd = (float)Math.Sqrt(predVariance.item<float>());  // Std dev for display
                             
                             _optimizer.zero_grad();
                             loss.backward();
@@ -639,10 +670,15 @@ public class PpoAgent : IAgent
                         var closeError = (closeSqueezed - closeTarget).pow(2) * hadPosMask;
                         var closeLoss = closeError.sum() / (hadPosMask.sum() + 1e-8f);
                         
-                        // Exploration bonus
+                        // PREDICTION DIVERSITY LOSS: Same as sequence-based training
                         var predVariance = predSqueezed.var();
+                        var minVariance = 0.001f;  // Raised from 0.0001
+                        var variancePenalty = max(tensor(0f, device: _device), minVariance - predVariance);
+                        var diversityLoss = variancePenalty * 500f;  // 500x penalty (was 100x)
+                        var explorationBonus = predVariance * 10f;   // 10x stronger bonus (was 5x)
                         
-                        var loss = predictionLoss + _valueCoef * valueLoss + _tpSlCoef * (slLoss + closeLoss) - _entropyCoef * predVariance;
+                        var loss = predictionLoss + _valueCoef * valueLoss + _tpSlCoef * (slLoss + closeLoss) 
+                                  + diversityLoss - _entropyCoef * explorationBonus;
                         
                         _lastKlDivergence = predictionLoss.item<float>();
                         _lastValueLoss = valueLoss.item<float>();
@@ -787,7 +823,7 @@ public class PpoAgent : IAgent
     public void DecayEpsilon()
     {
         if (!(_entropyCoef > _minEntropyCoef)) return;
-        _entropyCoef *= 0.999995f;  // 10x slower decay (was 0.99995)
+        _entropyCoef *= 0.9999995f;  // 100x slower decay to maintain exploration longer
         _entropyCoef = Math.Max(_entropyCoef, _minEntropyCoef);
     }
     
@@ -796,7 +832,7 @@ public class PpoAgent : IAgent
     /// </summary>
     public void ResetEntropy(float? newValue = null)
     {
-        _entropyCoef = newValue ?? 0.60f;  // Reset to high value (raised from 0.30)
+        _entropyCoef = newValue ?? 0.80f;  // Reset to near-maximum exploration
         // Note: Console output removed - it corrupts the Spectre.Console Live display
     }
     
@@ -828,8 +864,8 @@ public class PpoAgent : IAgent
         {
             var buyPct = (float)buyCount / tradeCount;
             var sellPct = (float)sellCount / tradeCount;
-            // If buy or sell is < 15% of trades, that's too imbalanced
-            if (buyPct < 0.15f || sellPct < 0.15f)
+            // If buy or sell is < 25% of trades, that's too imbalanced
+            if (buyPct < 0.25f || sellPct < 0.25f)
                 needsReset = true;
         }
         
@@ -851,14 +887,44 @@ public class PpoAgent : IAgent
     public float GetEntropyCoefficient() => _entropyCoef;
     
     /// <summary>
-    /// Get the actual policy entropy from the last action distribution.
-    /// Higher values = more exploration (max ~1.39 for 4 actions).
+    /// Get the prediction standard deviation from the last batch.
+    /// Higher values = more diverse predictions (NOT action entropy).
     /// </summary>
-    public float GetPolicyEntropy() => _lastPolicyEntropy;
+    public float GetPredictionStd() => _lastPredictionStd;
+    
+    /// <summary>
+    /// Get actual action distribution entropy from last batch.
+    /// Max ~1.39 for uniform 4-action distribution.
+    /// </summary>
+    public float GetActionEntropy() => _lastActionEntropy;
+    
+    /// <summary>
+    /// Backwards compatible - returns prediction std (NOT true policy entropy).
+    /// </summary>
+    [Obsolete("Use GetPredictionStd() or GetActionEntropy() instead")]
+    public float GetPolicyEntropy() => _lastPredictionStd;
     
     // Keep old name for backwards compatibility (deprecated)
     [Obsolete("Use GetEntropyCoefficient() instead")]
     public float GetEntropyCoef() => _entropyCoef;
+    
+    /// <summary>
+    /// Compute entropy of an action count distribution.
+    /// </summary>
+    private static float ComputeEntropy(int[] counts, int total)
+    {
+        if (total == 0) return 0f;
+        var entropy = 0f;
+        foreach (var c in counts)
+        {
+            if (c > 0)
+            {
+                var p = (float)c / total;
+                entropy -= p * MathF.Log(p);
+            }
+        }
+        return entropy;  // Max = ln(4) ≈ 1.39 for 4 uniform actions
+    }
     
     public float GetValueLoss() => _lastValueLoss;
     public float GetKlDivergence() => _lastKlDivergence;

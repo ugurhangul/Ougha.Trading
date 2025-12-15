@@ -71,17 +71,29 @@ public class TrainingStats
     private double _bestReward = double.MinValue;
     public double BestReward { get => _bestReward; set => _bestReward = value; }
     public float Epsilon { get; set; } = 1.0f;
-    
     /// <summary>
     /// Entropy coefficient (hyperparameter that weights entropy in PPO loss).
     /// </summary>
     public float EntropyCoefficient { get; set; } = 0.60f;
     
     /// <summary>
-    /// Actual policy entropy from the action distribution (max ~1.39 for 4 actions).
-    /// Higher = more exploration.
+    /// Backwards compatible - contains prediction std dev (NOT true action entropy).
+    /// Use PredictionStd or ActionEntropy for new code.
     /// </summary>
     public float PolicyEntropy { get; set; } = 0f;
+    
+    /// <summary>
+    /// Standard deviation of price predictions from the model.
+    /// Higher values = more diverse predictions (proxy for exploration).
+    /// </summary>
+    public float PredictionStd { get; set; } = 0f;
+    
+    /// <summary>
+    /// Actual action distribution entropy from the last batch.
+    /// Max ~1.39 for uniform 4-action distribution.
+    /// Lower values indicate policy collapse.
+    /// </summary>
+    public float ActionEntropy { get; set; } = 0f;
     
     /// <summary>
     /// Backwards compatible alias for EntropyCoefficient.

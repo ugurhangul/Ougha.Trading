@@ -1,8 +1,8 @@
 namespace Ougha.Trading.RL;
 
 /// <summary>
-/// Simplified reward configuration for price prediction strategy.
-/// Only 4 reward components: R-multiple, MDD, prediction accuracy, close bonus.
+/// Reward configuration for price prediction strategy.
+/// Positions only close via TP/SL - no manual close option.
 /// </summary>
 public class RewardConfig
 {
@@ -31,15 +31,22 @@ public class RewardConfig
     /// <summary>
     /// Penalty when predicted price direction was wrong.
     /// </summary>
-    public float PredictionWrongPenalty { get; set; } = 0.5f;
+    public float PredictionWrongPenalty { get; set; } = 1.0f;  // Increased to match bonus
 
     // ========================
-    // CLOSE ACTION
+    // TP/SL REWARDS
     // ========================
     /// <summary>
-    /// Bonus for profitable manual close (agent CLOSE action, not TP/SL).
+    /// Bonus when TP is hit (in addition to R-multiple).
+    /// Encourages letting winners run to target.
     /// </summary>
-    public float ManualCloseBonus { get; set; } = 0.5f;
+    public float TpHitBonus { get; set; } = 1.5f;
+    
+    /// <summary>
+    /// Penalty when SL is hit (in addition to R-multiple).
+    /// Discourages entries that lead to SL hits.
+    /// </summary>
+    public float SlHitPenalty { get; set; } = 0.5f;
 
     // ========================
     // POSITION HOLDING
@@ -49,6 +56,17 @@ public class RewardConfig
     /// Just direction: +0.001 if profitable, -0.001 if losing.
     /// </summary>
     public float PositionHoldingSignal { get; set; } = 0.001f;
+    
+    /// <summary>
+    /// Progressive holding bonus per minute (only when profitable).
+    /// Teaches agent that holding winners is good.
+    /// </summary>
+    public float HoldingBonusPerMinute { get; set; } = 0.03f;
+    
+    /// <summary>
+    /// Maximum holding bonus (cap to prevent infinite holding).
+    /// </summary>
+    public float MaxHoldingBonus { get; set; } = 1.0f;
 
     // ========================
     // MAX DRAWDOWN PENALTY
@@ -76,3 +94,5 @@ public class RewardConfig
     /// </summary>
     public bool NormalizeRewards { get; set; } = true;
 }
+
+

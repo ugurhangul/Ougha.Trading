@@ -43,19 +43,9 @@ public class RewardCalculator
     }
 
     /// <summary>
-    /// Simplified reward calculation for price prediction strategy.
+    /// Reward calculation for price prediction strategy.
+    /// Positions only close via TP/SL - no manual close option.
     /// </summary>
-    /// <param name="symbol">Symbol for per-symbol tracking</param>
-    /// <param name="tradeClosed">Whether a trade was closed this tick</param>
-    /// <param name="tradeProfit">Profit from closed trade (absolute)</param>
-    /// <param name="hasPosition">Whether currently holding a position</param>
-    /// <param name="unrealizedPnl">Current unrealized PnL percentage</param>
-    /// <param name="maxDrawdownPct">Current max drawdown percentage</param>
-    /// <param name="slDistance">Stop loss distance for R:R calculation</param>
-    /// <param name="symbolInfo">Symbol info for point-based normalization</param>
-    /// <param name="volume">Position volume for R-multiple calculation</param>
-    /// <param name="closePrice">Close price for prediction accuracy</param>
-    /// <param name="closeReason">How the trade was closed (Manual, TP, SL)</param>
     public float Calculate(
         string symbol,
         bool tradeClosed,
@@ -67,7 +57,8 @@ public class RewardCalculator
         SymbolInfo? symbolInfo = null,
         double volume = 0,
         double closePrice = 0,
-        CloseReason closeReason = CloseReason.Unknown)
+        CloseReason closeReason = CloseReason.Unknown,
+        int holdingTicks = 0)
     {
         var reward = 0f;
 
@@ -81,10 +72,14 @@ public class RewardCalculator
             // 2. PREDICTION ACCURACY: Reward for correct price direction prediction
             reward += CalculatePredictionAccuracyReward(symbol, closePrice, tradeProfit);
             
-            // 3. CLOSE BONUS: Only for manual close actions (not SL/TP)
-            if (closeReason == CloseReason.Manual && tradeProfit > 0)
+            // 3. TP/SL BONUS/PENALTY: Encourage TP hits, discourage SL hits
+            if (closeReason == CloseReason.TakeProfit)
             {
-                reward += _config.ManualCloseBonus;
+                reward += _config.TpHitBonus;  // Bonus for letting winners run to target
+            }
+            else if (closeReason == CloseReason.StopLoss)
+            {
+                reward -= _config.SlHitPenalty;  // Small penalty for bad entries
             }
             
             // Clear entry tracking
@@ -93,11 +88,21 @@ public class RewardCalculator
         }
         else if (hasPosition)
         {
-            // Minimal shaping: just sign of unrealized PnL
-            // This provides directional feedback without overwhelming R-multiple signal
+            // Minimal shaping: sign of unrealized PnL
             reward = (float)(Math.Sign(unrealizedPnl) * _config.PositionHoldingSignal);
+            
+            // CONDITIONAL HOLDING BONUS: Only reward holding PROFITABLE positions
+            // This prevents rewarding holding losers
+            if (holdingTicks > 0 && unrealizedPnl > 0)
+            {
+                var holdingMinutes = holdingTicks / 60f;
+                var holdingBonus = Math.Min(
+                    holdingMinutes * _config.HoldingBonusPerMinute,
+                    _config.MaxHoldingBonus
+                );
+                reward += holdingBonus;
+            }
         }
-        // No penalty for flat periods - prediction model learns when to enter
         
         // 4. MDD PENALTY: Risk constraint (applied to all states)
         if (maxDrawdownPct > _config.MddThreshold)
@@ -114,6 +119,7 @@ public class RewardCalculator
 
         return reward;
     }
+
 
     /// <summary>
     /// Calculate R-multiple based reward (primary signal).

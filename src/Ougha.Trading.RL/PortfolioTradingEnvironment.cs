@@ -428,23 +428,22 @@ public class PortfolioTradingEnvironment
     
     private async Task<(float Reward, bool TradeClosed)> ProcessSymbolAction(string symbol, int action)
     {
+        // HOLD action - do nothing
         if (ActionDecoder.IsHold(action)) return (0, false);
 
         var entryType = ActionDecoder.Decode(action);
-        var isCloseAction = ActionDecoder.IsClose(action);
-
-        var tradeClosed = false;
-        double tradeProfit = 0;
-        var holdingTicks = 0;
+        
+        // Not a valid entry action
+        if (!entryType.HasValue) return (0, false);
 
         var pos = _executor.GetPosition(symbol);
         var hasPosition = pos != null;
         
-        // Penalty for invalid CLOSE action when no position is held
-        // This teaches the agent that CLOSE is only valid when holding
-        if (isCloseAction && !hasPosition)
+        // If we already have a position, ignore new entry signals
+        // Positions can only close via TP/SL
+        if (hasPosition)
         {
-            return (-0.1f, false);  // Strong penalty for invalid action
+            return (0, false);  // Do nothing - wait for TP/SL
         }
 
         var lastAction = _lastExecutedAction.GetValueOrDefault(symbol, -1);
@@ -454,203 +453,115 @@ public class PortfolioTradingEnvironment
         if (lastAction == action && ticksSinceLastAction < _actionMemoryWindow)
             return (0, false);
 
-        var currentHoldingTicks = hasPosition ? _currentTick - _positionOpenTicks.GetValueOrDefault(symbol) : 0;
-
-        // Handle explicit CLOSE action - just close position, don't open new one
-        if (isCloseAction && hasPosition)
+        // Open new position
+        var candle = _executor.GetLastKnownCandle(symbol);
+        if (candle != null)
         {
-            if (currentHoldingTicks >= MIN_HOLDING_TICKS)
-            {
-                // Capture unrealized PnL and momentum BEFORE closing for smart reward
-                var unrealizedPct = pos!.UnrealizedPnlPercent;
-                var closeCandle = _executor.GetLastKnownCandle(symbol);
-                var closePriceChange = closeCandle != null ? closeCandle.Close - closeCandle.Open : 0;
-                var isMomentumAgainstPosition = (pos.Type == TradeType.Buy && closePriceChange < 0) || 
-                                                 (pos.Type == TradeType.Sell && closePriceChange > 0);
+            var atr = CalculateAtr(symbol);
+            if (atr <= 0 || double.IsNaN(atr))
+                atr = candle.Close * 0.001;
+
+            var symInfo = _executor.GetSymbolInfo(symbol)
+                ?? throw new InvalidOperationException($"SymbolInfo not found for {symbol}. Ensure MT5 is connected and symbol info is loaded.");
+
+            var (tpMult, slMult) = _lastTpSlMultipliers.GetValueOrDefault(symbol, (0.5f, 0.5f));
+
+            // Base multipliers: TP at 1.5 ATR, SL at 1.0 ATR
+            var tpAtrMult = 1.5 + tpMult * 4.0;
+            var slAtrMult = 1.0 + slMult * 2.5;
+
+            var slDistance = atr * slAtrMult;
+            var tpDistance = atr * tpAtrMult;
                 
-                var closeResult = await _executor.ClosePositionAsync(symbol);
-                if (closeResult.Success)
-                {
-                    tradeClosed = true;
-                    tradeProfit = closeResult.Profit;
-                    holdingTicks = currentHoldingTicks;
-                    _positionOpenTicks[symbol] = 0;
-                    hasPosition = false;
-                    _lastExecutedAction[symbol] = action;
-                    _lastExecutedTick[symbol] = _currentTick;
-                    
-                    // SMART CLOSE REWARD: Teach agent WHEN to close
-                    var smartCloseReward = 0f;
-                    
-                    if (unrealizedPct > 0.5)
-                    {
-                        // Taking profit - GOOD! Reward it
-                        smartCloseReward = 0.5f + Math.Min(1.0f, (float)unrealizedPct * 0.5f);
-                    }
-                    else if (unrealizedPct < -0.5 && isMomentumAgainstPosition)
-                    {
-                        // Cutting loss when momentum against position - SMART
-                        smartCloseReward = 0.1f;  // Small positive for smart exit
-                    }
-                    else if (unrealizedPct > -0.5 && unrealizedPct < 0.5)
-                    {
-                        // Closing at breakeven/small loss - PANIC SELLING
-                        smartCloseReward = -0.5f;  // Penalty for premature exit
-                    }
-                    else if (unrealizedPct < -0.5 && !isMomentumAgainstPosition)
-                    {
-                        // Cutting loss when price might recover - BAD
-                        smartCloseReward = -0.3f;
-                    }
-                    
-                    if (Math.Abs(smartCloseReward) > 0.01f)
-                    {
-                        return (smartCloseReward, true);  // Return smart close reward
-                    }
-                }
+            // Universal minimum SL: 0.1% of price
+            var bid = _executor.GetBid(symbol);
+            var ask = _executor.GetAsk(symbol);
+            var minSlDistance = bid * 0.001;
+            
+            if (slDistance < minSlDistance)
+            {
+                var ratio = slDistance > 0 ? tpDistance / slDistance : 2.0;
+                slDistance = minSlDistance;
+                tpDistance = slDistance * ratio;
             }
-            // After close action, skip to reward calculation (don't open new position)
-        }
-        // Close existing position if opening opposite direction
-        else if (hasPosition && entryType.HasValue && pos!.Type != entryType.Value)
-        {
-            if (currentHoldingTicks >= MIN_HOLDING_TICKS)
+            
+            // Add realistic slippage modeling
+            var spread = ask - bid;
+            var slippage = spread * 0.5;
+            var effectiveBid = bid - slippage;
+            var effectiveAsk = ask + slippage;
+
+            var sl = entryType.Value == TradeType.Buy
+                ? effectiveBid - slDistance
+                : effectiveAsk + slDistance;
+
+            var tp = entryType.Value == TradeType.Buy
+                ? effectiveBid + tpDistance
+                : effectiveAsk - tpDistance;
+
+            var riskAmount = _executor.GetEquity() * 0.003;
+            var slPoints = slDistance / symInfo.Point;
+            var tickValue = symInfo.TickValue;
+            
+            if (tickValue <= 0)
             {
-                var closeResult = await _executor.ClosePositionAsync(symbol);
-                if (closeResult.Success)
-                {
-                    tradeClosed = true;
-                    tradeProfit = closeResult.Profit;
-                    holdingTicks = currentHoldingTicks;
-                    _positionOpenTicks[symbol] = 0;
-                    hasPosition = false;
-                }
+                throw new ArgumentException(
+                    $"Invalid TickValue ({tickValue}) for symbol {symbol}. " +
+                    $"Ensure MT5 is connected and SymbolInfo is properly loaded.");
             }
-            else
+            
+            var volume = slPoints > 0
+                ? riskAmount / (tickValue * slPoints)
+                : 0.01;
+                
+            volume = Math.Max(0.01, Math.Min(volume, 0.1));
+            volume = Math.Round(volume, 2);
+            
+            if (volume >= 0.5)
             {
-                return (0, false);
+                Log.Debug("[VolumeCalc] {Symbol}: risk={RiskAmt:F2}, slPts={SlPts:F1}, tickVal={TickVal:F4}, vol={Vol:F2}",
+                    symbol, riskAmount, slPoints, tickValue, volume);
             }
-        }
 
-        if (entryType.HasValue && !hasPosition)
-        {
-            var candle = _executor.GetLastKnownCandle(symbol);
-            if (candle != null)
+            var result = await _executor.ExecuteAsync(symbol, entryType.Value, volume,
+                sl, tp, "RL Portfolio Agent", RiskLevel.Moderate);
+
+            if (result.Success)
             {
-                var atr = CalculateAtr(symbol);
-                if (atr <= 0 || double.IsNaN(atr))
-                    atr = candle.Close * 0.001;
-
-                var symInfo = _executor.GetSymbolInfo(symbol)
-                    ?? throw new InvalidOperationException($"SymbolInfo not found for {symbol}. Ensure MT5 is connected and symbol info is loaded.");
-
-                var (tpMult, slMult) = _lastTpSlMultipliers.GetValueOrDefault(symbol, (0.5f, 0.5f));
-
-                var tpAtrMult = 1.0 + tpMult * 4.0;
-                var slAtrMult = 0.5 + slMult * 2.5;
-
-                var slDistance = atr * slAtrMult;
-                var tpDistance = atr * tpAtrMult;
+                _positionOpenTicks[symbol] = _currentTick;
+                _peakUnrealizedPnls[symbol] = 0;
+                _lastExecutedAction[symbol] = action;
+                _lastExecutedTick[symbol] = _currentTick;
                 
-                // Universal minimum SL: 0.1% of price (fully dynamic, no if/else)
-                // EURUSD (1.08): 0.1% = ~10 pips | BTCUSD (100k): $100 | XAUUSD (2600): $2.60
-                var bid = _executor.GetBid(symbol);
-                var ask = _executor.GetAsk(symbol);
-                var minSlDistance = bid * 0.001;  // 0.1% of price
+                // Initialize hindsight SL tracking
+                var entryPrice = entryType.Value == TradeType.Buy ? ask : bid;
+                _positionEntryPrice[symbol] = entryPrice;
+                _maxAdverseExcursion[symbol] = 0;
+                _maxFavorableExcursion[symbol] = 0;
+                _positionAtr[symbol] = atr;
                 
-                if (slDistance < minSlDistance)
+                // Entry quality bonus: reward entries aligned with momentum
+                var candlePriceChange = candle.Close - candle.Open;
+                var momentum = candlePriceChange / (atr > 0 ? atr : candle.Close * 0.001);
+                
+                var entryQualityBonus = 0f;
+                if (entryType.Value == TradeType.Buy && momentum > 0.2)
                 {
-                    var ratio = slDistance > 0 ? tpDistance / slDistance : 2.0;
-                    slDistance = minSlDistance;
-                    tpDistance = slDistance * ratio;
+                    entryQualityBonus = Math.Min(0.5f, (float)momentum * 0.3f);
+                }
+                else if (entryType.Value == TradeType.Sell && momentum < -0.2)
+                {
+                    entryQualityBonus = Math.Min(0.5f, (float)Math.Abs(momentum) * 0.3f);
+                }
+                else if ((entryType.Value == TradeType.Buy && momentum < -0.2) ||
+                         (entryType.Value == TradeType.Sell && momentum > 0.2))
+                {
+                    entryQualityBonus = -0.1f;
                 }
                 
-                // Add realistic slippage modeling - assume 0.5x spread slippage on entry
-                var spread = ask - bid;
-                var slippage = spread * 0.5;
-                var effectiveBid = bid - slippage;  // Worse fill for buys
-                var effectiveAsk = ask + slippage;  // Worse fill for sells
-
-                var sl = entryType.Value == TradeType.Buy
-                    ? effectiveBid - slDistance
-                    : effectiveAsk + slDistance;
-
-                var tp = entryType.Value == TradeType.Buy
-                    ? effectiveBid + tpDistance
-                    : effectiveAsk - tpDistance;
-
-                var riskAmount = _executor.GetEquity() * 0.003;  // 0.3% risk per trade (was 1%)
-                var slPoints = slDistance / symInfo.Point;
-                var tickValue = symInfo.TickValue;
-                
-                // STRICT VALIDATION: No fallbacks - fail fast if data is bad
-                if (tickValue <= 0)
+                if (Math.Abs(entryQualityBonus) > 0.01f)
                 {
-                    throw new ArgumentException(
-                        $"Invalid TickValue ({tickValue}) for symbol {symbol}. " +
-                        $"Ensure MT5 is connected and SymbolInfo is properly loaded.");
-                }
-                
-                var volume = slPoints > 0
-                    ? riskAmount / (tickValue * slPoints)
-                    : 0.01;
-                    
-                // CRITICAL FIX: Cap volume at 0.1 lots for training stability
-                // Higher volume causes reward scale to vary wildly as equity grows
-                volume = Math.Max(0.01, Math.Min(volume, 0.1));
-                volume = Math.Round(volume, 2);
-                
-                // Debug log if volume seems unusual
-                if (volume >= 0.5)
-                {
-                    Log.Debug("[VolumeCalc] {Symbol}: risk={RiskAmt:F2}, slPts={SlPts:F1}, tickVal={TickVal:F4}, vol={Vol:F2}",
-                        symbol, riskAmount, slPoints, tickValue, volume);
-                }
-
-                var result = await _executor.ExecuteAsync(symbol, entryType.Value, volume,
-                    sl, tp, "RL Portfolio Agent", RiskLevel.Moderate);
-
-                if (result.Success)
-                {
-                    _positionOpenTicks[symbol] = _currentTick;
-                    _peakUnrealizedPnls[symbol] = 0;
-                    _lastExecutedAction[symbol] = action;
-                    _lastExecutedTick[symbol] = _currentTick;
-                    
-                    // Initialize hindsight SL tracking for this position
-                    var entryPrice = entryType.Value == TradeType.Buy ? ask : bid;
-                    _positionEntryPrice[symbol] = entryPrice;
-                    _maxAdverseExcursion[symbol] = 0;
-                    _maxFavorableExcursion[symbol] = 0;
-                    _positionAtr[symbol] = atr;
-                    
-                    // Entry quality bonus: reward entries that align with recent momentum
-                    // BUY when price rising = good entry, SELL when price falling = good entry
-                    var candlePriceChange = candle.Close - candle.Open;
-                    var momentum = candlePriceChange / (atr > 0 ? atr : candle.Close * 0.001);  // Normalize by ATR
-                    
-                    var entryQualityBonus = 0f;
-                    if (entryType.Value == TradeType.Buy && momentum > 0.2)
-                    {
-                        // BUY with upward momentum - good entry
-                        entryQualityBonus = Math.Min(0.5f, (float)momentum * 0.3f);
-                    }
-                    else if (entryType.Value == TradeType.Sell && momentum < -0.2)
-                    {
-                        // SELL with downward momentum - good entry  
-                        entryQualityBonus = Math.Min(0.5f, (float)Math.Abs(momentum) * 0.3f);
-                    }
-                    else if ((entryType.Value == TradeType.Buy && momentum < -0.2) ||
-                             (entryType.Value == TradeType.Sell && momentum > 0.2))
-                    {
-                        // Counter-trend entry - small penalty
-                        entryQualityBonus = -0.1f;
-                    }
-                    
-                    if (Math.Abs(entryQualityBonus) > 0.01f)
-                    {
-                        return (entryQualityBonus, false);
-                    }
+                    return (entryQualityBonus, false);
                 }
             }
         }
@@ -693,10 +604,13 @@ public class PortfolioTradingEnvironment
         var posDirection = pos?.Type == TradeType.Buy ? 1 : (pos?.Type == TradeType.Sell ? -1 : 0);
         var currentPrice = _executor.GetBid(symbol);
 
+        // Get holding ticks for progressive holding bonus (reuse existing var or compute fresh)
+        var rewardHoldingTicks = pos != null ? _currentTick - _positionOpenTicks.GetValueOrDefault(symbol) : 0;
+
         var reward = _rewardCalculator.Calculate(
             symbol: symbol,
-            tradeClosed: tradeClosed,
-            tradeProfit: tradeProfit,
+            tradeClosed: false,  // Positions only close via TP/SL (handled in OnPendingClose)
+            tradeProfit: 0,
             hasPosition: pos != null,
             unrealizedPnl: unrealized,
             maxDrawdownPct: maxDrawdownPct,
@@ -704,9 +618,10 @@ public class PortfolioTradingEnvironment
             symbolInfo: symbolInfo,
             volume: pos?.Volume ?? 0,
             closePrice: currentPrice,
-            closeReason: CloseReason.Unknown);
+            closeReason: CloseReason.Unknown,
+            holdingTicks: rewardHoldingTicks);
 
-        return (reward, tradeClosed);
+        return (reward, false);  // Never close from here - wait for TP/SL
     }
 
     public void SetTpSlMultipliers(string symbol, float tpMult, float slMult)
@@ -844,11 +759,8 @@ public class PortfolioTradingEnvironment
         if (IsForexPair(symbol) && IsWeekend(timestamp))
             return false;
         
-        // Check if we have enough candle data for feature computation
-        var candles = _mtfAggregators[symbol].GetCandles("M1", 10);
-        if (candles.Count < 5)
-            return false;
-        
+        // Note: Don't check candle count here - feature building handles missing data with zero-padding
+        // This check is only for bid/ask availability
         return true;
     }
     
@@ -859,6 +771,20 @@ public class PortfolioTradingEnvironment
     public bool[] GetValidDataMask()
     {
         return _config.Symbols.Select(HasValidPriceData).ToArray();
+    }
+    
+    /// <summary>
+    /// Get current bid prices for all symbols (for M1-level price change tracking).
+    /// Used to compute dense supervised signal in experience collection.
+    /// </summary>
+    public double[] GetCurrentPrices()
+    {
+        var prices = new double[_config.Symbols.Length];
+        for (var i = 0; i < _config.Symbols.Length; i++)
+        {
+            prices[i] = Executor.GetBid(_config.Symbols[i]);
+        }
+        return prices;
     }
     
     /// <summary>

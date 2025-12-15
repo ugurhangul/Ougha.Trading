@@ -75,12 +75,12 @@ public class QuestDbDataLoader
         foreach (var s in symbolList)
             result[s] = new List<Candle>();
 
-        var rows = await conn.QueryAsync<(string Symbol, DateTime Time, double Open, double High, double Low, double Close, double Volume, double Spread)>(
+        var rows = await conn.QueryAsync<(string Symbol, DateTime Time, double Open, double High, double Low, double Close, long Volume, double Spread)>(
             sql, new { start = startParam, end = endParam });
 
         foreach (var row in rows)
         {
-            result[row.Symbol].Add(new Candle(row.Time, row.Open, row.High, row.Low, row.Close, (long)row.Volume, row.Spread));
+            result[row.Symbol].Add(new Candle(row.Time, row.Open, row.High, row.Low, row.Close, row.Volume, row.Spread));
         }
 
         return result;

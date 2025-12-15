@@ -13,7 +13,7 @@ public class EnvironmentPool : IDisposable
     private readonly Dictionary<string, SymbolInfo> _symbolInfo;
     private readonly PortfolioEnvironmentConfig _envConfig;
     private readonly string[] _symbols;
-    private readonly int _episodesPerChunk;
+    private readonly int _totalEpisodes;
 
     private readonly Channel<PreparedEnvironment> _envChannel;
     private readonly CancellationTokenSource _cts;
@@ -39,9 +39,9 @@ public class EnvironmentPool : IDisposable
         _chunkProvider = chunkProvider;
         _symbolInfo = symbolInfo;
         _envConfig = envConfig;
+        _totalEpisodes = totalEpisodes;
         var poolConfig1 = poolConfig ?? new EnvironmentPoolConfig();
         _symbols = envConfig.Symbols;
-        _episodesPerChunk = Math.Max(1, totalEpisodes / Math.Max(1, _chunkProvider.TotalChunks));
 
         _envChannel = Channel.CreateBounded<PreparedEnvironment>(
             new BoundedChannelOptions(poolConfig1.PoolSize)
@@ -85,26 +85,33 @@ public class EnvironmentPool : IDisposable
 
     private async Task ProduceEnvironmentsAsync(CancellationToken ct)
     {
-        var producedInChunk = 0;
+        var totalProduced = 0;
 
         try
         {
-            var chunk = await _chunkProvider.GetNextChunkAsync();
-            if (chunk == null)
+            // Simple loop: consume chunks until we hit totalEpisodes
+            // ChunkBasedDataProvider cycles infinitely, so we just consume
+            while (totalProduced < _totalEpisodes && !ct.IsCancellationRequested)
             {
-                Log.Warning("[EnvironmentPool] No initial chunk available, producer exiting");
-                return;
-            }
-            var chunkIndex = _chunkProvider.CurrentChunkIndex;
-            var chunkStart = chunk.StartDate;
-            var chunkEnd = chunk.EndDate;
-            
-            Log.Information("[EnvironmentPool] Producer started, first chunk: {ChunkStart:yyyy-MM-dd} to {ChunkEnd:yyyy-MM-dd}", chunkStart, chunkEnd);
+                var chunk = await _chunkProvider.GetNextChunkAsync();
+                if (chunk == null)
+                {
+                    Log.Warning("[EnvironmentPool] Chunk provider returned null at episode {Episode}, stopping", totalProduced);
+                    break;
+                }
+                
+                var chunkIndex = _chunkProvider.CurrentChunkIndex;
+                var chunkStart = chunk.StartDate;
+                var chunkEnd = chunk.EndDate;
 
-            while (!ct.IsCancellationRequested)
-            {
+                if (totalProduced == 0)
+                {
+                    Log.Information("[EnvironmentPool] Producer started, first chunk: {ChunkStart:yyyy-MM-dd} to {ChunkEnd:yyyy-MM-dd}", 
+                        chunkStart, chunkEnd);
+                }
+
                 var env = CreateEnvironmentFromChunk(out var episodeStart, out var episodeEnd);
-                producedInChunk++;
+                totalProduced++;
                 
                 var prepared = new PreparedEnvironment(
                     env, 
@@ -113,34 +120,25 @@ public class EnvironmentPool : IDisposable
                     chunkIndex,
                     chunkStart,
                     chunkEnd,
-                    producedInChunk,
-                    _episodesPerChunk
+                    totalProduced,
+                    _totalEpisodes
                 );
 
                 await _envChannel.Writer.WriteAsync(prepared, ct);
-
-                if (producedInChunk >= _episodesPerChunk)
+                
+                // Log every 100 episodes
+                if (totalProduced % 100 == 0)
                 {
-                    var nextChunk = await _chunkProvider.GetNextChunkAsync();
-                    if (nextChunk == null)
-                    {
-                        Log.Information("[EnvironmentPool] No more chunks, produced {ChunkIndex} chunks total", chunkIndex);
-                        break;
-                    }
-                    chunk = nextChunk;
-                    chunkIndex = _chunkProvider.CurrentChunkIndex;
-                    chunkStart = chunk.StartDate;
-                    chunkEnd = chunk.EndDate;
-                    producedInChunk = 0;
-                    Log.Debug("[EnvironmentPool] Moved to chunk {ChunkIndex}: {ChunkStart:yyyy-MM-dd} to {ChunkEnd:yyyy-MM-dd}", chunkIndex, chunkStart, chunkEnd);
+                    Log.Debug("[EnvironmentPool] Produced {Produced}/{Total} episodes", totalProduced, _totalEpisodes);
                 }
             }
             
-            Log.Information("[EnvironmentPool] Producer completed normally after {ChunkIndex} chunks", chunkIndex);
+            Log.Information("[EnvironmentPool] Producer completed: {TotalProduced}/{TotalRequested} episodes", 
+                totalProduced, _totalEpisodes);
         }
         catch (OperationCanceledException)
         {
-            Log.Information("[EnvironmentPool] Producer cancelled");
+            Log.Information("[EnvironmentPool] Producer cancelled at episode {TotalProduced}", totalProduced);
         }
         catch (Exception ex)
         {

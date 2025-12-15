@@ -30,6 +30,11 @@ public class PpoSequence
     /// -999 = no trade closed.
     /// </summary>
     public required float[] ActualPriceChanges { get; init; }
+    /// <summary>
+    /// Current prices at each timestep for M1-level dense supervision.
+    /// Used to compute price change between consecutive experiences.
+    /// </summary>
+    public required double[] CurrentPrices { get; init; }
     public required int EpisodeId { get; init; }
     public int Length => States.Length;
 }
@@ -103,6 +108,7 @@ internal class SequentialPpoDataset
                 var hindsightSlMults = new float[seqLen];
                 var hadPositions = new bool[seqLen];
                 var actualPriceChanges = new float[seqLen];
+                var currentPrices = new double[seqLen];
                 
                 for (var j = 0; j < seqLen; j++)
                 {
@@ -118,6 +124,7 @@ internal class SequentialPpoDataset
                     hindsightSlMults[j] = exp.HindsightSlMultiplier;
                     hadPositions[j] = exp.HadPosition;
                     actualPriceChanges[j] = exp.ActualPriceChange;
+                    currentPrices[j] = exp.CurrentPrice;
                 }
                 
                 sequences.Add(new PpoSequence
@@ -133,6 +140,7 @@ internal class SequentialPpoDataset
                     HindsightSlMultipliers = hindsightSlMults,
                     HadPositions = hadPositions,
                     ActualPriceChanges = actualPriceChanges,
+                    CurrentPrices = currentPrices,
                     EpisodeId = episodeGroup.Key
                 });
             }

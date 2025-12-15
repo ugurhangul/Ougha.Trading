@@ -106,11 +106,20 @@ public static class TrainingDisplay
             var predAccStyle = stats.PredictionAccuracy > 55 ? "green" : stats.PredictionAccuracy > 50 ? "yellow" : "red";
             table.AddRow("[dim]PredAcc:[/]", $"[{predAccStyle}]{stats.PredictionAccuracy,10:F1}%[/]");
             table.AddRow("[dim]PredMAE:[/]", $"[cyan]{stats.AvgPredictionError * 100,10:F3}%[/]");  // Show as percentage
+            
+            // Show prediction std (proxy for prediction diversity) and action entropy (true action distribution)
+            var predStdStyle = stats.PredictionStd > 0.01 ? "green" : stats.PredictionStd > 0.005 ? "yellow" : "red";
+            table.AddRow("[dim]PredStd:[/]", $"[{predStdStyle}]{stats.PredictionStd * 100,9:F3}%[/]");
+            
+            var actEntStyle = stats.ActionEntropy > 1.0 ? "green" : stats.ActionEntropy > 0.5 ? "yellow" : "red";
+            table.AddRow("[dim]ActEnt:[/]", $"[{actEntStyle}]{stats.ActionEntropy,10:F3}[/]");  // Max ~1.39
         }
         else
         {
             table.AddRow("[dim]Epsilon:[/]", $"[magenta]{stats.Epsilon,12:F4}[/]");
-            table.AddRow("", "");  // Empty row for alignment
+            table.AddRow("", "");  // Empty rows for alignment
+            table.AddRow("", "");
+            table.AddRow("", "");
         }
         
         // Show valid data symbols (important for weekends/missing data)
@@ -296,11 +305,11 @@ public static class TrainingDisplay
             .Expand();
     }
 
-    private const int SymbolsPerPage = 30;  // Show 20 symbols per page
+    private const int SymbolsPerPage = 25;  // Show 20 symbols per page
     
     private static Table BuildSymbolPerformanceTable(TrainingStats stats)
     {
-        var allSymbols = stats.SymbolPerformance
+        var allSymbols = stats.SymbolPerformance.Where(x => x.Value.CumulativeTrades > 0)
             .OrderByDescending(x => x.Value.NetProfit)
             .ToList();
         

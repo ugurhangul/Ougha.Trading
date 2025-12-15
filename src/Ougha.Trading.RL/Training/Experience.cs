@@ -11,10 +11,22 @@ public class Experience
     public bool Done { get; set; }
 
     /// <summary>
-    /// Log probability of the action (logπ(a|s)) for PPO importance sampling.
-    /// Used in the PPO ratio calculation: exp(newLogProb - oldLogProb).
+    /// Prediction confidence: negative abs(prediction magnitude).
+    /// Higher values = more confident prediction. NOT a log probability.
+    /// Kept as "LogProb" for backwards compatibility with existing code.
     /// </summary>
     public float LogProb { get; set; } = 0f;
+    
+    /// <summary>
+    /// Current bid price at time of experience for M1-level price change computation.
+    /// Used to create dense supervised signal (not just trade closes).
+    /// </summary>
+    public double CurrentPrice { get; set; }
+    
+    /// <summary>
+    /// Symbol name for price normalization and tracking.
+    /// </summary>
+    public string Symbol { get; set; } = "";
     
     /// <summary>
     /// Priority weight for DQN Prioritized Experience Replay (PER).
