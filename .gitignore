@@ -79,3 +79,5 @@ Desktop.ini
 test_symbol_ids.csx
 *.txt
 *.log
+/.codegraph
+/ougha_trading_cv.md
