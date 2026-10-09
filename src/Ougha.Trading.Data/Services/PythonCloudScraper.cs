@@ -11,13 +11,11 @@ namespace Ougha.Trading.Data.Services;
 public class PythonCloudScraper : IDisposable
 {
     private readonly bool _ownsGil;
-    
-    private const string PythonDll = @"C:\Users\Ougha\AppData\Local\Programs\Python\Python312\python312.dll";
-    
+
+    // Runtime.PythonDLL defaults to the PYTHONNET_PYDLL environment variable.
     public PythonCloudScraper()
     {
         if (PythonEngine.IsInitialized) return;
-        Runtime.PythonDLL = PythonDll;
         PythonEngine.Initialize();
         PythonEngine.BeginAllowThreads();
         _ownsGil = true;

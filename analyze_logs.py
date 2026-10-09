@@ -1,10 +1,11 @@
 import json
+import sys
 from collections import defaultdict
 
 # Read and parse JSONL file
 trades = []
 actions = []
-filepath = r'C:\repos\ugurhangul\Ougha.Trading\src\Ougha.Trading.App\bin\Release\net10.0\win-x64\publish\action_logs\actions_20251215_141106.jsonl'
+filepath = sys.argv[1]
 
 with open(filepath, 'r') as f:
     for line in f:
